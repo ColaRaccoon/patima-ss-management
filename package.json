@@ -1,0 +1,29 @@
+{
+  "name": "patima-naver-ss",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Smart Store profit management MVP",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev --workspace @patima/frontend\" \"npm run dev:backend\"",
+    "dev:frontend": "npm run dev --workspace @patima/frontend",
+    "dev:backend": "npm run build --workspace @patima/backend && npm run start --workspace @patima/backend",
+    "dev:backend:watch": "npm run start:dev --workspace @patima/backend",
+    "start:backend": "npm run start --workspace @patima/backend",
+    "build": "npm run build --workspace @patima/shared && npm run build --workspace @patima/backend && npm run build --workspace @patima/frontend",
+    "lint": "npm run typecheck --workspace @patima/shared && npm run typecheck --workspace @patima/backend && npm run typecheck --workspace @patima/frontend",
+    "test": "npm run test --workspace @patima/backend",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

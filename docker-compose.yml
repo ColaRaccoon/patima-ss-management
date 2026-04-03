@@ -1,0 +1,40 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://backend:4000/api/v1
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      MASTER_KEY: ${MASTER_KEY}
+      DATABASE_URL: postgresql://patima_app:${POSTGRES_PASSWORD:-patima_local}@db:5432/patima_naver_ss
+      UPLOAD_DIR: /app/apps/backend/uploads
+    depends_on:
+      - db
+
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: patima_naver_ss
+      POSTGRES_USER: patima_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-patima_local}
+    ports:
+      - "5432:5432"
+    volumes:
+      - patima-db:/var/lib/postgresql/data
+
+volumes:
+  patima-db:

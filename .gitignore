@@ -1,0 +1,11 @@
+node_modules
+.next
+dist
+coverage
+.env
+.env.local
+.DS_Store
+*.log
+apps/backend/uploads
+apps/backend/data/*.json
+!apps/backend/data/.gitkeep

@@ -1,0 +1,63 @@
+{
+  "stores": [
+    {
+      "id": "d4578502-548e-44b8-8050-63c7e29182a0",
+      "name": "Patima ??? ???",
+      "platformType": "NAVER_SMARTSTORE",
+      "sellerAccountId": "seller-001",
+      "channelNo": "channel-001",
+      "isPrimary": true,
+      "isActive": true,
+      "deactivatedAt": null,
+      "memo": null,
+      "lastOrderSyncAt": null,
+      "lastOrderSyncStatus": "NEVER",
+      "credentialConnectionStatus": "NOT_TESTED",
+      "lastCredentialTestAt": null,
+      "createdAt": "2026-04-03T02:22:02.032Z",
+      "updatedAt": "2026-04-03T02:22:02.032Z"
+    }
+  ],
+  "commerceCredentials": [],
+  "products": [],
+  "canonicalSalesUnits": [],
+  "orderSourceSignatures": [],
+  "orders": [],
+  "orderItems": [],
+  "campaignMappings": [],
+  "adExcelUploads": [],
+  "adUploadPreviewRows": [],
+  "adCampaignDailyCosts": [],
+  "salesUnitCostSettings": [],
+  "operations": [],
+  "auditLogs": [
+    {
+      "id": "7a71a580-082d-45ad-9276-2b8a0b22426d",
+      "actorType": "LOCALHOST_ADMIN",
+      "createdAt": "2026-04-03T02:22:02.032Z",
+      "storeId": "d4578502-548e-44b8-8050-63c7e29182a0",
+      "domain": "STORE",
+      "action": "CREATE",
+      "targetId": "d4578502-548e-44b8-8050-63c7e29182a0",
+      "actorIdentifier": "LOCALHOST_ADMIN",
+      "beforeJson": null,
+      "afterJson": {
+        "id": "d4578502-548e-44b8-8050-63c7e29182a0",
+        "name": "Patima ??? ???",
+        "platformType": "NAVER_SMARTSTORE",
+        "sellerAccountId": "seller-001",
+        "channelNo": "channel-001",
+        "isPrimary": true,
+        "isActive": true,
+        "deactivatedAt": null,
+        "memo": null,
+        "lastOrderSyncAt": null,
+        "lastOrderSyncStatus": "NEVER",
+        "credentialConnectionStatus": "NOT_TESTED",
+        "lastCredentialTestAt": null,
+        "createdAt": "2026-04-03T02:22:02.032Z",
+        "updatedAt": "2026-04-03T02:22:02.032Z"
+      }
+    }
+  ]
+}
