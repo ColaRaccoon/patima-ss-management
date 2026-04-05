@@ -77,6 +77,8 @@ const collectSources = (
 const pickPrimaryStore = (stores: StoreListItem[]) =>
   stores.find((store) => store.isPrimary) ?? stores[0] ?? null;
 
+const MAX_FRONTEND_PAGE_SIZE = 200;
+
 const toMappingReason = (value: string | null | undefined) => {
   switch (value) {
     case "NO_RULE":
@@ -91,6 +93,69 @@ const toMappingReason = (value: string | null | undefined) => {
       return null;
   }
 };
+
+async function fetchAllRecordPages<T>(params: {
+  label: string;
+  path: string;
+  query: Record<string, string | number | boolean | null | undefined>;
+  fallback: T[];
+}) {
+  let page = 1;
+  let collected: T[] = [];
+  let baseResponse:
+    | {
+        label: string;
+        source: "live" | "mock";
+        endpoint: string;
+        error?: string;
+      }
+    | null = null;
+
+  while (true) {
+    const response = await fetchApi<{
+      items: T[];
+      hasNext?: boolean;
+      totalPages?: number;
+    }>({
+      label: params.label,
+      path: withQuery(params.path, {
+        ...params.query,
+        page,
+        pageSize: MAX_FRONTEND_PAGE_SIZE,
+      }),
+      fallback: { items: page === 1 ? params.fallback : [] },
+    });
+
+    if (!baseResponse) {
+      baseResponse = {
+        label: response.label,
+        source: response.source,
+        endpoint: response.endpoint,
+        ...(response.error ? { error: response.error } : {}),
+      };
+    }
+
+    if (response.source === "mock") {
+      return {
+        ...response,
+        data: response.data.items,
+      };
+    }
+
+    collected.push(...response.data.items);
+
+    if (!response.data.hasNext || page >= (response.data.totalPages ?? page)) {
+      break;
+    }
+
+    page += 1;
+  }
+
+  return {
+    ...baseResponse!,
+    data: collected,
+  };
+}
 
 function normalizeOrdersPageFilters(
   filters?: Partial<OrdersPageFilters>,
@@ -196,19 +261,18 @@ async function getDashboardSummary(storeId: string, date: string) {
 }
 
 async function getProfitRows(storeId: string, dateFrom: string, dateTo: string) {
-  const response = await fetchApi<{ items: DailySalesUnitProfit[] }>({
+  const response = await fetchAllRecordPages<DailySalesUnitProfit>({
     label: "Profit rows",
-    path: withQuery("/profits/daily-sales-units", {
+    path: "/profits/daily-sales-units",
+    query: {
       storeId,
       dateFrom,
       dateTo,
-      page: 1,
-      pageSize: 50,
-    }),
-    fallback: { items: mockProfits },
+    },
+    fallback: mockProfits,
   });
 
-  return { ...response, data: response.data.items };
+  return { ...response, data: response.data };
 }
 
 async function getDailySalesUnitDetail(
@@ -381,19 +445,18 @@ async function getPreviewRows(uploadId: string, salesUnits: SalesUnitListItem[])
 }
 
 async function getAdCosts(storeId: string, dateFrom: string, dateTo: string, salesUnits: SalesUnitListItem[]) {
-  const response = await fetchApi<{ items: Array<Record<string, unknown>> }>({
+  const response = await fetchAllRecordPages({
     label: "Ad costs",
-    path: withQuery("/ad-campaign-costs", {
+    path: "/ad-campaign-costs",
+    query: {
       storeId,
       dateFrom,
       dateTo,
-      page: 1,
-      pageSize: 50,
-    }),
-    fallback: { items: mockAdCosts as unknown as Array<Record<string, unknown>> },
+    },
+    fallback: mockAdCosts as unknown as Array<Record<string, unknown>>,
   });
 
-  const items = response.data.items.map((item) => {
+  const items = response.data.map((item) => {
     const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
     const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
     return {
@@ -732,8 +795,11 @@ export async function getProfitsPageData(params?: {
   dateFrom?: string;
   dateTo?: string;
 }): Promise<ProfitsPageData> {
-  const dateFrom = params?.dateFrom?.trim() || MOCK_DATE_FROM;
-  const dateTo = params?.dateTo?.trim() || MOCK_DATE_TO;
+  const requestedDateFrom = params?.dateFrom?.trim();
+  const requestedDateTo = params?.dateTo?.trim();
+  const fallbackDate = MOCK_SELECTED_DATE;
+  const dateFrom = requestedDateFrom || requestedDateTo || fallbackDate;
+  const dateTo = requestedDateTo || requestedDateFrom || fallbackDate;
   const storeResponse = await getStores();
   const primaryStore = pickPrimaryStore(storeResponse.data);
 

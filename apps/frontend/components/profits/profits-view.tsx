@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useTransition, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
@@ -10,10 +11,11 @@ import { StatCard } from "@/components/shared/stat-card";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { readApiResponse } from "@/lib/api/browser";
 import type { DailySalesUnitDetail, ProfitsPageData } from "@/lib/api/types";
-import { formatCurrency, formatDateRange, formatNumber } from "@/lib/format";
+import { formatCurrency, formatDate, formatDateRange, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
 
 export function ProfitsView({ data }: { data: ProfitsPageData }) {
+  const router = useRouter();
   const [selectedProfitKey, setSelectedProfitKey] = useState<string | null>(
     data.selectedDetail
       ? `${data.selectedDetail.canonicalSalesUnitId}-${data.selectedDetail.date}`
@@ -24,8 +26,10 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const [selectedDetail, setSelectedDetail] = useState<DailySalesUnitDetail | null>(
     data.selectedDetail,
   );
+  const [selectedDate, setSelectedDate] = useState(data.dateTo);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+  const [isRefreshing, startRefresh] = useTransition();
 
   const selectedProfit = useMemo(
     () =>
@@ -34,6 +38,10 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       ) ?? null,
     [data.profits, selectedProfitKey],
   );
+
+  useEffect(() => {
+    setSelectedDate(data.dateTo);
+  }, [data.dateTo]);
 
   useEffect(() => {
     if (selectedProfitKey && data.profits.some((row) => `${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey)) {
@@ -50,6 +58,17 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       setSelectedProfitKey(`${data.profits[0].canonicalSalesUnitId}-${data.profits[0].date}`);
     }
   }, [data.profits, data.selectedDetail, selectedProfitKey]);
+
+  const applyDateFilter = (nextDate: string) => {
+    const searchParams = new URLSearchParams();
+    if (nextDate) {
+      searchParams.set("date", nextDate);
+    }
+
+    startRefresh(() => {
+      router.replace(searchParams.size > 0 ? `/profits?${searchParams.toString()}` : "/profits");
+    });
+  };
 
   if (!data.primaryStore) {
     return (
@@ -74,6 +93,33 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       />
 
       <SourceBanner sources={data.sources} />
+
+      <Panel
+        title="조회 날짜"
+        description={`현재 선택 ${formatDate(data.dateTo)}. 손익 테이블과 요약 카드는 선택한 하루 기준으로 다시 계산됩니다.`}
+      >
+        <form
+          className="flex flex-wrap items-end gap-3"
+          onSubmit={(event: FormEvent<HTMLFormElement>) => {
+            event.preventDefault();
+            applyDateFilter(selectedDate);
+          }}
+        >
+          <label className="block min-w-56">
+            <span className="mb-2 block text-sm font-medium text-ink">date</span>
+            <input
+              className="input-shell"
+              type="date"
+              required
+              value={selectedDate}
+              onChange={(event) => setSelectedDate(event.target.value)}
+            />
+          </label>
+          <button className="button-shell button-primary" type="submit" disabled={isRefreshing}>
+            해당 날짜 조회
+          </button>
+        </form>
+      </Panel>
 
       <div className="grid gap-4 md:grid-cols-4">
         <StatCard label="총 주문금액" value={formatCurrency(data.summary.totalRevenue)} />

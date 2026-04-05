@@ -28,6 +28,10 @@ function emptyCampaignDraft(defaultSalesUnitId = "") {
   };
 }
 
+function pickDefaultAdCostId(adCosts: MappingsPageData["adCosts"]) {
+  return adCosts.find((item) => item.mappingStatus === "UNMAPPED")?.id ?? adCosts[0]?.id ?? null;
+}
+
 export function MappingsView({ data }: { data: MappingsPageData }) {
   const router = useRouter();
   const [selectedSignatureId, setSelectedSignatureId] = useState<string | null>(
@@ -37,7 +41,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     data.campaignMappings[0]?.id ?? null,
   );
   const [selectedAdCostId, setSelectedAdCostId] = useState<string | null>(
-    data.adCosts.find((item) => item.mappingStatus === "UNMAPPED")?.id ?? data.adCosts[0]?.id ?? null,
+    pickDefaultAdCostId(data.adCosts.filter((item) => item.totalCost !== 0)),
   );
   const [signatureSalesUnitId, setSignatureSalesUnitId] = useState(
     data.signatures[0]?.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? "",
@@ -49,6 +53,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(
     data.adCosts[0]?.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? "",
   );
+  const [hideZeroCostAdRows, setHideZeroCostAdRows] = useState(true);
   const [intentionalReason, setIntentionalReason] = useState("");
   const [orderError, setOrderError] = useState<string | null>(null);
   const [orderSuccess, setOrderSuccess] = useState<string | null>(null);
@@ -65,7 +70,11 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     data.signatures.find((signature) => signature.id === selectedSignatureId) ?? null;
   const selectedMapping =
     data.campaignMappings.find((mapping) => mapping.id === selectedMappingId) ?? null;
-  const selectedAdCost = data.adCosts.find((adCost) => adCost.id === selectedAdCostId) ?? null;
+  const visibleAdCosts = hideZeroCostAdRows
+    ? data.adCosts.filter((adCost) => adCost.totalCost !== 0)
+    : data.adCosts;
+  const hiddenZeroCostCount = data.adCosts.length - visibleAdCosts.length;
+  const selectedAdCost = visibleAdCosts.find((adCost) => adCost.id === selectedAdCostId) ?? null;
   const isBusy = isSavingOrder || isSavingCampaign || isSavingAdCost || isRefreshing;
 
   useEffect(() => {
@@ -121,13 +130,14 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   }, [data.campaignMappings, selectedMappingId]);
 
   useEffect(() => {
-    if (selectedAdCostId && data.adCosts.some((adCost) => adCost.id === selectedAdCostId)) {
+    const nextAdCosts = hideZeroCostAdRows
+      ? data.adCosts.filter((adCost) => adCost.totalCost !== 0)
+      : data.adCosts;
+    if (selectedAdCostId && nextAdCosts.some((adCost) => adCost.id === selectedAdCostId)) {
       return;
     }
-    setSelectedAdCostId(
-      data.adCosts.find((item) => item.mappingStatus === "UNMAPPED")?.id ?? data.adCosts[0]?.id ?? null,
-    );
-  }, [data.adCosts, selectedAdCostId]);
+    setSelectedAdCostId(pickDefaultAdCostId(nextAdCosts));
+  }, [data.adCosts, hideZeroCostAdRows, selectedAdCostId]);
 
   if (!data.primaryStore) {
     return (
@@ -434,6 +444,20 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
           title="주문 원본 매핑"
           description="기존 시그니처를 기존 판매단위에 연결하거나, 새 판매단위를 생성하면서 바로 연결할 수 있습니다."
         >
+          <div className="hidden">
+            <label className="inline-flex items-center gap-2 text-sm text-ink/70">
+              <input
+                type="checkbox"
+                checked={hideZeroCostAdRows}
+                onChange={(event) => setHideZeroCostAdRows(event.target.checked)}
+              />
+              광고비 0원 숨기기
+            </label>
+            {hideZeroCostAdRows && hiddenZeroCostCount > 0 ? (
+              <p className="text-sm text-ink/55">{formatNumber(hiddenZeroCostCount)}개 숨김</p>
+            ) : null}
+          </div>
+
           <DataTable
             caption="주문 원본 매핑"
             columns={[
@@ -668,9 +692,22 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 render: (row) => row.canonicalDisplayName ?? "미매핑",
               },
             ]}
-            rows={data.adCosts}
+            rows={visibleAdCosts}
             getRowKey={(row) => row.id}
           />
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+            <label className="inline-flex items-center gap-2 text-sm text-ink/70">
+              <input
+                type="checkbox"
+                checked={hideZeroCostAdRows}
+                onChange={(event) => setHideZeroCostAdRows(event.target.checked)}
+              />
+              광고비 0원 숨기기
+            </label>
+            {hideZeroCostAdRows && hiddenZeroCostCount > 0 ? (
+              <p className="text-sm text-ink/55">{formatNumber(hiddenZeroCostCount)}개 숨김</p>
+            ) : null}
+          </div>
         </Panel>
 
         <Panel
