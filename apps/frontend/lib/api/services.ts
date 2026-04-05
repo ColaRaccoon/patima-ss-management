@@ -94,6 +94,17 @@ const toMappingReason = (value: string | null | undefined) => {
   }
 };
 
+const toAdMappingStatus = (
+  canonicalSalesUnitId: string | null,
+  mappingReason: ReturnType<typeof toMappingReason>,
+) => {
+  if (mappingReason === "MULTIPLE_RULE_MATCHES") {
+    return "CONFLICT" as const;
+  }
+
+  return canonicalSalesUnitId ? ("MAPPED" as const) : ("UNMAPPED" as const);
+};
+
 async function fetchAllRecordPages<T>(params: {
   label: string;
   path: string;
@@ -161,7 +172,9 @@ function normalizeOrdersPageFilters(
   filters?: Partial<OrdersPageFilters>,
 ): OrdersPageFilters {
   const mappingStatus =
-    filters?.mappingStatus === "MAPPED" || filters?.mappingStatus === "UNMAPPED"
+    filters?.mappingStatus === "MAPPED" ||
+    filters?.mappingStatus === "UNMAPPED" ||
+    filters?.mappingStatus === "CONFLICT"
       ? filters.mappingStatus
       : "ALL";
   const paymentDateStatus =
@@ -223,8 +236,10 @@ function createMockDailySalesUnitDetail(
       excludedOrderRevenue: 0,
       excludedAdCost: 0,
       excludedUnmappedOrderRevenue: 0,
+      excludedConflictOrderRevenue: 0,
       excludedNonSaleOrderRevenue: 0,
       excludedUnmappedAdCost: 0,
+      excludedConflictAdCost: 0,
       excludedIntentionalUnmappedAdCost: 0,
       excludedOrderStatusCounts: {
         CANCELED: 0,
@@ -387,7 +402,17 @@ async function getSalesUnits(storeId: string) {
     }),
     fallback: { items: mockSalesUnits },
   });
-  return { ...response, data: response.data.items };
+  return {
+    ...response,
+    data: response.data.items.map((item) => ({
+      ...item,
+      matchAliases:
+        Array.isArray((item as Partial<SalesUnitListItem>).matchAliases) &&
+        (item as Partial<SalesUnitListItem>).matchAliases
+          ? (item as Partial<SalesUnitListItem>).matchAliases!
+          : [],
+    })),
+  };
 }
 
 async function getAdUploads(storeId: string) {
@@ -416,6 +441,7 @@ async function getPreviewRows(uploadId: string, salesUnits: SalesUnitListItem[])
   const items = response.data.items.map((item, index) => {
     const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
     const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
+    const mappingStatus = toAdMappingStatus(canonicalSalesUnitId, mappingReason);
     return {
       rowNo: index + 1,
       campaignId: String(item.campaignId),
@@ -424,14 +450,12 @@ async function getPreviewRows(uploadId: string, salesUnits: SalesUnitListItem[])
       adStatus: item.status ? String(item.status) : null,
       weekdayLabel: item.weekday ? String(item.weekday) : null,
       totalCost: Number(item.totalCost ?? 0),
-      mappingStatus: canonicalSalesUnitId ? "MAPPED" : "UNMAPPED",
+      mappingStatus,
       mappingReason,
       displayMappingState:
         mappingReason === "INTENTIONALLY_UNMAPPED"
           ? "INTENTIONALLY_UNMAPPED"
-          : canonicalSalesUnitId
-            ? "MAPPED"
-            : "UNMAPPED",
+          : mappingStatus,
       matchedRuleCount: Number(item.matchedRuleCount ?? 0),
       canonicalSalesUnitId,
       canonicalDisplayName:
@@ -459,6 +483,7 @@ async function getAdCosts(storeId: string, dateFrom: string, dateTo: string, sal
   const items = response.data.map((item) => {
     const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
     const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
+    const mappingStatus = toAdMappingStatus(canonicalSalesUnitId, mappingReason);
     return {
       id: String(item.id),
       uploadId: String(item.sourceUploadId ?? item.uploadId ?? ""),
@@ -468,7 +493,7 @@ async function getAdCosts(storeId: string, dateFrom: string, dateTo: string, sal
       canonicalSalesUnitId,
       canonicalDisplayName:
         salesUnits.find((salesUnit) => salesUnit.id === canonicalSalesUnitId)?.displayName ?? null,
-      mappingStatus: canonicalSalesUnitId ? "MAPPED" : "UNMAPPED",
+      mappingStatus,
       mappingReason,
       matchedRuleCount: Number(item.matchedRuleCount ?? 0),
       reasonNote: item.reasonNote ? String(item.reasonNote) : null,
@@ -746,6 +771,7 @@ export async function getAdUploadsPageData(): Promise<AdUploadsPageData> {
         mappingPreviewSummary: {
           mappedCount: previewRowsResponse?.data.filter((row) => row.mappingStatus === "MAPPED").length ?? 0,
           unmappedCount: previewRowsResponse?.data.filter((row) => row.mappingStatus === "UNMAPPED").length ?? 0,
+          conflictCount: previewRowsResponse?.data.filter((row) => row.mappingStatus === "CONFLICT").length ?? 0,
           multipleRuleMatchCount:
             previewRowsResponse?.data.filter((row) => row.mappingReason === "MULTIPLE_RULE_MATCHES").length ?? 0,
           intentionallyUnmappedCount:

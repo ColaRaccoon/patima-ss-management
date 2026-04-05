@@ -14,11 +14,25 @@ import { formatCurrency, formatDate, formatNullableText, formatNumber } from "@/
 
 function emptySignatureDraft() {
   return {
-    standardProductName: "",
-    standardOptionName: "",
     displayName: "",
+    matchAliasesText: "",
     memo: "",
   };
+}
+
+function aliasesToText(aliases: string[]) {
+  return aliases.join("\n");
+}
+
+function parseAliases(value: string) {
+  return Array.from(
+    new Set(
+      value
+        .split(/\r?\n|,/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
 }
 
 function emptyCampaignDraft(defaultSalesUnitId = "") {
@@ -28,8 +42,23 @@ function emptyCampaignDraft(defaultSalesUnitId = "") {
   };
 }
 
+function toneForMappingStatus(status: "MAPPED" | "UNMAPPED" | "CONFLICT") {
+  if (status === "MAPPED") {
+    return "success" as const;
+  }
+  if (status === "CONFLICT") {
+    return "danger" as const;
+  }
+  return "warning" as const;
+}
+
 function pickDefaultAdCostId(adCosts: MappingsPageData["adCosts"]) {
-  return adCosts.find((item) => item.mappingStatus === "UNMAPPED")?.id ?? adCosts[0]?.id ?? null;
+  return (
+    adCosts.find((item) => item.mappingStatus === "CONFLICT")?.id ??
+    adCosts.find((item) => item.mappingStatus === "UNMAPPED")?.id ??
+    adCosts[0]?.id ??
+    null
+  );
 }
 
 export function MappingsView({ data }: { data: MappingsPageData }) {
@@ -76,16 +105,29 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const hiddenZeroCostCount = data.adCosts.length - visibleAdCosts.length;
   const selectedAdCost = visibleAdCosts.find((adCost) => adCost.id === selectedAdCostId) ?? null;
   const isBusy = isSavingOrder || isSavingCampaign || isSavingAdCost || isRefreshing;
+  const conflictSignatureCount = data.signatures.filter((signature) => signature.mappingStatus === "CONFLICT").length;
+  const conflictAdCostCount = data.adCosts.filter((adCost) => adCost.mappingStatus === "CONFLICT").length;
 
   useEffect(() => {
     if (selectedSignature) {
+      const suggestedAliases = [
+        selectedSignature.rawProductNameSnapshot,
+        [selectedSignature.rawProductNameSnapshot, selectedSignature.rawOptionInfoSnapshot]
+          .filter(Boolean)
+          .join(" "),
+        selectedSignature.sourceSignature,
+      ].filter(Boolean);
+
       setSignatureSalesUnitId(
         selectedSignature.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? "",
       );
       setSignatureDraft({
-        standardProductName: selectedSignature.rawProductNameSnapshot,
-        standardOptionName: selectedSignature.rawOptionInfoSnapshot ?? "",
-        displayName: selectedSignature.canonicalDisplayName ?? "",
+        displayName:
+          selectedSignature.canonicalDisplayName ??
+          [selectedSignature.rawProductNameSnapshot, selectedSignature.rawOptionInfoSnapshot]
+            .filter(Boolean)
+            .join(" / "),
+        matchAliasesText: aliasesToText(parseAliases(suggestedAliases.join("\n"))),
         memo: "",
       });
       return;
@@ -142,20 +184,17 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   if (!data.primaryStore) {
     return (
       <EmptyState
-        title="매핑 관리를 시작하려면 대표 스토어가 필요합니다."
-        description="주문 원본과 광고 캠페인 모두 대표 스토어 기준으로 연결됩니다."
+        title="Mappings need a store first."
+        description="Order signatures and ad campaigns are grouped by the primary store."
         actionHref="/settings/stores"
-        actionLabel="스토어 설정"
+        actionLabel="Open store settings"
       />
     );
   }
 
   const primaryStore = data.primaryStore;
 
-  function refreshWithMessage(
-    target: "order" | "campaign" | "ad-cost",
-    message: string,
-  ) {
+  function refreshWithMessage(target: "order" | "campaign" | "ad-cost", message: string) {
     if (target === "order") {
       setOrderSuccess(message);
     } else if (target === "campaign") {
@@ -171,7 +210,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   async function handleSaveOrderMapping() {
     if (!selectedSignature || !signatureSalesUnitId) {
-      setOrderError("매핑할 판매단위를 선택해주세요.");
+      setOrderError("Select a sales unit first.");
       return;
     }
 
@@ -193,7 +232,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         throw new Error(payload?.message ?? "Failed to save order mapping.");
       }
 
-      refreshWithMessage("order", "주문 매핑을 저장했습니다.");
+      refreshWithMessage("order", "Order mapping saved.");
     } catch (error) {
       setOrderError(error instanceof Error ? error.message : "Failed to save order mapping.");
     } finally {
@@ -203,12 +242,18 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   async function handleCreateAndMap() {
     if (!selectedSignature) {
-      setOrderError("주문 시그니처를 먼저 선택해주세요.");
+      setOrderError("Select an order signature first.");
       return;
     }
 
-    if (!signatureDraft.standardProductName.trim()) {
-      setOrderError("표준 상품명은 필수입니다.");
+    if (!signatureDraft.displayName.trim()) {
+      setOrderError("displayName is required.");
+      return;
+    }
+
+    const matchAliases = parseAliases(signatureDraft.matchAliasesText);
+    if (!matchAliases.length) {
+      setOrderError("Add at least one match alias.");
       return;
     }
 
@@ -222,9 +267,8 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          standardProductName: signatureDraft.standardProductName.trim(),
-          standardOptionName: signatureDraft.standardOptionName.trim() || null,
-          displayName: signatureDraft.displayName.trim() || null,
+          displayName: signatureDraft.displayName.trim(),
+          matchAliases,
           memo: signatureDraft.memo.trim() || null,
         }),
       });
@@ -233,11 +277,9 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         throw new Error(payload?.message ?? "Failed to create and map sales unit.");
       }
 
-      refreshWithMessage("order", "신규 판매단위를 만들고 바로 매핑했습니다.");
+      refreshWithMessage("order", "Created a sales unit and mapped the signature.");
     } catch (error) {
-      setOrderError(
-        error instanceof Error ? error.message : "Failed to create and map sales unit.",
-      );
+      setOrderError(error instanceof Error ? error.message : "Failed to create and map sales unit.");
     } finally {
       setIsSavingOrder(false);
     }
@@ -245,7 +287,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   async function handleSaveCampaign() {
     if (!campaignDraft.canonicalSalesUnitId || !campaignDraft.campaignPattern.trim()) {
-      setCampaignError("판매단위와 campaignPattern을 모두 입력해주세요.");
+      setCampaignError("Select a sales unit and enter a campaign pattern.");
       return;
     }
 
@@ -274,7 +316,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
       refreshWithMessage(
         "campaign",
-        selectedMapping ? "캠페인 규칙을 수정했습니다." : "캠페인 규칙을 추가했습니다.",
+        selectedMapping ? "Campaign mapping updated." : "Campaign mapping created.",
       );
     } catch (error) {
       setCampaignError(error instanceof Error ? error.message : "Failed to save campaign mapping.");
@@ -302,7 +344,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
       refreshWithMessage(
         "campaign",
-        nextAction === "activate" ? "캠페인 규칙을 활성화했습니다." : "캠페인 규칙을 비활성화했습니다.",
+        nextAction === "activate" ? "Campaign mapping activated." : "Campaign mapping deactivated.",
       );
     } catch (error) {
       setCampaignError(
@@ -315,7 +357,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   async function handleIntentionalUnmapped() {
     if (!selectedAdCost || !intentionalReason.trim()) {
-      setAdCostError("사유 메모를 입력해주세요.");
+      setAdCostError("Enter a reason note first.");
       return;
     }
 
@@ -340,7 +382,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         throw new Error(payload?.message ?? "Failed to save intentional-unmapped note.");
       }
 
-      refreshWithMessage("ad-cost", "광고 row를 의도적 제외로 처리했습니다.");
+      refreshWithMessage("ad-cost", "Marked the ad row as intentionally unmapped.");
     } catch (error) {
       setAdCostError(
         error instanceof Error ? error.message : "Failed to save intentional-unmapped note.",
@@ -352,7 +394,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   async function handleSaveAdCostMapping() {
     if (!selectedAdCost || !adCostSalesUnitId) {
-      setAdCostError("매핑할 판매단위를 선택해주세요.");
+      setAdCostError("Select a sales unit first.");
       return;
     }
 
@@ -374,7 +416,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         throw new Error(payload?.message ?? "Failed to save ad cost mapping.");
       }
 
-      refreshWithMessage("ad-cost", "광고 row를 판매단위에 수동 매핑했습니다.");
+      refreshWithMessage("ad-cost", "Saved the ad cost mapping.");
     } catch (error) {
       setAdCostError(error instanceof Error ? error.message : "Failed to save ad cost mapping.");
     } finally {
@@ -399,7 +441,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         throw new Error(payload?.message ?? "Failed to recalculate ad cost mapping.");
       }
 
-      refreshWithMessage("ad-cost", "광고 row 매핑을 규칙 기준으로 다시 계산했습니다.");
+      refreshWithMessage("ad-cost", "Recalculated the ad cost mapping.");
     } catch (error) {
       setAdCostError(
         error instanceof Error ? error.message : "Failed to recalculate ad cost mapping.",
@@ -413,12 +455,12 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     <div className="space-y-6">
       <PageHeader
         eyebrow="Mappings"
-        title="주문 원본과 광고 캠페인 연결"
-        description="기존에 있던 정적 표를 실제 저장 액션과 연결해 주문/광고 매핑을 바로 수정할 수 있게 구성했습니다."
+        title="Order and ad mappings"
+        description="Review source signatures, create sales units quickly, and resolve ad mapping conflicts in one place."
         actions={
           <>
             <Link className="button-shell button-secondary" href="/sales-units">
-              판매단위 보기
+              Open sales units
             </Link>
             <button
               className="button-shell button-primary"
@@ -431,7 +473,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 setCampaignSuccess(null);
               }}
             >
-              새 캠페인 규칙
+              New campaign rule
             </button>
           </>
         }
@@ -439,27 +481,22 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
       <SourceBanner sources={data.sources} />
 
+      {conflictSignatureCount > 0 || conflictAdCostCount > 0 ? (
+        <div className="rounded-2xl border border-red-300/40 bg-red-100/70 px-4 py-4 text-sm leading-6 text-red-800">
+          <p className="font-semibold">CONFLICT items require manual review.</p>
+          <p className="mt-1">
+            Order signatures {formatNumber(conflictSignatureCount)} / Ad rows {formatNumber(conflictAdCostCount)}
+          </p>
+        </div>
+      ) : null}
+
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">
         <Panel
-          title="주문 원본 매핑"
-          description="기존 시그니처를 기존 판매단위에 연결하거나, 새 판매단위를 생성하면서 바로 연결할 수 있습니다."
+          title="Order signatures"
+          description="Pick an existing sales unit or create a new one with aliases that will be used by auto-mapping."
         >
-          <div className="hidden">
-            <label className="inline-flex items-center gap-2 text-sm text-ink/70">
-              <input
-                type="checkbox"
-                checked={hideZeroCostAdRows}
-                onChange={(event) => setHideZeroCostAdRows(event.target.checked)}
-              />
-              광고비 0원 숨기기
-            </label>
-            {hideZeroCostAdRows && hiddenZeroCostCount > 0 ? (
-              <p className="text-sm text-ink/55">{formatNumber(hiddenZeroCostCount)}개 숨김</p>
-            ) : null}
-          </div>
-
           <DataTable
-            caption="주문 원본 매핑"
+            caption="Order signatures"
             columns={[
               {
                 key: "select",
@@ -481,7 +518,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               },
               {
                 key: "signature",
-                title: "원본 시그니처",
+                title: "Source",
                 render: (row) => (
                   <div>
                     <p className="font-semibold text-ink">{row.sourceSignature}</p>
@@ -493,19 +530,19 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               },
               {
                 key: "usageCount",
-                title: "사용 건수",
+                title: "Usage",
                 render: (row) => formatNumber(row.usageCount),
               },
               {
                 key: "mapping",
-                title: "현재 매핑",
+                title: "Status",
                 render: (row) => (
                   <div>
-                    <StatusBadge tone={row.mappingStatus === "MAPPED" ? "success" : "warning"}>
+                    <StatusBadge tone={toneForMappingStatus(row.mappingStatus)}>
                       {row.mappingStatus}
                     </StatusBadge>
                     <p className="mt-2 text-sm text-ink/65">
-                      {row.canonicalDisplayName ?? "미매핑"}
+                      {row.canonicalDisplayName ?? "Unmapped"}
                     </p>
                   </div>
                 ),
@@ -517,8 +554,8 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         </Panel>
 
         <Panel
-          title="주문 매핑 실행"
-          description="선택된 시그니처를 기존 판매단위에 연결하거나 신규 판매단위를 만들 수 있습니다."
+          title="Quick create"
+          description="Create a sales unit using displayName, matchAliases, and memo, then map the selected signature immediately."
         >
           {selectedSignature ? (
             <div className="space-y-4">
@@ -528,16 +565,21 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   {selectedSignature.rawProductNameSnapshot} /{" "}
                   {formatNullableText(selectedSignature.rawOptionInfoSnapshot)}
                 </p>
+                <div className="mt-3">
+                  <StatusBadge tone={toneForMappingStatus(selectedSignature.mappingStatus)}>
+                    {selectedSignature.mappingStatus}
+                  </StatusBadge>
+                </div>
               </div>
 
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">기존 판매단위 선택</span>
+                <span className="mb-2 block text-sm font-medium text-ink">Map to existing sales unit</span>
                 <select
                   className="input-shell"
                   value={signatureSalesUnitId}
                   onChange={(event) => setSignatureSalesUnitId(event.target.value)}
                 >
-                  <option value="">선택</option>
+                  <option value="">Select</option>
                   {data.salesUnits.map((salesUnit) => (
                     <option key={salesUnit.id} value={salesUnit.id}>
                       {salesUnit.displayName}
@@ -552,63 +594,66 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 disabled={isBusy || !data.salesUnits.length}
                 onClick={() => void handleSaveOrderMapping()}
               >
-                기존 판매단위로 매핑
+                Save existing mapping
               </button>
 
               <div className="rounded-2xl border border-ink/10 p-4">
-                <p className="mb-4 text-sm font-medium text-ink">신규 판매단위 생성 후 바로 매핑</p>
+                <p className="mb-4 text-sm font-medium text-ink">Create a new sales unit and map it now</p>
                 <div className="space-y-3">
-                  <input
-                    className="input-shell"
-                    placeholder="표준 상품명"
-                    value={signatureDraft.standardProductName}
-                    onChange={(event) =>
-                      setSignatureDraft((current) => ({
-                        ...current,
-                        standardProductName: event.target.value,
-                      }))
-                    }
-                  />
-                  <input
-                    className="input-shell"
-                    placeholder="표준 옵션명"
-                    value={signatureDraft.standardOptionName}
-                    onChange={(event) =>
-                      setSignatureDraft((current) => ({
-                        ...current,
-                        standardOptionName: event.target.value,
-                      }))
-                    }
-                  />
-                  <input
-                    className="input-shell"
-                    placeholder="표시 이름"
-                    value={signatureDraft.displayName}
-                    onChange={(event) =>
-                      setSignatureDraft((current) => ({
-                        ...current,
-                        displayName: event.target.value,
-                      }))
-                    }
-                  />
-                  <textarea
-                    className="input-shell min-h-24"
-                    placeholder="메모"
-                    value={signatureDraft.memo}
-                    onChange={(event) =>
-                      setSignatureDraft((current) => ({
-                        ...current,
-                        memo: event.target.value,
-                      }))
-                    }
-                  />
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-ink">displayName</span>
+                    <input
+                      className="input-shell"
+                      value={signatureDraft.displayName}
+                      onChange={(event) =>
+                        setSignatureDraft((current) => ({
+                          ...current,
+                          displayName: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-ink">matchAliases</span>
+                    <textarea
+                      className="input-shell min-h-32"
+                      value={signatureDraft.matchAliasesText}
+                      onChange={(event) =>
+                        setSignatureDraft((current) => ({
+                          ...current,
+                          matchAliasesText: event.target.value,
+                        }))
+                      }
+                      placeholder={"one alias per line\ncomma also works"}
+                    />
+                  </label>
+
+                  <p className="text-xs leading-5 text-ink/55">
+                    displayName is for UI only. Auto-mapping uses matchAliases only.
+                  </p>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-ink">memo</span>
+                    <textarea
+                      className="input-shell min-h-24"
+                      value={signatureDraft.memo}
+                      onChange={(event) =>
+                        setSignatureDraft((current) => ({
+                          ...current,
+                          memo: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+
                   <button
                     className="button-shell button-secondary"
                     type="button"
                     disabled={isBusy}
                     onClick={() => void handleCreateAndMap()}
                   >
-                    신규 판매단위 생성 후 매핑
+                    Create and map
                   </button>
                 </div>
               </div>
@@ -626,18 +671,18 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               ) : null}
             </div>
           ) : (
-            <p className="text-sm text-ink/60">선택된 주문 시그니처가 없습니다.</p>
+            <p className="text-sm text-ink/60">No order signature selected.</p>
           )}
         </Panel>
       </div>
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)]">
         <Panel
-          title="광고 row 매핑 상태"
-          description="의도적 제외 메모를 바로 백엔드에 저장할 수 있게 연결했습니다."
+          title="Ad cost rows"
+          description="Conflict rows are surfaced first so they can be reviewed before profit totals are trusted."
         >
           <DataTable
-            caption="광고 비용 row"
+            caption="Ad cost rows"
             columns={[
               {
                 key: "select",
@@ -659,7 +704,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               },
               {
                 key: "campaignName",
-                title: "캠페인",
+                title: "Campaign",
                 render: (row) => (
                   <div>
                     <p className="font-semibold text-ink">{row.campaignName}</p>
@@ -669,15 +714,15 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               },
               {
                 key: "cost",
-                title: "광고비",
+                title: "Cost",
                 render: (row) => formatCurrency(row.totalCost),
               },
               {
                 key: "mappingReason",
-                title: "매핑 상태",
+                title: "Status",
                 render: (row) => (
                   <div>
-                    <StatusBadge tone={row.mappingStatus === "MAPPED" ? "success" : "warning"}>
+                    <StatusBadge tone={toneForMappingStatus(row.mappingStatus)}>
                       {row.mappingStatus}
                     </StatusBadge>
                     <p className="mt-2 text-xs text-ink/55">
@@ -688,8 +733,8 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               },
               {
                 key: "displayName",
-                title: "판매단위",
-                render: (row) => row.canonicalDisplayName ?? "미매핑",
+                title: "Sales unit",
+                render: (row) => row.canonicalDisplayName ?? "Unmapped",
               },
             ]}
             rows={visibleAdCosts}
@@ -702,34 +747,39 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 checked={hideZeroCostAdRows}
                 onChange={(event) => setHideZeroCostAdRows(event.target.checked)}
               />
-              광고비 0원 숨기기
+              Hide zero-cost rows
             </label>
             {hideZeroCostAdRows && hiddenZeroCostCount > 0 ? (
-              <p className="text-sm text-ink/55">{formatNumber(hiddenZeroCostCount)}개 숨김</p>
+              <p className="text-sm text-ink/55">{formatNumber(hiddenZeroCostCount)} hidden</p>
             ) : null}
           </div>
         </Panel>
 
         <Panel
-          title="의도적 제외 메모"
-          description="광고 row를 수동으로 제외 처리할 때 reasonNote를 저장합니다."
+          title="Ad mapping actions"
+          description="Resolve conflicts with a manual mapping, recalculate from rules, or mark the row as intentionally unmapped."
         >
           {selectedAdCost ? (
             <div className="space-y-4">
               <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
                 <p className="font-semibold text-ink">{selectedAdCost.campaignName}</p>
-                <p>광고비 {formatCurrency(selectedAdCost.totalCost)}</p>
-                <p>현재 상태 {selectedAdCost.mappingReason ?? selectedAdCost.mappingStatus}</p>
+                <p>Cost {formatCurrency(selectedAdCost.totalCost)}</p>
+                <div className="mt-3">
+                  <StatusBadge tone={toneForMappingStatus(selectedAdCost.mappingStatus)}>
+                    {selectedAdCost.mappingStatus}
+                  </StatusBadge>
+                </div>
+                <p className="mt-2">{selectedAdCost.mappingReason ?? "RULE_MATCHED"}</p>
               </div>
 
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">판매단위 선택</span>
+                <span className="mb-2 block text-sm font-medium text-ink">Sales unit</span>
                 <select
                   className="input-shell"
                   value={adCostSalesUnitId}
                   onChange={(event) => setAdCostSalesUnitId(event.target.value)}
                 >
-                  <option value="">선택</option>
+                  <option value="">Select</option>
                   {data.salesUnits.map((salesUnit) => (
                     <option key={salesUnit.id} value={salesUnit.id}>
                       {salesUnit.displayName}
@@ -745,7 +795,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   disabled={isBusy || !data.salesUnits.length}
                   onClick={() => void handleSaveAdCostMapping()}
                 >
-                  판매단위로 수동 매핑
+                  Save manual mapping
                 </button>
                 <button
                   className="button-shell button-ghost"
@@ -753,7 +803,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   disabled={isBusy}
                   onClick={() => void handleRecalculateAdCostMapping()}
                 >
-                  자동 규칙으로 다시 계산
+                  Recalculate
                 </button>
               </div>
 
@@ -761,7 +811,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 className="input-shell min-h-28"
                 value={intentionalReason}
                 onChange={(event) => setIntentionalReason(event.target.value)}
-                placeholder="의도적 제외 사유 메모"
+                placeholder="Reason note"
               />
 
               <button
@@ -770,7 +820,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 disabled={isBusy}
                 onClick={() => void handleIntentionalUnmapped()}
               >
-                의도적 제외로 저장
+                Mark intentionally unmapped
               </button>
 
               {adCostError ? (
@@ -786,18 +836,18 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               ) : null}
             </div>
           ) : (
-            <p className="text-sm text-ink/60">선택된 광고 row가 없습니다.</p>
+            <p className="text-sm text-ink/60">No ad row selected.</p>
           )}
         </Panel>
       </div>
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)]">
         <Panel
-          title="캠페인 규칙"
-          description="생성, 수정, 활성/비활성 전환을 모두 프론트에서 직접 실행할 수 있습니다."
+          title="Campaign rules"
+          description="Active rules are applied before alias fallback logic."
         >
           <DataTable
-            caption="캠페인 매핑 규칙"
+            caption="Campaign rules"
             columns={[
               {
                 key: "select",
@@ -819,7 +869,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               },
               {
                 key: "pattern",
-                title: "campaignPattern",
+                title: "Pattern",
                 render: (row) => (
                   <div>
                     <p className="font-semibold text-ink">{row.campaignPattern}</p>
@@ -829,12 +879,12 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               },
               {
                 key: "salesUnit",
-                title: "판매단위",
+                title: "Sales unit",
                 render: (row) => row.canonicalDisplayName,
               },
               {
                 key: "enabled",
-                title: "상태",
+                title: "State",
                 render: (row) => (
                   <StatusBadge tone={row.isEnabled ? "success" : "muted"}>
                     {row.isEnabled ? "ENABLED" : "DISABLED"}
@@ -848,12 +898,12 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         </Panel>
 
         <Panel
-          title={selectedMapping ? "캠페인 규칙 수정" : "새 캠페인 규칙"}
-          description="활성 규칙을 선택하면 수정, 선택을 해제하면 신규 생성 모드로 동작합니다."
+          title={selectedMapping ? "Edit campaign rule" : "New campaign rule"}
+          description="Create a new contains rule or update the currently selected one."
         >
           <div className="space-y-4">
             <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">판매단위</span>
+              <span className="mb-2 block text-sm font-medium text-ink">Sales unit</span>
               <select
                 className="input-shell"
                 value={campaignDraft.canonicalSalesUnitId}
@@ -864,7 +914,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   }))
                 }
               >
-                <option value="">선택</option>
+                <option value="">Select</option>
                 {data.salesUnits.map((salesUnit) => (
                   <option key={salesUnit.id} value={salesUnit.id}>
                     {salesUnit.displayName}
@@ -906,7 +956,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 disabled={isBusy || !data.salesUnits.length}
                 onClick={() => void handleSaveCampaign()}
               >
-                {selectedMapping ? "규칙 저장" : "규칙 생성"}
+                {selectedMapping ? "Save changes" : "Create rule"}
               </button>
               <button
                 className="button-shell button-secondary"
@@ -914,7 +964,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 disabled={isBusy || !selectedMapping || selectedMapping.isEnabled}
                 onClick={() => void handleToggleCampaign("activate")}
               >
-                활성화
+                Activate
               </button>
               <button
                 className="button-shell button-ghost"
@@ -922,7 +972,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 disabled={isBusy || !selectedMapping || !selectedMapping.isEnabled}
                 onClick={() => void handleToggleCampaign("deactivate")}
               >
-                비활성화
+                Deactivate
               </button>
             </div>
           </div>

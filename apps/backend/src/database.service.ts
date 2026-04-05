@@ -3,7 +3,7 @@ import { DatabaseShape } from "@patima/shared";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { Pool, PoolClient } from "pg";
-import { createEmptyDatabase } from "./helpers";
+import { createEmptyDatabase, getSignatureMappingStatus, migrateCanonicalSalesUnit } from "./helpers";
 
 type DatabaseCollectionKey = keyof DatabaseShape;
 
@@ -95,7 +95,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   }
 
   private loadSnapshotFromFile(): DatabaseShape {
-    return JSON.parse(readFileSync(this.filePath, "utf-8")) as DatabaseShape;
+    return this.normalizeSnapshot(JSON.parse(readFileSync(this.filePath, "utf-8")) as DatabaseShape);
   }
 
   private cloneSnapshot<T>(value: T): T {
@@ -159,11 +159,25 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       (snapshot[table.key] as unknown[]) = result.rows.map((row) => row.payload);
     }
 
-    return snapshot;
+    return this.normalizeSnapshot(snapshot);
   }
 
   private isEmptySnapshot(snapshot: DatabaseShape) {
     return STORAGE_TABLES.every((table) => snapshot[table.key].length === 0);
+  }
+
+  private normalizeSnapshot(snapshot: DatabaseShape): DatabaseShape {
+    const normalized = this.cloneSnapshot(snapshot);
+
+    normalized.canonicalSalesUnits = normalized.canonicalSalesUnits.map((item) =>
+      migrateCanonicalSalesUnit(item as never),
+    );
+    normalized.orderSourceSignatures = normalized.orderSourceSignatures.map((item) => ({
+      ...item,
+      mappingStatus: getSignatureMappingStatus(item),
+    }));
+
+    return normalized;
   }
 
   private queuePostgresPersistence(snapshot: DatabaseShape) {

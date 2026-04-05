@@ -63,6 +63,7 @@ export class OrderMappingService implements OnModuleInit {
     this.databaseService.write((draft) => {
       const target = draft.orderSourceSignatures.find((item) => item.id === signatureId)!;
       target.canonicalSalesUnitId = payload.canonicalSalesUnitId;
+      target.mappingStatus = "MAPPED";
       target.confirmedAt = nowIso();
       target.updatedAt = nowIso();
     });
@@ -81,7 +82,7 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  createAndMap(signatureId: string, payload: { standardProductName: string; standardOptionName?: string | null; displayName?: string | null; memo?: string | null }) {
+  createAndMap(signatureId: string, payload: { displayName: string; matchAliases?: string[] | null; memo?: string | null }) {
     const snapshot = this.databaseService.getSnapshot();
     const signature = snapshot.orderSourceSignatures.find((item) => item.id === signatureId);
     if (!signature) {
@@ -94,9 +95,8 @@ export class OrderMappingService implements OnModuleInit {
     this.storeService.ensureWritable(signature.storeId);
     const createdResponse = this.salesUnitService.create({
       storeId: signature.storeId,
-      standardProductName: payload.standardProductName,
-      standardOptionName: payload.standardOptionName,
       displayName: payload.displayName,
+      matchAliases: payload.matchAliases,
       memo: payload.memo,
     });
     const created = createdResponse.data;

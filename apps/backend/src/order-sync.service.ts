@@ -7,6 +7,8 @@ import {
   ensureKstDateRange,
   ensureStoreExists,
   formatApiSuccess,
+  getOrderItemMappingStatus,
+  getSignatureMappingStatus,
   mapOrderItemResponse,
   nowIso,
   paginate,
@@ -293,7 +295,7 @@ export class OrderSyncService implements OnModuleInit {
     dateTo?: string;
     productName?: string;
     optionInfo?: string;
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED";
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
     orderStatus?: string;
     saleStatus?: string;
     paymentDateStatus?: "ALL" | "PRESENT" | "MISSING";
@@ -314,9 +316,7 @@ export class OrderSyncService implements OnModuleInit {
       .filter((item) => (keywordOption ? item.normalizedOptionInfo.includes(keywordOption) : true))
       .filter((item) =>
         query.mappingStatus && query.mappingStatus !== "ALL"
-          ? query.mappingStatus === "MAPPED"
-            ? !!item.canonicalSalesUnitId
-            : !item.canonicalSalesUnitId
+          ? getOrderItemMappingStatus(snapshot, item) === query.mappingStatus
           : true,
       )
       .filter((item) => (query.orderStatus ? item.orderStatus === query.orderStatus : true))
@@ -341,7 +341,7 @@ export class OrderSyncService implements OnModuleInit {
 
   listOrderSourceSignatures(query: {
     storeId: string;
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED";
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
     q?: string;
     page?: number;
     pageSize?: number;
@@ -359,9 +359,7 @@ export class OrderSyncService implements OnModuleInit {
       .filter((item) => item.storeId === query.storeId)
       .filter((item) =>
         query.mappingStatus && query.mappingStatus !== "ALL"
-          ? query.mappingStatus === "MAPPED"
-            ? !!item.canonicalSalesUnitId
-            : !item.canonicalSalesUnitId
+          ? getSignatureMappingStatus(item) === query.mappingStatus
           : true,
       )
       .filter((item) =>
@@ -379,7 +377,7 @@ export class OrderSyncService implements OnModuleInit {
           rawProductNameSnapshot: item.rawProductNameSnapshot,
           rawOptionInfoSnapshot: item.rawOptionInfoSnapshot,
           sourceSignature: item.sourceSignature,
-          mappingStatus: item.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED",
+          mappingStatus: getSignatureMappingStatus(item),
           canonicalSalesUnitId: item.canonicalSalesUnitId,
           canonicalDisplayName: salesUnit?.displayName ?? null,
           usageCount: usageMap.get(item.id) ?? 0,
@@ -458,6 +456,7 @@ export class OrderSyncService implements OnModuleInit {
       normalizedProductName,
       normalizedOptionInfo,
       canonicalSalesUnitId: null,
+      mappingStatus: "UNMAPPED",
       confirmedAt: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),

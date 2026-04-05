@@ -5,7 +5,9 @@ import {
   calculateDailyProfitRows,
   calculateFee,
   formatApiSuccess,
+  getAdMappingStatus,
   getCostSettingForDate,
+  getOrderItemMappingStatus,
   paginate,
 } from "./helpers";
 
@@ -136,8 +138,10 @@ export class ProfitService {
         excludedOrderRevenue: excludedSummary.excludedOrderRevenue,
         excludedAdCost: excludedSummary.excludedAdCost,
         excludedUnmappedOrderRevenue: excludedSummary.excludedUnmappedOrderRevenue,
+        excludedConflictOrderRevenue: excludedSummary.excludedConflictOrderRevenue,
         excludedNonSaleOrderRevenue: excludedSummary.excludedNonSaleOrderRevenue,
         excludedUnmappedAdCost: excludedSummary.excludedUnmappedAdCost,
+        excludedConflictAdCost: excludedSummary.excludedConflictAdCost,
         excludedIntentionalUnmappedAdCost: excludedSummary.excludedIntentionalUnmappedAdCost,
         excludedOrderStatusCounts: {
           CANCELED: snapshot.orderItems.filter(
@@ -170,7 +174,16 @@ export class ProfitService {
         item.paymentDate >= dateFrom &&
         item.paymentDate <= dateTo &&
         item.saleStatus === "SALE" &&
-        !item.canonicalSalesUnitId,
+        getOrderItemMappingStatus(snapshot, item) === "UNMAPPED",
+    );
+    const conflictOrderItems = snapshot.orderItems.filter(
+      (item) =>
+        item.storeId === storeId &&
+        item.paymentDate &&
+        item.paymentDate >= dateFrom &&
+        item.paymentDate <= dateTo &&
+        item.saleStatus === "SALE" &&
+        getOrderItemMappingStatus(snapshot, item) === "CONFLICT",
     );
     const adRows = snapshot.adCampaignDailyCosts.filter(
       (item) =>
@@ -183,10 +196,15 @@ export class ProfitService {
     return formatApiSuccess({
       unmappedOrderItemCount: unmappedOrderItems.length,
       unmappedOrderRevenue: unmappedOrderItems.reduce((total, item) => total + item.productPaymentAmount, 0),
-      unmappedCampaignCount: adRows.filter((item) => item.mappingReason === "NO_RULE" || item.mappingReason === "MULTIPLE_RULES")
-        .length,
+      conflictOrderItemCount: conflictOrderItems.length,
+      conflictOrderRevenue: conflictOrderItems.reduce((total, item) => total + item.productPaymentAmount, 0),
+      unmappedCampaignCount: adRows.filter((item) => getAdMappingStatus(item) === "UNMAPPED").length,
       unmappedAdCost: adRows
-        .filter((item) => item.mappingReason === "NO_RULE" || item.mappingReason === "MULTIPLE_RULES")
+        .filter((item) => getAdMappingStatus(item) === "UNMAPPED")
+        .reduce((total, item) => total + item.totalCost, 0),
+      conflictCampaignCount: adRows.filter((item) => getAdMappingStatus(item) === "CONFLICT").length,
+      conflictAdCost: adRows
+        .filter((item) => getAdMappingStatus(item) === "CONFLICT")
         .reduce((total, item) => total + item.totalCost, 0),
       intentionalUnmappedCampaignCount: adRows.filter((item) => item.mappingReason === "INTENTIONALLY_UNMAPPED")
         .length,

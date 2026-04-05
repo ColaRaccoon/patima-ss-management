@@ -106,7 +106,7 @@ export class AppController {
     @Query("dateTo") dateTo?: string,
     @Query("productName") productName?: string,
     @Query("optionInfo") optionInfo?: string,
-    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED",
+    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("orderStatus") orderStatus?: string,
     @Query("saleStatus") saleStatus?: string,
     @Query("paymentDateStatus") paymentDateStatus?: "ALL" | "PRESENT" | "MISSING",
@@ -131,7 +131,7 @@ export class AppController {
   @Get("order-source-signatures")
   getOrderSourceSignatures(
     @Query("storeId") storeId: string,
-    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED",
+    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("q") q?: string,
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
@@ -151,9 +151,8 @@ export class AppController {
     @Body() body:
       | { canonicalSalesUnitId: string }
       | {
-          standardProductName: string;
-          standardOptionName?: string | null;
-          displayName?: string | null;
+          displayName: string;
+          matchAliases?: string[] | null;
           memo?: string | null;
         },
   ) {
@@ -174,14 +173,14 @@ export class AppController {
   }
 
   @Post("canonical-sales-units")
-  createSalesUnit(@Body() body: { storeId: string; standardProductName: string; standardOptionName?: string | null; displayName?: string | null; memo?: string | null }) {
+  createSalesUnit(@Body() body: { storeId: string; displayName: string; matchAliases?: string[] | null; memo?: string | null }) {
     return this.salesUnitService.create(body);
   }
 
   @Patch("canonical-sales-units/:salesUnitId")
   updateSalesUnit(
     @Param("salesUnitId") salesUnitId: string,
-    @Body() body: { standardProductName: string; standardOptionName?: string | null; displayName?: string | null; memo?: string | null },
+    @Body() body: { displayName: string; matchAliases?: string[] | null; memo?: string | null },
   ) {
     return this.salesUnitService.update(salesUnitId, body);
   }
@@ -234,7 +233,7 @@ export class AppController {
     @Query("storeId") storeId: string,
     @Query("dateFrom") dateFrom?: string,
     @Query("dateTo") dateTo?: string,
-    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED",
+    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {

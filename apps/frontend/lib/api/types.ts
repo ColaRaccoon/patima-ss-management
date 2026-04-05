@@ -79,7 +79,7 @@ export interface OrderListItem {
   paymentDate: string | null;
   orderStatus: string;
   saleStatus: SaleStatus;
-  mappingStatus: "MAPPED" | "UNMAPPED";
+  mappingStatus: "MAPPED" | "UNMAPPED" | "CONFLICT";
 }
 
 export interface OrderSourceSignatureListItem {
@@ -87,7 +87,7 @@ export interface OrderSourceSignatureListItem {
   rawProductNameSnapshot: string;
   rawOptionInfoSnapshot: string | null;
   sourceSignature: string;
-  mappingStatus: "MAPPED" | "UNMAPPED";
+  mappingStatus: "MAPPED" | "UNMAPPED" | "CONFLICT";
   canonicalSalesUnitId: string | null;
   canonicalDisplayName: string | null;
   usageCount: number;
@@ -96,9 +96,8 @@ export interface OrderSourceSignatureListItem {
 export interface SalesUnitListItem {
   id: string;
   storeId: string;
-  standardProductName: string;
-  standardOptionName: string | null;
   displayName: string;
+  matchAliases: string[];
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;
@@ -129,6 +128,7 @@ export interface AdPreviewSummary {
   mappingPreviewSummary: {
     mappedCount: number;
     unmappedCount: number;
+    conflictCount: number;
     multipleRuleMatchCount: number;
     intentionallyUnmappedCount: number;
   };
@@ -144,14 +144,14 @@ export interface AdPreviewRowItem {
   adStatus: string | null;
   weekdayLabel: string | null;
   totalCost: number;
-  mappingStatus: "MAPPED" | "UNMAPPED";
+  mappingStatus: "MAPPED" | "UNMAPPED" | "CONFLICT";
   mappingReason:
     | "NO_RULE_MATCH"
     | "MULTIPLE_RULE_MATCHES"
     | "MANUAL_MAPPED"
     | "INTENTIONALLY_UNMAPPED"
     | null;
-  displayMappingState: "MAPPED" | "UNMAPPED" | "INTENTIONALLY_UNMAPPED";
+  displayMappingState: "MAPPED" | "UNMAPPED" | "CONFLICT" | "INTENTIONALLY_UNMAPPED";
   matchedRuleCount: number;
   canonicalSalesUnitId: string | null;
   canonicalDisplayName: string | null;
@@ -167,7 +167,7 @@ export interface CampaignCostListItem {
   totalCost: number;
   canonicalSalesUnitId: string | null;
   canonicalDisplayName: string | null;
-  mappingStatus: "MAPPED" | "UNMAPPED";
+  mappingStatus: "MAPPED" | "UNMAPPED" | "CONFLICT";
   mappingReason:
     | "NO_RULE_MATCH"
     | "MULTIPLE_RULE_MATCHES"
@@ -237,8 +237,12 @@ export interface OperationDetail {
 export interface UnmappedSummary {
   unmappedOrderItemCount: number;
   unmappedOrderRevenue: number;
+  conflictOrderItemCount: number;
+  conflictOrderRevenue: number;
   unmappedCampaignCount: number;
   unmappedAdCost: number;
+  conflictCampaignCount: number;
+  conflictAdCost: number;
   intentionalUnmappedCampaignCount: number;
   intentionalUnmappedAdCost: number;
 }
@@ -290,8 +294,10 @@ export interface DailySalesUnitDetail {
     excludedOrderRevenue: number;
     excludedAdCost: number;
     excludedUnmappedOrderRevenue: number;
+    excludedConflictOrderRevenue: number;
     excludedNonSaleOrderRevenue: number;
     excludedUnmappedAdCost: number;
+    excludedConflictAdCost: number;
     excludedIntentionalUnmappedAdCost: number;
     excludedOrderStatusCounts: {
       CANCELED: number;
@@ -329,7 +335,7 @@ export interface OrdersPageFilters {
   dateTo: string;
   productName: string;
   optionInfo: string;
-  mappingStatus: "ALL" | "MAPPED" | "UNMAPPED";
+  mappingStatus: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
   saleStatus: string;
   orderStatus: string;
   paymentDateStatus: "ALL" | "PRESENT" | "MISSING";

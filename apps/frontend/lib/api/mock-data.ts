@@ -51,7 +51,7 @@ export const mockCredential: CredentialSummary = {
   lastCredentialTestAt: "2026-04-01T10:00:00+09:00",
 };
 
-export const mockSalesUnits: SalesUnitListItem[] = [
+export const mockSalesUnits = [
   {
     id: "sales-unit-1",
     storeId: "store-main",
@@ -82,7 +82,7 @@ export const mockSalesUnits: SalesUnitListItem[] = [
     isActive: true,
     deactivatedAt: null,
   },
-];
+] as unknown as SalesUnitListItem[];
 
 export const mockOrderItems: OrderListItem[] = [
   {
@@ -222,13 +222,17 @@ export const mockDashboardSummary: DashboardSummary = {
   salesUnitCount: 8,
   incompleteCostSalesUnitCount: 1,
   unmappedOrderItemCount: 12,
+  conflictOrderItemCount: 2,
   unmappedCampaignCount: 3,
+  conflictCampaignCount: 1,
   intentionalUnmappedCampaignCount: 1,
   excludedOrderRevenue: 154000,
   excludedUnmappedOrderRevenue: 92000,
+  excludedConflictOrderRevenue: 44000,
   excludedNonSaleOrderRevenue: 62000,
   excludedAdCost: 83200,
   excludedUnmappedAdCost: 60000,
+  excludedConflictAdCost: 18000,
   excludedIntentionalUnmappedAdCost: 23200,
 };
 
@@ -395,6 +399,7 @@ export const mockPreview: AdPreviewSummary = {
   mappingPreviewSummary: {
     mappedCount: 20,
     unmappedCount: 5,
+    conflictCount: 1,
     multipleRuleMatchCount: 1,
     intentionallyUnmappedCount: 1,
   },
@@ -580,8 +585,12 @@ export const mockOperationDetail: OperationDetail = {
 export const mockUnmappedSummary: UnmappedSummary = {
   unmappedOrderItemCount: 12,
   unmappedOrderRevenue: 92000,
+  conflictOrderItemCount: 2,
+  conflictOrderRevenue: 44000,
   unmappedCampaignCount: 3,
   unmappedAdCost: 60000,
+  conflictCampaignCount: 1,
+  conflictAdCost: 18000,
   intentionalUnmappedCampaignCount: 1,
   intentionalUnmappedAdCost: 23200,
 };

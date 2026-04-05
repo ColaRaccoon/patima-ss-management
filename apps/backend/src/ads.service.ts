@@ -14,6 +14,7 @@ import {
   createId,
   ensureStoreExists,
   formatApiSuccess,
+  getAdMappingStatus,
   getWeekdayNameKo,
   hashBuffer,
   nowIso,
@@ -369,7 +370,7 @@ export class AdsService implements OnModuleInit {
     storeId: string;
     dateFrom?: string;
     dateTo?: string;
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED";
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
     page?: number;
     pageSize?: number;
   }) {
@@ -383,9 +384,7 @@ export class AdsService implements OnModuleInit {
       .filter((item) => (query.dateFrom && query.dateTo ? item.reportDate >= query.dateFrom && item.reportDate <= query.dateTo : true))
       .filter((item) =>
         query.mappingStatus && query.mappingStatus !== "ALL"
-          ? query.mappingStatus === "MAPPED"
-            ? !!item.canonicalSalesUnitId
-            : !item.canonicalSalesUnitId
+          ? getAdMappingStatus(item) === query.mappingStatus
           : true,
       )
       .sort((left, right) => right.reportDate.localeCompare(left.reportDate));

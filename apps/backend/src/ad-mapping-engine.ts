@@ -30,9 +30,7 @@ export const getActiveCampaignMappings = (database: DatabaseShape, storeId: stri
 export const getAutoMatchSalesUnitsSnapshot = (database: DatabaseShape, storeId: string) =>
   getActiveSalesUnitsForAutoMapping(database, storeId).map((item) => ({
     id: item.id,
-    normalizedDisplayName: item.normalizedDisplayName,
-    normalizedStandardProductName: item.normalizedStandardProductName,
-    normalizedStandardOptionName: item.normalizedStandardOptionName,
+    normalizedMatchAliases: item.normalizedMatchAliases,
   }));
 
 export const getRuleSnapshotHash = (database: DatabaseShape, storeId: string): string =>

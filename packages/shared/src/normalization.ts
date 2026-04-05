@@ -11,6 +11,11 @@ export const normalizeText = (value: string | null | undefined): string => {
     .toLowerCase();
 };
 
+const MATCH_ALIAS_PATTERN = /[^\p{L}\p{N}]+/gu;
+
+export const normalizeMatchAlias = (value: string | null | undefined): string =>
+  normalizeText(value).replace(MATCH_ALIAS_PATTERN, "");
+
 export const createSourceSignature = (
   productName: string | null | undefined,
   optionInfo: string | null | undefined,

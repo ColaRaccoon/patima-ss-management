@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, useTransition, type FormEvent } from "react";
+import { useEffect, useState, useTransition, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
@@ -31,20 +31,15 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
 
-  const selectedProfit = useMemo(
-    () =>
-      data.profits.find(
-        (row) => `${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey,
-      ) ?? null,
-    [data.profits, selectedProfitKey],
-  );
-
   useEffect(() => {
     setSelectedDate(data.dateTo);
   }, [data.dateTo]);
 
   useEffect(() => {
-    if (selectedProfitKey && data.profits.some((row) => `${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey)) {
+    if (
+      selectedProfitKey &&
+      data.profits.some((row) => `${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey)
+    ) {
       return;
     }
 
@@ -73,30 +68,31 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   if (!data.primaryStore) {
     return (
       <EmptyState
-        title="손익 분석은 대표 스토어가 있어야 열립니다."
-        description="주문, 광고, 비용 데이터가 모여야 판매단위 기준 손익을 계산할 수 있습니다."
+        title="Profit analysis needs a primary store."
+        description="Orders, ads, and cost settings must be tied to one store before profit rows can be calculated."
         actionHref="/settings/stores"
-        actionLabel="스토어 설정"
+        actionLabel="Open store settings"
       />
     );
   }
 
   const deliveryFeeReferenceTotal =
     selectedDetail?.orderItems.reduce((total, item) => total + (item.deliveryFeeAmount ?? 0), 0) ?? 0;
+  const hasConflict = data.unmappedSummary.conflictOrderItemCount > 0 || data.unmappedSummary.conflictCampaignCount > 0;
 
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="Profits"
-        title="판매단위 손익 분석"
-        description={`조회 범위 ${formatDateRange(data.dateFrom, data.dateTo)}. roughProfit은 매출-광고비 기준이며, 비용이 비어 있으면 estimatedNetProfit이 null로 유지됩니다.`}
+        title="Sales-unit profit analysis"
+        description={`Range ${formatDateRange(data.dateFrom, data.dateTo)}. Conflict and unmapped rows are excluded from the aggregated totals.`}
       />
 
       <SourceBanner sources={data.sources} />
 
       <Panel
-        title="조회 날짜"
-        description={`현재 선택 ${formatDate(data.dateTo)}. 손익 테이블과 요약 카드는 선택한 하루 기준으로 다시 계산됩니다.`}
+        title="Filter date"
+        description={`Current date ${formatDate(data.dateTo)}. The table and summary cards are recalculated for the selected day.`}
       >
         <form
           className="flex flex-wrap items-end gap-3"
@@ -116,42 +112,51 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
             />
           </label>
           <button className="button-shell button-primary" type="submit" disabled={isRefreshing}>
-            해당 날짜 조회
+            Refresh
           </button>
         </form>
       </Panel>
 
-      <div className="grid gap-4 md:grid-cols-4">
-        <StatCard label="총 주문금액" value={formatCurrency(data.summary.totalRevenue)} />
-        <StatCard label="총 광고비" value={formatCurrency(data.summary.totalAdCost)} tone="accent" />
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="Revenue" value={formatCurrency(data.summary.totalRevenue)} />
+        <StatCard label="Ad cost" value={formatCurrency(data.summary.totalAdCost)} tone="accent" />
         <StatCard
-          label="러프 손익"
+          label="Rough profit"
           value={formatCurrency(data.summary.roughProfit)}
           tone={data.summary.roughProfit >= 0 ? "success" : "danger"}
         />
         <StatCard
-          label="추정 순이익"
+          label="Estimated net profit"
           value={formatCurrency(data.summary.estimatedNetProfit)}
           hint={
             data.summary.profitStatus === "INCOMPLETE_COST"
-              ? "INCOMPLETE 판매단위가 있어 총합을 비웠습니다."
+              ? "Some cost rows are incomplete."
               : undefined
           }
           tone={toneForProfitStatus(data.summary.profitStatus)}
         />
       </div>
 
+      {hasConflict ? (
+        <div className="rounded-2xl border border-red-300/40 bg-red-100/70 px-4 py-4 text-sm leading-6 text-red-800">
+          <p className="font-semibold">Conflict mappings are excluded from profit totals.</p>
+          <p className="mt-1">
+            Order revenue {formatCurrency(data.unmappedSummary.conflictOrderRevenue)} / Ad cost {formatCurrency(data.unmappedSummary.conflictAdCost)}
+          </p>
+        </div>
+      ) : null}
+
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
         <Panel
-          title="손익 테이블"
-          description="행을 선택하면 우측에서 실제 손익 상세와 원가/수수료 breakdown을 확인할 수 있습니다."
+          title="Daily profit rows"
+          description="Select a row to inspect the underlying cost breakdown and excluded totals."
         >
           <DataTable
-            caption="손익 목록"
+            caption="Daily profit rows"
             columns={[
               {
                 key: "select",
-                title: "선택",
+                title: "Select",
                 render: (row) => (
                   <button
                     className="button-shell button-ghost"
@@ -173,27 +178,25 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                               cache: "no-store",
                             },
                           ),
-                          "손익 상세 조회에 실패했습니다.",
+                          "Failed to load profit detail.",
                         );
                         setSelectedDetail(detail);
                       } catch (error) {
                         setDetailError(
-                          error instanceof Error
-                            ? error.message
-                            : "손익 상세 조회 중 오류가 발생했습니다.",
+                          error instanceof Error ? error.message : "Failed to load profit detail.",
                         );
                       } finally {
                         setIsLoadingDetail(false);
                       }
                     }}
                   >
-                    {`${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey ? "선택됨" : "선택"}
+                    {`${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey ? "Selected" : "Open"}
                   </button>
                 ),
               },
               {
                 key: "salesUnit",
-                title: "판매단위",
+                title: "Sales unit",
                 render: (row) => (
                   <div>
                     <p className="font-semibold text-ink">{row.displayName}</p>
@@ -203,32 +206,32 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
               },
               {
                 key: "quantity",
-                title: "판매수량",
+                title: "Qty",
                 render: (row) => formatNumber(row.totalQuantity),
               },
               {
                 key: "revenue",
-                title: "주문금액",
+                title: "Revenue",
                 render: (row) => formatCurrency(row.totalRevenue),
               },
               {
                 key: "adCost",
-                title: "광고비",
+                title: "Ad cost",
                 render: (row) => formatCurrency(row.totalAdCost),
               },
               {
                 key: "feeCost",
-                title: "수수료",
+                title: "Fee",
                 render: (row) => formatCurrency(row.totalFeeCost),
               },
               {
                 key: "roughProfit",
-                title: "러프 손익",
+                title: "Rough profit",
                 render: (row) => formatCurrency(row.roughProfit),
               },
               {
                 key: "netProfit",
-                title: "추정 순이익",
+                title: "Net profit",
                 render: (row) => formatCurrency(row.estimatedNetProfit),
               },
             ]}
@@ -238,19 +241,42 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
         </Panel>
 
         <div className="space-y-6">
-          <Panel title="미매핑/제외 요약">
+          <Panel title="Excluded totals">
             <div className="grid gap-3">
-              <StatCard label="미매핑 주문" value={formatCurrency(data.unmappedSummary.unmappedOrderRevenue)} />
-              <StatCard label="미매핑 광고" value={formatCurrency(data.unmappedSummary.unmappedAdCost)} />
               <StatCard
-                label="의도적 제외 광고"
-                value={formatCurrency(data.unmappedSummary.intentionalUnmappedAdCost)}
+                label="Unmapped order revenue"
+                value={formatCurrency(data.unmappedSummary.unmappedOrderRevenue)}
+                hint={`${formatNumber(data.unmappedSummary.unmappedOrderItemCount)} items`}
                 tone="warning"
+              />
+              <StatCard
+                label="Conflict order revenue"
+                value={formatCurrency(data.unmappedSummary.conflictOrderRevenue)}
+                hint={`${formatNumber(data.unmappedSummary.conflictOrderItemCount)} items`}
+                tone="danger"
+              />
+              <StatCard
+                label="Unmapped ad cost"
+                value={formatCurrency(data.unmappedSummary.unmappedAdCost)}
+                hint={`${formatNumber(data.unmappedSummary.unmappedCampaignCount)} campaigns`}
+                tone="warning"
+              />
+              <StatCard
+                label="Conflict ad cost"
+                value={formatCurrency(data.unmappedSummary.conflictAdCost)}
+                hint={`${formatNumber(data.unmappedSummary.conflictCampaignCount)} campaigns`}
+                tone="danger"
+              />
+              <StatCard
+                label="Intentional unmapped ad cost"
+                value={formatCurrency(data.unmappedSummary.intentionalUnmappedAdCost)}
+                hint={`${formatNumber(data.unmappedSummary.intentionalUnmappedCampaignCount)} campaigns`}
+                tone="muted"
               />
             </div>
           </Panel>
 
-          <Panel title="상세 미리보기">
+          <Panel title="Detail preview">
             {detailError ? (
               <div className="mb-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
                 {detailError}
@@ -265,17 +291,21 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                     {selectedDetail.summary.profitStatus}
                   </StatusBadge>
                 </div>
-                <p>주문 {formatNumber(selectedDetail.orderItems.length)}건 / 광고 {formatNumber(selectedDetail.adCampaigns.length)}건</p>
-                <p>총 판매수량 {formatNumber(selectedDetail.summary.totalQuantity)}개</p>
-                <p>계산된 수수료 {formatCurrency(selectedDetail.costBreakdown.computedFeeCost)}</p>
-                <p>fallback 수수료 사용분 {formatCurrency(selectedDetail.costBreakdown.fallbackFeeCostPortion)}</p>
-                <p>배송비 참고값 {formatCurrency(deliveryFeeReferenceTotal)}</p>
-                <p>제외 주문 매출 {formatCurrency(selectedDetail.excludedSummary.excludedOrderRevenue)}</p>
-                <p>제외 광고비 {formatCurrency(selectedDetail.excludedSummary.excludedAdCost)}</p>
-                {isLoadingDetail ? <p>상세를 불러오는 중입니다.</p> : null}
+                <p>
+                  Orders {formatNumber(selectedDetail.orderItems.length)} / Ads {formatNumber(selectedDetail.adCampaigns.length)}
+                </p>
+                <p>Total quantity {formatNumber(selectedDetail.summary.totalQuantity)}</p>
+                <p>Computed fee cost {formatCurrency(selectedDetail.costBreakdown.computedFeeCost)}</p>
+                <p>Fallback fee portion {formatCurrency(selectedDetail.costBreakdown.fallbackFeeCostPortion)}</p>
+                <p>Delivery reference {formatCurrency(deliveryFeeReferenceTotal)}</p>
+                <p>Excluded order revenue {formatCurrency(selectedDetail.excludedSummary.excludedOrderRevenue)}</p>
+                <p>Excluded conflict order revenue {formatCurrency(selectedDetail.excludedSummary.excludedConflictOrderRevenue)}</p>
+                <p>Excluded ad cost {formatCurrency(selectedDetail.excludedSummary.excludedAdCost)}</p>
+                <p>Excluded conflict ad cost {formatCurrency(selectedDetail.excludedSummary.excludedConflictAdCost)}</p>
+                {isLoadingDetail ? <p>Loading detail...</p> : null}
               </div>
             ) : (
-              <p className="text-sm text-ink/60">표시할 상세 미리보기가 없습니다.</p>
+              <p className="text-sm text-ink/60">No detail selected.</p>
             )}
           </Panel>
         </div>

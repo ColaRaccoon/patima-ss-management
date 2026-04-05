@@ -280,6 +280,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                   <option value="ALL">ALL</option>
                   <option value="MAPPED">MAPPED</option>
                   <option value="UNMAPPED">UNMAPPED</option>
+                  <option value="CONFLICT">CONFLICT</option>
                 </select>
               </label>
               <label className="block">

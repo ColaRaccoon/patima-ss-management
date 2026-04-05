@@ -16,18 +16,26 @@ import { toneForActive } from "@/lib/status-tone";
 
 function emptyDraft() {
   return {
-    standardProductName: "",
-    standardOptionName: "",
     displayName: "",
+    matchAliasesText: "",
     memo: "",
   };
 }
 
+function aliasesToText(matchAliases: string[]) {
+  return matchAliases.join("\n");
+}
+
+function parseAliases(value: string) {
+  return value
+    .split(/\r?\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   const router = useRouter();
-  const [selectedSalesUnitId, setSelectedSalesUnitId] = useState<string | null>(
-    data.salesUnits[0]?.id ?? null,
-  );
+  const [selectedSalesUnitId, setSelectedSalesUnitId] = useState<string | null>(data.salesUnits[0]?.id ?? null);
   const [isCreatingDraft, setIsCreatingDraft] = useState(data.salesUnits.length === 0);
   const [pendingCreatedSalesUnitId, setPendingCreatedSalesUnitId] = useState<string | null>(null);
   const [draft, setDraft] = useState(emptyDraft());
@@ -45,9 +53,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   useEffect(() => {
     if (selectedSalesUnit) {
       setDraft({
-        standardProductName: selectedSalesUnit.standardProductName,
-        standardOptionName: selectedSalesUnit.standardOptionName ?? "",
         displayName: selectedSalesUnit.displayName,
+        matchAliasesText: aliasesToText(selectedSalesUnit.matchAliases),
         memo: selectedSalesUnit.memo ?? "",
       });
       return;
@@ -57,10 +64,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   }, [selectedSalesUnit]);
 
   useEffect(() => {
-    if (
-      pendingCreatedSalesUnitId &&
-      data.salesUnits.some((item) => item.id === pendingCreatedSalesUnitId)
-    ) {
+    if (pendingCreatedSalesUnitId && data.salesUnits.some((item) => item.id === pendingCreatedSalesUnitId)) {
       setSelectedSalesUnitId(pendingCreatedSalesUnitId);
       setPendingCreatedSalesUnitId(null);
       setIsCreatingDraft(false);
@@ -81,10 +85,10 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   if (!data.primaryStore) {
     return (
       <EmptyState
-        title="표준 판매단위를 정의하려면 스토어가 먼저 필요합니다."
-        description="대표 스토어가 생성되면 주문 원본과 광고 캠페인을 안정적으로 묶을 수 있는 표준 판매단위를 정의할 수 있습니다."
+        title="판매단위를 정의하려면 먼저 스토어가 필요합니다."
+        description="스토어가 생성되면 주문 원본과 광고 캠페인을 안정적으로 연결할 판매단위를 관리할 수 있습니다."
         actionHref="/settings/stores"
-        actionLabel="스토어 설정 먼저 하기"
+        actionLabel="스토어 설정"
       />
     );
   }
@@ -113,22 +117,15 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
     setSuccessMessage(null);
     setIsToggling(true);
     try {
-      const response = await fetch(
-        `/api/canonical-sales-units/${selectedSalesUnit.id}/${nextAction}`,
-        {
-          method: "POST",
-        },
-      );
+      const response = await fetch(`/api/canonical-sales-units/${selectedSalesUnit.id}/${nextAction}`, {
+        method: "POST",
+      });
       const payload = (await response.json().catch(() => null)) as { message?: string } | null;
       if (!response.ok) {
         throw new Error(payload?.message ?? "상태 변경에 실패했습니다.");
       }
 
-      await refreshWithMessage(
-        nextAction === "activate"
-          ? "표준 판매단위를 다시 활성화했습니다."
-          : "표준 판매단위를 비활성화했습니다.",
-      );
+      await refreshWithMessage(nextAction === "activate" ? "판매단위를 다시 활성화했습니다." : "판매단위를 비활성화했습니다.");
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "상태 변경 중 오류가 발생했습니다.");
     } finally {
@@ -140,8 +137,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
     <div className="space-y-6">
       <PageHeader
         eyebrow="Sales Units"
-        title="표준 판매단위 정의"
-        description="표준 상품명, 표준 옵션명, 표시명을 분리해 관리하고, 비활성화 전후에도 과거 FK 조회 결과가 유지되도록 설계했습니다."
+        title="판매단위 정의"
+        description="표시명은 UI에만 쓰이고 자동 매핑은 matchAliases 기준으로만 동작합니다."
         actions={
           <>
             <Link className="button-shell button-secondary" href="/mappings">
@@ -160,7 +157,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                 setDraft(emptyDraft());
               }}
             >
-              새 판매단위 초안 추가
+              새 판매단위 추가
             </button>
           </>
         }
@@ -169,17 +166,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
       <SourceBanner sources={data.sources} />
 
       <div className="grid gap-4 md:grid-cols-3">
-        <StatCard
-          label="전체 판매단위"
-          value={formatNumber(data.salesUnits.length)}
-          hint={`활성 ${formatNumber(activeCount)}건`}
-        />
-        <StatCard
-          label="비용 미설정"
-          value={formatNumber(incompleteCostCount)}
-          hint="INCOMPLETE 후보"
-          tone="warning"
-        />
+        <StatCard label="전체 판매단위" value={formatNumber(data.salesUnits.length)} hint={`활성 ${formatNumber(activeCount)}개`} />
+        <StatCard label="비용 미설정" value={formatNumber(incompleteCostCount)} hint="INCOMPLETE 후보" tone="warning" />
         <StatCard
           label="활성 비용 row"
           value={formatNumber(data.costSettings.filter((item) => item.isActive).length)}
@@ -190,15 +178,15 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
         <Panel
-          title="표준 판매단위 목록"
-          description="같은 스토어 안에서는 정규화된 표시명과 표준 상품/옵션 조합이 중복될 수 없습니다."
+          title="판매단위 목록"
+          description="같은 스토어 안에서는 표시명과 normalize된 alias가 중복되지 않도록 관리합니다."
         >
           <DataTable
-            caption="표준 판매단위 목록"
+            caption="판매단위 목록"
             columns={[
               {
                 key: "select",
-                title: "편집",
+                title: "열기",
                 render: (row: SalesUnitListItem) => (
                   <button
                     className="button-shell button-ghost"
@@ -211,7 +199,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                       setSuccessMessage(null);
                     }}
                   >
-                    {selectedSalesUnitId === row.id ? "선택됨" : "편집"}
+                    {selectedSalesUnitId === row.id ? "선택됨" : "열기"}
                   </button>
                 ),
               },
@@ -222,7 +210,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                   <div>
                     <p className="font-semibold text-ink">{row.displayName}</p>
                     <p className="mt-1 text-xs text-ink/55">
-                      {row.standardProductName} / {row.standardOptionName ?? "-"}
+                      {row.matchAliases.length > 0 ? row.matchAliases.join(", ") : "alias 없음"}
                     </p>
                   </div>
                 ),
@@ -245,12 +233,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                 key: "costStatus",
                 title: "현재 비용",
                 render: (row) => {
-                  const cost = data.costSettings.find(
-                    (item) => item.canonicalSalesUnitId === row.id && item.isActive,
-                  );
-                  return cost
-                    ? `${formatNumber(cost.unitCost)}원 / ${formatPercent(cost.feeRate)}`
-                    : "미설정";
+                  const cost = data.costSettings.find((item) => item.canonicalSalesUnitId === row.id && item.isActive);
+                  return cost ? `${formatNumber(cost.unitCost)}원 / ${formatPercent(cost.feeRate)}` : "미설정";
                 },
               },
               {
@@ -265,8 +249,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
         </Panel>
 
         <Panel
-          title={isEditing ? "선택된 판매단위 수정" : "새 판매단위 만들기"}
-          description="백엔드 문서 기준 필드 구조와 활성 옵션 분리를 그대로 반영합니다."
+          title={isEditing ? "선택한 판매단위 수정" : "새 판매단위 만들기"}
+          description="matchAliases는 한 줄에 하나씩 입력하면 자동 매핑 기준으로 사용됩니다."
         >
           <form
             className="space-y-4"
@@ -275,17 +259,15 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
               setErrorMessage(null);
               setSuccessMessage(null);
 
-              if (!draft.standardProductName.trim()) {
-                setErrorMessage("표준 상품명은 필수입니다.");
+              if (!draft.displayName.trim()) {
+                setErrorMessage("표시 이름은 필수입니다.");
                 return;
               }
 
               setIsSubmitting(true);
               try {
                 const response = await fetch(
-                  isEditing
-                    ? `/api/canonical-sales-units/${selectedSalesUnit!.id}`
-                    : "/api/canonical-sales-units",
+                  isEditing ? `/api/canonical-sales-units/${selectedSalesUnit!.id}` : "/api/canonical-sales-units",
                   {
                     method: isEditing ? "PATCH" : "POST",
                     headers: {
@@ -293,9 +275,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                     },
                     body: JSON.stringify({
                       ...(isEditing ? {} : { storeId: primaryStore.id }),
-                      standardProductName: draft.standardProductName.trim(),
-                      standardOptionName: draft.standardOptionName.trim() || null,
-                      displayName: draft.displayName.trim() || null,
+                      displayName: draft.displayName.trim(),
+                      matchAliases: parseAliases(draft.matchAliasesText),
                       memo: draft.memo.trim() || null,
                     }),
                   },
@@ -306,58 +287,38 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                   data?: { id?: string };
                 } | null;
                 if (!response.ok) {
-                  throw new Error(payload?.message ?? "표준 판매단위 저장에 실패했습니다.");
+                  throw new Error(payload?.message ?? "판매단위 저장에 실패했습니다.");
                 }
 
                 if (!isEditing && typeof payload?.data?.id === "string") {
                   setPendingCreatedSalesUnitId(payload.data.id);
                 }
 
-                await refreshWithMessage(
-                  isEditing
-                    ? "표준 판매단위를 수정했습니다."
-                    : "표준 판매단위를 생성했습니다.",
-                );
+                await refreshWithMessage(isEditing ? "판매단위를 수정했습니다." : "판매단위를 생성했습니다.");
               } catch (error) {
-                setErrorMessage(error instanceof Error ? error.message : "저장 중 오류가 발생했습니다.");
+                setErrorMessage(error instanceof Error ? error.message : "처리 중 오류가 발생했습니다.");
               } finally {
                 setIsSubmitting(false);
               }
             }}
           >
             <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">표준 상품명</span>
+              <span className="mb-2 block text-sm font-medium text-ink">표시 이름</span>
               <input
                 className="input-shell"
-                placeholder="예: 스포츠 양말"
-                value={draft.standardProductName}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, standardProductName: event.target.value }))
-                }
-              />
-            </label>
-
-            <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">표준 옵션명</span>
-              <input
-                className="input-shell"
-                placeholder="예: 화이트 / 여성"
-                value={draft.standardOptionName}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, standardOptionName: event.target.value }))
-                }
-              />
-            </label>
-
-            <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">표시명</span>
-              <input
-                className="input-shell"
-                placeholder="예: 스포츠 양말 / 화이트 / 여성"
+                placeholder="예: 코벨 다이어트 양말"
                 value={draft.displayName}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, displayName: event.target.value }))
-                }
+                onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))}
+              />
+            </label>
+
+            <label className="block">
+              <span className="mb-2 block text-sm font-medium text-ink">matchAliases</span>
+              <textarea
+                className="input-shell min-h-28"
+                placeholder={"한 줄에 하나씩 alias를 입력하세요.\n코벨 다이어트 양말\n다이어트 양말\n코벨 다이어트"}
+                value={draft.matchAliasesText}
+                onChange={(event) => setDraft((current) => ({ ...current, matchAliasesText: event.target.value }))}
               />
             </label>
 
@@ -384,7 +345,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
             ) : null}
 
             <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-              비활성화된 판매단위는 과거 FK를 유지하지만, 신규 주문 매핑과 광고 규칙, 비용 row 생성 대상에서는 제외됩니다.
+              비활성화된 판매단위는 과거 FK를 유지하지만 신규 자동 매핑과 비용 설정 대상에서는 제외됩니다.
             </div>
 
             <div className="flex flex-wrap gap-3">
@@ -405,7 +366,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                 disabled={isBusy || !selectedSalesUnit || selectedSalesUnit.isActive}
                 onClick={() => handleToggle("activate")}
               >
-                재활성화
+                활성화
               </button>
             </div>
           </form>

@@ -11,7 +11,7 @@ export type SaleStatus =
   | "RETURNED"
   | "EXCHANGED"
   | "UNKNOWN";
-export type MappingStatus = "MAPPED" | "UNMAPPED";
+export type MappingStatus = "MAPPED" | "UNMAPPED" | "CONFLICT";
 export type ProfitStatus = "COMPLETE" | "INCOMPLETE_COST";
 export type WeekdayValidationStatus =
   | "PENDING"
@@ -78,12 +78,9 @@ export interface Product {
 export interface CanonicalSalesUnit {
   id: string;
   storeId: string;
-  standardProductName: string;
-  standardOptionName: string | null;
-  normalizedStandardProductName: string;
-  normalizedStandardOptionName: string;
   displayName: string;
-  normalizedDisplayName: string;
+  matchAliases: string[];
+  normalizedMatchAliases: string[];
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;
@@ -100,6 +97,7 @@ export interface OrderSourceSignature {
   normalizedProductName: string;
   normalizedOptionInfo: string;
   canonicalSalesUnitId: string | null;
+  mappingStatus: MappingStatus;
   confirmedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -277,13 +275,17 @@ export interface DashboardSummary {
   salesUnitCount: number;
   incompleteCostSalesUnitCount: number;
   unmappedOrderItemCount: number;
+  conflictOrderItemCount: number;
   unmappedCampaignCount: number;
+  conflictCampaignCount: number;
   intentionalUnmappedCampaignCount: number;
   excludedOrderRevenue: number;
   excludedUnmappedOrderRevenue: number;
+  excludedConflictOrderRevenue: number;
   excludedNonSaleOrderRevenue: number;
   excludedAdCost: number;
   excludedUnmappedAdCost: number;
+  excludedConflictAdCost: number;
   excludedIntentionalUnmappedAdCost: number;
 }
 

@@ -1,24 +1,25 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
-import { CanonicalSalesUnit, normalizeText } from "@patima/shared";
+import { CanonicalSalesUnit, normalizeMatchAlias, normalizeText } from "@patima/shared";
 import { recalculateAdMappingsForStore } from "./ad-mapping-engine";
 import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import {
-  createDisplayName,
   createId,
+  ensureNormalizedLength,
   ensureStoreExists,
   formatApiSuccess,
+  normalizeMatchAliasList,
   nowIso,
   paginate,
+  sanitizeMatchAliases,
 } from "./helpers";
 import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
 import { StoreService } from "./store.service";
 
 interface SalesUnitPayload {
   storeId: string;
-  standardProductName: string;
-  standardOptionName?: string | null;
-  displayName?: string | null;
+  displayName: string;
+  matchAliases?: string[] | null;
   memo?: string | null;
 }
 
@@ -32,10 +33,17 @@ export class SalesUnitService {
 
   list(storeId: string, q?: string, page?: number, pageSize?: number) {
     const keyword = q ? normalizeText(q) : null;
+    const aliasKeyword = q ? normalizeMatchAlias(q) : null;
     const items = this.databaseService
       .getSnapshot()
       .canonicalSalesUnits.filter((item) => item.storeId === storeId)
-      .filter((item) => (keyword ? item.normalizedDisplayName.includes(keyword) : true))
+      .filter((item) =>
+        keyword
+          ? normalizeText(item.displayName).includes(keyword) ||
+            item.matchAliases.some((alias) => normalizeText(alias).includes(keyword)) ||
+            (!!aliasKeyword && item.normalizedMatchAliases.some((alias) => alias.includes(aliasKeyword)))
+          : true,
+      )
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 
     return formatApiSuccess(paginate(items, page, pageSize));
@@ -43,17 +51,16 @@ export class SalesUnitService {
 
   create(payload: SalesUnitPayload) {
     this.storeService.ensureWritable(payload.storeId);
-    const standardOptionName = payload.standardOptionName ?? null;
-    const displayName = payload.displayName?.trim() || createDisplayName(payload.standardProductName, standardOptionName);
+    const displayName = payload.displayName.trim();
+    const matchAliases = sanitizeMatchAliases(payload.matchAliases ?? []);
+    ensureNormalizedLength(normalizeText(displayName), "displayName");
+
     const created: CanonicalSalesUnit = {
       id: createId(),
       storeId: payload.storeId,
-      standardProductName: payload.standardProductName,
-      standardOptionName,
-      normalizedStandardProductName: normalizeText(payload.standardProductName),
-      normalizedStandardOptionName: normalizeText(standardOptionName),
       displayName,
-      normalizedDisplayName: normalizeText(displayName),
+      matchAliases,
+      normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
       memo: payload.memo ?? null,
       isActive: true,
       deactivatedAt: null,
@@ -89,23 +96,21 @@ export class SalesUnitService {
     if (!existing) {
       throw new NotFoundException({
         success: false,
-        message: "표준 판매단위를 찾을 수 없습니다.",
+        message: "?쒖? ?먮ℓ?⑥쐞瑜?李얠쓣 ???놁뒿?덈떎.",
         errors: [{ field: "salesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
       });
     }
     this.storeService.ensureWritable(existing.storeId);
 
-    const nextDisplayName =
-      payload.displayName?.trim() ||
-      createDisplayName(payload.standardProductName, payload.standardOptionName ?? null);
+    const displayName = payload.displayName.trim();
+    const matchAliases = sanitizeMatchAliases(payload.matchAliases ?? []);
+    ensureNormalizedLength(normalizeText(displayName), "displayName");
+
     const updated: CanonicalSalesUnit = {
       ...existing,
-      standardProductName: payload.standardProductName,
-      standardOptionName: payload.standardOptionName ?? null,
-      normalizedStandardProductName: normalizeText(payload.standardProductName),
-      normalizedStandardOptionName: normalizeText(payload.standardOptionName),
-      displayName: nextDisplayName,
-      normalizedDisplayName: normalizeText(nextDisplayName),
+      displayName,
+      matchAliases,
+      normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
       memo: payload.memo ?? null,
       updatedAt: nowIso(),
     };
@@ -137,7 +142,7 @@ export class SalesUnitService {
     if (!existing) {
       throw new NotFoundException({
         success: false,
-        message: "표준 판매단위를 찾을 수 없습니다.",
+        message: "?쒖? ?먮ℓ?⑥쐞瑜?李얠쓣 ???놁뒿?덈떎.",
         errors: [{ field: "salesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
       });
     }
@@ -165,7 +170,7 @@ export class SalesUnitService {
     if (!existing) {
       throw new NotFoundException({
         success: false,
-        message: "표준 판매단위를 찾을 수 없습니다.",
+        message: "?쒖? ?먮ℓ?⑥쐞瑜?李얠쓣 ???놁뒿?덈떎.",
         errors: [{ field: "salesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
       });
     }
@@ -193,27 +198,29 @@ export class SalesUnitService {
       (item) =>
         item.id !== excludeId &&
         item.storeId === target.storeId &&
-        item.normalizedDisplayName === target.normalizedDisplayName,
+        normalizeText(item.displayName) === normalizeText(target.displayName),
     );
     if (duplicatedDisplay) {
       throw new BadRequestException({
         success: false,
-        message: "정규화된 표시명이 중복됩니다.",
+        message: "?뺢퇋?붾맂 ?쒖떆紐낆씠 以묐났?⑸땲??",
         errors: [{ field: "displayName", reason: "SALES_UNIT_DUPLICATE_DISPLAY_NAME" }],
       });
     }
-    const duplicatedCombo = snapshot.canonicalSalesUnits.some(
-      (item) =>
-        item.id !== excludeId &&
-        item.storeId === target.storeId &&
-        item.normalizedStandardProductName === target.normalizedStandardProductName &&
-        item.normalizedStandardOptionName === target.normalizedStandardOptionName,
+
+    const duplicatedAlias = target.normalizedMatchAliases.find((alias) =>
+      snapshot.canonicalSalesUnits.some(
+        (item) =>
+          item.id !== excludeId &&
+          item.storeId === target.storeId &&
+          item.normalizedMatchAliases.includes(alias),
+      ),
     );
-    if (duplicatedCombo) {
+    if (duplicatedAlias) {
       throw new BadRequestException({
         success: false,
-        message: "정규화된 표준 상품/옵션 조합이 중복됩니다.",
-        errors: [{ field: "standardProductName", reason: "SALES_UNIT_DUPLICATE_STANDARD_COMBINATION" }],
+        message: "以묐났?섎뒗 alias瑜?뺣낫?룄濡???ν븷 ???놁뒿?덈떎.",
+        errors: [{ field: "matchAliases", reason: "SALES_UNIT_DUPLICATE_MATCH_ALIAS" }],
       });
     }
   }

@@ -1,15 +1,19 @@
 import { createHash } from "crypto";
 import {
+  CanonicalSalesUnit,
   createSourceSignature,
   DailySalesUnitProfit,
   DashboardSummary,
   DatabaseShape,
+  MappingStatus,
   OrderItem,
+  OrderSourceSignature,
   PaginationResult,
   ProfitStatus,
   SaleStatus,
   SalesUnitCostSetting,
   Store,
+  normalizeMatchAlias,
   normalizeText,
 } from "@patima/shared";
 import { BadRequestException, NotFoundException } from "@nestjs/common";
@@ -294,6 +298,107 @@ export const isSalesUnitAssignable = (
 export const createDisplayName = (standardProductName: string, standardOptionName?: string | null): string =>
   [standardProductName, standardOptionName].filter(Boolean).join(" / ");
 
+export const sanitizeMatchAliases = (aliases: Array<string | null | undefined>): string[] => {
+  const seen = new Set<string>();
+  const items: string[] = [];
+
+  aliases.forEach((alias) => {
+    const trimmed = alias?.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const normalized = normalizeMatchAlias(trimmed);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+
+    seen.add(normalized);
+    items.push(trimmed);
+  });
+
+  return items;
+};
+
+export const normalizeMatchAliasList = (aliases: Array<string | null | undefined>): string[] =>
+  sanitizeMatchAliases(aliases).map((alias) => normalizeMatchAlias(alias));
+
+export const deriveLegacyMatchAliases = (
+  standardProductName?: string | null,
+  standardOptionName?: string | null,
+): string[] => {
+  const productName = standardProductName?.trim() ?? "";
+  const optionName = standardOptionName?.trim() ?? "";
+
+  if (!productName) {
+    return [];
+  }
+
+  return sanitizeMatchAliases([
+    productName,
+    optionName ? createDisplayName(productName, optionName) : null,
+  ]);
+};
+
+export const migrateCanonicalSalesUnit = (
+  raw: CanonicalSalesUnit &
+    Partial<{
+      standardProductName: string | null;
+      standardOptionName: string | null;
+      matchAliases: string[];
+    }>,
+): CanonicalSalesUnit => {
+  const displayName =
+    raw.displayName?.trim() ||
+    createDisplayName(raw.standardProductName ?? "", raw.standardOptionName ?? null) ||
+    "이름 없는 판매단위";
+  const matchAliases =
+    Array.isArray(raw.matchAliases) && raw.matchAliases.length > 0
+      ? sanitizeMatchAliases(raw.matchAliases)
+      : deriveLegacyMatchAliases(raw.standardProductName, raw.standardOptionName);
+
+  return {
+    id: raw.id,
+    storeId: raw.storeId,
+    displayName,
+    matchAliases,
+    normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
+    memo: raw.memo ?? null,
+    isActive: raw.isActive,
+    deactivatedAt: raw.deactivatedAt ?? null,
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
+  };
+};
+
+export const getSignatureMappingStatus = (
+  signature: Pick<OrderSourceSignature, "mappingStatus" | "canonicalSalesUnitId">,
+): MappingStatus => signature.mappingStatus ?? (signature.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED");
+
+export const getOrderItemMappingStatus = (
+  database: DatabaseShape,
+  item: Pick<OrderItem, "canonicalSalesUnitId" | "orderSourceSignatureId">,
+): MappingStatus => {
+  if (item.orderSourceSignatureId) {
+    const signature = database.orderSourceSignatures.find((entry) => entry.id === item.orderSourceSignatureId);
+    if (signature) {
+      return getSignatureMappingStatus(signature);
+    }
+  }
+
+  return item.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED";
+};
+
+export const getAdMappingStatus = (
+  item: Pick<DatabaseShape["adCampaignDailyCosts"][number], "canonicalSalesUnitId" | "mappingReason">,
+): MappingStatus => {
+  if (item.mappingReason === "MULTIPLE_RULES") {
+    return "CONFLICT";
+  }
+
+  return item.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED";
+};
+
 export const getCostSettingForDate = (
   costSettings: SalesUnitCostSetting[],
   targetDate: string | null,
@@ -499,13 +604,19 @@ export const calculateDashboardSummary = (
   );
 
   const excludedUnmappedOrderRevenue = eligibleOrders
-    .filter((item) => item.saleStatus === "SALE" && !item.canonicalSalesUnitId)
+    .filter((item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "UNMAPPED")
+    .reduce((total, item) => total + item.productPaymentAmount, 0);
+  const excludedConflictOrderRevenue = eligibleOrders
+    .filter((item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "CONFLICT")
     .reduce((total, item) => total + item.productPaymentAmount, 0);
   const excludedNonSaleOrderRevenue = eligibleOrders
     .filter((item) => item.saleStatus !== "SALE")
     .reduce((total, item) => total + item.productPaymentAmount, 0);
   const excludedUnmappedAdCost = eligibleAds
-    .filter((item) => item.mappingReason === "NO_RULE" || item.mappingReason === "MULTIPLE_RULES")
+    .filter((item) => item.mappingReason === "NO_RULE")
+    .reduce((total, item) => total + item.totalCost, 0);
+  const excludedConflictAdCost = eligibleAds
+    .filter((item) => item.mappingReason === "MULTIPLE_RULES")
     .reduce((total, item) => total + item.totalCost, 0);
   const excludedIntentionalUnmappedAdCost = eligibleAds
     .filter((item) => item.mappingReason === "INTENTIONALLY_UNMAPPED")
@@ -524,19 +635,26 @@ export const calculateDashboardSummary = (
     profitStatus: incompleteRows.length > 0 ? "INCOMPLETE_COST" : "COMPLETE",
     salesUnitCount: rows.length,
     incompleteCostSalesUnitCount: incompleteRows.length,
-    unmappedOrderItemCount: eligibleOrders.filter((item) => item.saleStatus === "SALE" && !item.canonicalSalesUnitId)
-      .length,
-    unmappedCampaignCount: eligibleAds.filter(
-      (item) => item.mappingReason === "NO_RULE" || item.mappingReason === "MULTIPLE_RULES",
+    unmappedOrderItemCount: eligibleOrders.filter(
+      (item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "UNMAPPED",
     ).length,
+    conflictOrderItemCount: eligibleOrders.filter(
+      (item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "CONFLICT",
+    ).length,
+    unmappedCampaignCount: eligibleAds.filter((item) => item.mappingReason === "NO_RULE").length,
+    conflictCampaignCount: eligibleAds.filter((item) => item.mappingReason === "MULTIPLE_RULES").length,
     intentionalUnmappedCampaignCount: eligibleAds.filter(
       (item) => item.mappingReason === "INTENTIONALLY_UNMAPPED",
     ).length,
-    excludedOrderRevenue: excludedUnmappedOrderRevenue + excludedNonSaleOrderRevenue,
+    excludedOrderRevenue:
+      excludedUnmappedOrderRevenue + excludedConflictOrderRevenue + excludedNonSaleOrderRevenue,
     excludedUnmappedOrderRevenue,
+    excludedConflictOrderRevenue,
     excludedNonSaleOrderRevenue,
-    excludedAdCost: excludedUnmappedAdCost + excludedIntentionalUnmappedAdCost,
+    excludedAdCost:
+      excludedUnmappedAdCost + excludedConflictAdCost + excludedIntentionalUnmappedAdCost,
     excludedUnmappedAdCost,
+    excludedConflictAdCost,
     excludedIntentionalUnmappedAdCost,
   };
 };
@@ -580,12 +698,9 @@ export const mapOrderItemResponse = (
     paymentDate: item.paymentDate,
     orderStatus: item.orderStatus,
     saleStatus: item.saleStatus,
-    mappingStatus: item.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED",
+    mappingStatus: getOrderItemMappingStatus(database, item),
   };
 };
-
-export const normalizedDisplayName = (productName: string, optionName?: string | null) =>
-  normalizeText(createDisplayName(productName, optionName));
 
 export const ensureNoCrossStoreReference = (
   ownerStoreId: string,
