@@ -2,10 +2,8 @@ import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from
 import { CampaignSalesUnitMapping } from "@patima/shared";
 import { AuditLogService } from "./audit-log.service";
 import {
-  evaluateAdMapping,
-  getAdMappingOverride,
-  getActiveCampaignMappings,
   normalizeCampaignPattern,
+  recalculateAdMappingsForStore,
 } from "./ad-mapping-engine";
 import { DatabaseService } from "./database.service";
 import {
@@ -31,6 +29,13 @@ export class CampaignMappingService implements OnModuleInit {
     this.operationService.registerRetryExecutor("RECALCULATE_AD_MAPPING", async (operation) =>
       this.recalculate(operation.storeId),
     );
+
+    const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
+    storeIds.forEach((storeId) => {
+      this.databaseService.write((draft) => {
+        recalculateAdMappingsForStore(draft, storeId);
+      });
+    });
   }
 
   list(storeId: string, page?: number, pageSize?: number) {
@@ -225,21 +230,7 @@ export class CampaignMappingService implements OnModuleInit {
 
   async recalculate(storeId: string) {
     this.databaseService.write((draft) => {
-      draft.adCampaignDailyCosts
-        .filter((item) => item.storeId === storeId)
-        .forEach((item) => {
-          const mapping = evaluateAdMapping(
-            draft,
-            storeId,
-            item.normalizedCampaignName,
-            getAdMappingOverride(item),
-          );
-          item.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
-          item.matchedRuleCount = mapping.matchedRuleCount;
-          item.mappingReason = mapping.mappingReason;
-          item.reasonNote = mapping.reasonNote;
-          item.updatedAt = nowIso();
-        });
+      recalculateAdMappingsForStore(draft, storeId);
     });
 
     return {

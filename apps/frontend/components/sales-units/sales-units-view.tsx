@@ -28,6 +28,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   const [selectedSalesUnitId, setSelectedSalesUnitId] = useState<string | null>(
     data.salesUnits[0]?.id ?? null,
   );
+  const [isCreatingDraft, setIsCreatingDraft] = useState(data.salesUnits.length === 0);
+  const [pendingCreatedSalesUnitId, setPendingCreatedSalesUnitId] = useState<string | null>(null);
   const [draft, setDraft] = useState(emptyDraft());
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -36,8 +38,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   const [isRefreshing, startRefresh] = useTransition();
 
   const selectedSalesUnit = useMemo(
-    () => data.salesUnits.find((item) => item.id === selectedSalesUnitId) ?? null,
-    [data.salesUnits, selectedSalesUnitId],
+    () => (isCreatingDraft ? null : data.salesUnits.find((item) => item.id === selectedSalesUnitId) ?? null),
+    [data.salesUnits, isCreatingDraft, selectedSalesUnitId],
   );
 
   useEffect(() => {
@@ -55,12 +57,26 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   }, [selectedSalesUnit]);
 
   useEffect(() => {
+    if (
+      pendingCreatedSalesUnitId &&
+      data.salesUnits.some((item) => item.id === pendingCreatedSalesUnitId)
+    ) {
+      setSelectedSalesUnitId(pendingCreatedSalesUnitId);
+      setPendingCreatedSalesUnitId(null);
+      setIsCreatingDraft(false);
+      return;
+    }
+
+    if (isCreatingDraft) {
+      return;
+    }
+
     if (selectedSalesUnitId && data.salesUnits.some((item) => item.id === selectedSalesUnitId)) {
       return;
     }
 
     setSelectedSalesUnitId(data.salesUnits[0]?.id ?? null);
-  }, [data.salesUnits, selectedSalesUnitId]);
+  }, [data.salesUnits, isCreatingDraft, pendingCreatedSalesUnitId, selectedSalesUnitId]);
 
   if (!data.primaryStore) {
     return (
@@ -136,6 +152,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
               type="button"
               disabled={isBusy}
               onClick={() => {
+                setIsCreatingDraft(true);
+                setPendingCreatedSalesUnitId(null);
                 setSelectedSalesUnitId(null);
                 setErrorMessage(null);
                 setSuccessMessage(null);
@@ -186,6 +204,8 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                     className="button-shell button-ghost"
                     type="button"
                     onClick={() => {
+                      setIsCreatingDraft(false);
+                      setPendingCreatedSalesUnitId(null);
                       setSelectedSalesUnitId(row.id);
                       setErrorMessage(null);
                       setSuccessMessage(null);
@@ -281,9 +301,16 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                   },
                 );
 
-                const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+                const payload = (await response.json().catch(() => null)) as {
+                  message?: string;
+                  data?: { id?: string };
+                } | null;
                 if (!response.ok) {
                   throw new Error(payload?.message ?? "표준 판매단위 저장에 실패했습니다.");
+                }
+
+                if (!isEditing && typeof payload?.data?.id === "string") {
+                  setPendingCreatedSalesUnitId(payload.data.id);
                 }
 
                 await refreshWithMessage(

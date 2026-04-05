@@ -7,6 +7,7 @@ import {
   normalizeText,
 } from "@patima/shared";
 import { hashJson } from "./helpers";
+import { getActiveSalesUnitsForAutoMapping, resolveCampaignAutoMapping } from "./sales-unit-auto-mapper";
 
 export type AdMappingOverride =
   | { type: "MANUAL_MAPPED"; canonicalSalesUnitId: string }
@@ -26,14 +27,23 @@ export const getActiveCampaignMappings = (database: DatabaseShape, storeId: stri
     return item.storeId === storeId && item.isActive && salesUnit?.isActive;
   });
 
+export const getAutoMatchSalesUnitsSnapshot = (database: DatabaseShape, storeId: string) =>
+  getActiveSalesUnitsForAutoMapping(database, storeId).map((item) => ({
+    id: item.id,
+    normalizedDisplayName: item.normalizedDisplayName,
+    normalizedStandardProductName: item.normalizedStandardProductName,
+    normalizedStandardOptionName: item.normalizedStandardOptionName,
+  }));
+
 export const getRuleSnapshotHash = (database: DatabaseShape, storeId: string): string =>
-  hashJson(
-    getActiveCampaignMappings(database, storeId).map((item) => ({
+  hashJson({
+    explicitRules: getActiveCampaignMappings(database, storeId).map((item) => ({
       id: item.id,
       normalizedCampaignPattern: item.normalizedCampaignPattern,
       canonicalSalesUnitId: item.canonicalSalesUnitId,
     })),
-  );
+    autoMatchSalesUnits: getAutoMatchSalesUnitsSnapshot(database, storeId),
+  });
 
 export const getOverrideSnapshotHash = (database: DatabaseShape, storeId: string): string =>
   hashJson(
@@ -122,6 +132,30 @@ export const evaluateAdMapping = (
       reasonNoteInherited: false,
     };
   }
+
+  const fallback = resolveCampaignAutoMapping(
+    getActiveSalesUnitsForAutoMapping(database, storeId),
+    normalizedCampaignName,
+  );
+  if (fallback.canonicalSalesUnitId) {
+    return {
+      canonicalSalesUnitId: fallback.canonicalSalesUnitId,
+      matchedRuleCount: fallback.candidateCount,
+      mappingReason: "RULE_MATCHED",
+      reasonNote: null,
+      reasonNoteInherited: false,
+    };
+  }
+  if (fallback.ambiguous) {
+    return {
+      canonicalSalesUnitId: null,
+      matchedRuleCount: fallback.candidateCount,
+      mappingReason: "MULTIPLE_RULES",
+      reasonNote: "여러 규칙이 동시에 일치했습니다.",
+      reasonNoteInherited: false,
+    };
+  }
+
   return {
     canonicalSalesUnitId: null,
     matchedRuleCount: 0,
@@ -132,3 +166,17 @@ export const evaluateAdMapping = (
 };
 
 export const normalizeCampaignPattern = (pattern: string): string => normalizeText(pattern);
+
+export const recalculateAdMappingsForStore = (database: DatabaseShape, storeId: string): void => {
+  database.adCampaignDailyCosts
+    .filter((item) => item.storeId === storeId)
+    .forEach((item) => {
+      const mapping = evaluateAdMapping(database, storeId, item.normalizedCampaignName, getAdMappingOverride(item));
+      item.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
+      item.matchedRuleCount = mapping.matchedRuleCount;
+      item.mappingReason = mapping.mappingReason;
+      item.reasonNote = mapping.reasonNote;
+      item.reasonNoteInherited = mapping.reasonNoteInherited;
+      item.updatedAt = new Date().toISOString();
+    });
+};

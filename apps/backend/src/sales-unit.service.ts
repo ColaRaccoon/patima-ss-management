@@ -1,17 +1,17 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { CanonicalSalesUnit, normalizeText } from "@patima/shared";
+import { recalculateAdMappingsForStore } from "./ad-mapping-engine";
 import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import {
   createDisplayName,
   createId,
-  ensureNoCrossStoreReference,
   ensureStoreExists,
   formatApiSuccess,
-  normalizedDisplayName,
   nowIso,
   paginate,
 } from "./helpers";
+import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
 import { StoreService } from "./store.service";
 
 interface SalesUnitPayload {
@@ -66,6 +66,8 @@ export class SalesUnitService {
     this.databaseService.write((draft) => {
       ensureStoreExists(draft, payload.storeId);
       draft.canonicalSalesUnits.push(created);
+      recalculateOrderMappingsForStore(draft, payload.storeId);
+      recalculateAdMappingsForStore(draft, payload.storeId);
     });
 
     this.auditLogService.record({
@@ -93,19 +95,17 @@ export class SalesUnitService {
     }
     this.storeService.ensureWritable(existing.storeId);
 
+    const nextDisplayName =
+      payload.displayName?.trim() ||
+      createDisplayName(payload.standardProductName, payload.standardOptionName ?? null);
     const updated: CanonicalSalesUnit = {
       ...existing,
       standardProductName: payload.standardProductName,
       standardOptionName: payload.standardOptionName ?? null,
       normalizedStandardProductName: normalizeText(payload.standardProductName),
       normalizedStandardOptionName: normalizeText(payload.standardOptionName),
-      displayName:
-        payload.displayName?.trim() ||
-        createDisplayName(payload.standardProductName, payload.standardOptionName ?? null),
-      normalizedDisplayName: normalizedDisplayName(
-        payload.standardProductName,
-        payload.standardOptionName ?? null,
-      ),
+      displayName: nextDisplayName,
+      normalizedDisplayName: normalizeText(nextDisplayName),
       memo: payload.memo ?? null,
       updatedAt: nowIso(),
     };
@@ -114,6 +114,8 @@ export class SalesUnitService {
     this.databaseService.write((draft) => {
       const target = draft.canonicalSalesUnits.find((item) => item.id === salesUnitId)!;
       Object.assign(target, updated);
+      recalculateOrderMappingsForStore(draft, existing.storeId);
+      recalculateAdMappingsForStore(draft, existing.storeId);
     });
 
     this.auditLogService.record({
@@ -146,6 +148,8 @@ export class SalesUnitService {
       target.isActive = false;
       target.deactivatedAt = nowIso();
       target.updatedAt = nowIso();
+      recalculateOrderMappingsForStore(draft, existing.storeId);
+      recalculateAdMappingsForStore(draft, existing.storeId);
     });
 
     return formatApiSuccess({
@@ -172,6 +176,8 @@ export class SalesUnitService {
       target.isActive = true;
       target.deactivatedAt = null;
       target.updatedAt = nowIso();
+      recalculateOrderMappingsForStore(draft, existing.storeId);
+      recalculateAdMappingsForStore(draft, existing.storeId);
     });
 
     return formatApiSuccess({

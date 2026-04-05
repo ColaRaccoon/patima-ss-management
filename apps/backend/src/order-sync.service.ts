@@ -7,7 +7,6 @@ import {
   ensureKstDateRange,
   ensureStoreExists,
   formatApiSuccess,
-  isSalesUnitAssignable,
   mapOrderItemResponse,
   nowIso,
   paginate,
@@ -15,6 +14,7 @@ import {
 } from "./helpers";
 import { NaverCommerceService, SyncedOrderItemInput } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
+import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
 
 interface OrderTemplate {
   productName: string;
@@ -181,14 +181,6 @@ export class OrderSyncService implements OnModuleInit {
           const existingItem = draft.orderItems.find(
             (item) => item.storeId === storeId && item.externalProductOrderId === entry.externalProductOrderId,
           );
-          const canonicalSalesUnit = signature.canonicalSalesUnitId
-            ? draft.canonicalSalesUnits.find((item) => item.id === signature.canonicalSalesUnitId)
-            : null;
-          const assignableSalesUnitId =
-            canonicalSalesUnit && isSalesUnitAssignable(canonicalSalesUnit.deactivatedAt, entry.paymentDate)
-              ? canonicalSalesUnit.id
-              : null;
-
           if (entry.saleStatus === "UNKNOWN") {
             unknownOrderStatusCount += 1;
           }
@@ -202,7 +194,7 @@ export class OrderSyncService implements OnModuleInit {
             storeId,
             productId: product.id,
             orderSourceSignatureId: signature.id,
-            canonicalSalesUnitId: assignableSalesUnitId,
+            canonicalSalesUnitId: null,
             externalProductOrderId: entry.externalProductOrderId,
             externalProductId: product.externalProductId,
             packageNumber: entry.packageNumber,
@@ -239,6 +231,8 @@ export class OrderSyncService implements OnModuleInit {
           }
           orderItemsUpserted += 1;
         });
+
+        recalculateOrderMappingsForStore(draft, storeId);
 
         const targetStore = ensureStoreExists(draft, storeId);
         targetStore.lastOrderSyncAt = nowIso();

@@ -1,15 +1,12 @@
 import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from "@nestjs/common";
-import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import {
-  createId,
   ensureNoCrossStoreReference,
-  ensureStoreExists,
   formatApiSuccess,
-  isSalesUnitAssignable,
   nowIso,
 } from "./helpers";
 import { OperationService } from "./operation.service";
+import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 
@@ -20,12 +17,18 @@ export class OrderMappingService implements OnModuleInit {
     private readonly operationService: OperationService,
     private readonly storeService: StoreService,
     private readonly salesUnitService: SalesUnitService,
-    private readonly auditLogService: AuditLogService,
   ) {}
 
   onModuleInit(): void {
     this.operationService.registerRetryExecutor("RECALCULATE_ORDER_MAPPING", async (operation) => {
       return this.recalculate(operation.storeId);
+    });
+
+    const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
+    storeIds.forEach((storeId) => {
+      this.databaseService.write((draft) => {
+        recalculateOrderMappingsForStore(draft, storeId);
+      });
     });
   }
 
@@ -102,21 +105,7 @@ export class OrderMappingService implements OnModuleInit {
 
   async recalculate(storeId: string) {
     this.databaseService.write((draft) => {
-      const signaturesById = new Map(draft.orderSourceSignatures.filter((item) => item.storeId === storeId).map((item) => [item.id, item]));
-      const salesUnitsById = new Map(draft.canonicalSalesUnits.filter((item) => item.storeId === storeId).map((item) => [item.id, item]));
-      draft.orderItems
-        .filter((item) => item.storeId === storeId)
-        .forEach((item) => {
-          const signature = item.orderSourceSignatureId ? signaturesById.get(item.orderSourceSignatureId) : null;
-          const candidate = signature?.canonicalSalesUnitId
-            ? salesUnitsById.get(signature.canonicalSalesUnitId)
-            : null;
-          item.canonicalSalesUnitId =
-            candidate && isSalesUnitAssignable(candidate.deactivatedAt, item.paymentDate)
-              ? candidate.id
-              : null;
-          item.updatedAt = nowIso();
-        });
+      recalculateOrderMappingsForStore(draft, storeId);
     });
 
     return {
