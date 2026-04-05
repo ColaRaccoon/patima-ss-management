@@ -148,6 +148,7 @@ export interface AdPreviewRowItem {
   mappingReason:
     | "NO_RULE_MATCH"
     | "MULTIPLE_RULE_MATCHES"
+    | "MANUAL_MAPPED"
     | "INTENTIONALLY_UNMAPPED"
     | null;
   displayMappingState: "MAPPED" | "UNMAPPED" | "INTENTIONALLY_UNMAPPED";
@@ -170,6 +171,7 @@ export interface CampaignCostListItem {
   mappingReason:
     | "NO_RULE_MATCH"
     | "MULTIPLE_RULE_MATCHES"
+    | "MANUAL_MAPPED"
     | "INTENTIONALLY_UNMAPPED"
     | null;
   matchedRuleCount: number;

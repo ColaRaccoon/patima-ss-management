@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { normalizeText } from "@patima/shared";
+import { evaluateAdMapping, getAdMappingOverride } from "./ad-mapping-engine";
 import {
   calculateFee,
+  createEmptyDatabase,
   getWeekdayNameKo,
   saleStatusFromNaverOrderState,
   saleStatusFromRawStatus,
@@ -98,6 +100,45 @@ run("calculateFee falls back to feeRate only when both API fees are null", () =>
   assert.equal(result.totalFeeCost, 350);
   assert.equal(result.usedFallback, true);
   assert.equal(result.incomplete, false);
+});
+
+run("getAdMappingOverride returns manual mapped rows as overrides", () => {
+  assert.deepEqual(
+    getAdMappingOverride({
+      canonicalSalesUnitId: "sales-1",
+      mappingReason: "MANUAL_MAPPED",
+      reasonNote: null,
+    } as never),
+    {
+      type: "MANUAL_MAPPED",
+      canonicalSalesUnitId: "sales-1",
+    },
+  );
+});
+
+run("evaluateAdMapping preserves manual overrides ahead of rule matching", () => {
+  const database = createEmptyDatabase();
+  database.canonicalSalesUnits.push({
+    id: "sales-1",
+    storeId: "store-1",
+    isActive: true,
+  } as never);
+  database.campaignMappings.push({
+    id: "mapping-1",
+    storeId: "store-1",
+    canonicalSalesUnitId: "sales-2",
+    normalizedCampaignPattern: "alpha",
+    isActive: true,
+  } as never);
+
+  const result = evaluateAdMapping(database, "store-1", "alpha campaign", {
+    type: "MANUAL_MAPPED",
+    canonicalSalesUnitId: "sales-1",
+  });
+
+  assert.equal(result.canonicalSalesUnitId, "sales-1");
+  assert.equal(result.mappingReason, "MANUAL_MAPPED");
+  assert.equal(result.matchedRuleCount, 0);
 });
 
 console.log("All backend checks passed.");

@@ -3,6 +3,7 @@ import { CampaignSalesUnitMapping } from "@patima/shared";
 import { AuditLogService } from "./audit-log.service";
 import {
   evaluateAdMapping,
+  getAdMappingOverride,
   getActiveCampaignMappings,
   normalizeCampaignPattern,
 } from "./ad-mapping-engine";
@@ -173,10 +174,18 @@ export class CampaignMappingService implements OnModuleInit {
       target.updatedAt = nowIso();
     });
 
+    const operation = this.operationService.enqueue(
+      existing.storeId,
+      "RECALCULATE_AD_MAPPING",
+      { storeId: existing.storeId, reason: "AD_MAPPING_CHANGED" },
+      () => this.recalculate(existing.storeId),
+    );
+
     return formatApiSuccess({
       mappingId,
       isActive: false,
       deactivatedAt: nowIso(),
+      operationId: operation.id,
     });
   }
 
@@ -199,10 +208,18 @@ export class CampaignMappingService implements OnModuleInit {
       target.updatedAt = nowIso();
     });
 
+    const operation = this.operationService.enqueue(
+      existing.storeId,
+      "RECALCULATE_AD_MAPPING",
+      { storeId: existing.storeId, reason: "AD_MAPPING_CHANGED" },
+      () => this.recalculate(existing.storeId),
+    );
+
     return formatApiSuccess({
       mappingId,
       isActive: true,
       reactivatedAt: nowIso(),
+      operationId: operation.id,
     });
   }
 
@@ -211,10 +228,12 @@ export class CampaignMappingService implements OnModuleInit {
       draft.adCampaignDailyCosts
         .filter((item) => item.storeId === storeId)
         .forEach((item) => {
-          if (item.mappingReason === "INTENTIONALLY_UNMAPPED" && item.reasonNote) {
-            return;
-          }
-          const mapping = evaluateAdMapping(draft, storeId, item.normalizedCampaignName);
+          const mapping = evaluateAdMapping(
+            draft,
+            storeId,
+            item.normalizedCampaignName,
+            getAdMappingOverride(item),
+          );
           item.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
           item.matchedRuleCount = mapping.matchedRuleCount;
           item.mappingReason = mapping.mappingReason;

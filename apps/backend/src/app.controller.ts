@@ -253,6 +253,19 @@ export class AppController {
     return this.adsService.setIntentionalUnmapped(adCostId, body);
   }
 
+  @Post("ad-campaign-costs/:adCostId/mapping")
+  saveAdCampaignMapping(
+    @Param("adCostId") adCostId: string,
+    @Body() body: { canonicalSalesUnitId: string },
+  ) {
+    return this.adsService.saveManualMapping(adCostId, body);
+  }
+
+  @Post("ad-campaign-costs/:adCostId/recalculate-mapping")
+  recalculateAdCampaignMapping(@Param("adCostId") adCostId: string) {
+    return this.adsService.recalculateMapping(adCostId);
+  }
+
   @Get("campaign-mappings")
   getCampaignMappings(
     @Query("storeId") storeId: string,

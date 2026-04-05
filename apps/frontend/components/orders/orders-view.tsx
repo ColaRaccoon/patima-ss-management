@@ -70,6 +70,41 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
     });
   };
 
+  const startOrderSync = async (
+    payload: { dateFrom?: string; dateTo?: string },
+    fallbackMessage: string,
+    nextSuccessMessage: string,
+  ) => {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsSyncing(true);
+    try {
+      await readApiResponse(
+        await fetch(`/api/stores/${data.primaryStore!.id}/order-sync`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        }),
+        fallbackMessage,
+      );
+
+      setSuccessMessage(nextSuccessMessage);
+      startRefresh(() => {
+        router.refresh();
+      });
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "\uC8FC\uBB38 \uB3D9\uAE30\uD654 \uC694\uCCAD \uC911 \uC624\uB958\uAC00 \uBC1C\uC0DD\uD588\uC2B5\uB2C8\uB2E4.",
+      );
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -114,6 +149,23 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               }}
             >
               최근 30일 동기화
+            </button>
+            <button
+              className="button-shell button-secondary"
+              type="button"
+              disabled={isBusy}
+              onClick={() =>
+                void startOrderSync(
+                  {
+                    dateFrom: filters.dateFrom,
+                    dateTo: filters.dateTo,
+                  },
+                  "\uC120\uD0DD \uAE30\uAC04 \uC8FC\uBB38 \uB3D9\uAE30\uD654 \uC2DC\uC791\uC5D0 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4.",
+                  `\uC120\uD0DD \uAE30\uAC04(${filters.dateFrom} ~ ${filters.dateTo}) \uC8FC\uBB38 \uB3D9\uAE30\uD654\uB97C \uC791\uC5C5 \uD050\uC5D0 \uB4F1\uB85D\uD588\uC2B5\uB2C8\uB2E4.`,
+                )
+              }
+            >
+              {"\uC120\uD0DD \uAE30\uAC04 \uB3D9\uAE30\uD654"}
             </button>
             <Link className="button-shell button-primary" href="/operations">
               작업 상세 보기

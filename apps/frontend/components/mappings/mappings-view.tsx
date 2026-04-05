@@ -46,6 +46,9 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const [campaignDraft, setCampaignDraft] = useState(
     emptyCampaignDraft(data.campaignMappings[0]?.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? ""),
   );
+  const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(
+    data.adCosts[0]?.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? "",
+  );
   const [intentionalReason, setIntentionalReason] = useState("");
   const [orderError, setOrderError] = useState<string | null>(null);
   const [orderSuccess, setOrderSuccess] = useState<string | null>(null);
@@ -97,7 +100,8 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   useEffect(() => {
     setIntentionalReason(selectedAdCost?.reasonNote ?? "");
-  }, [selectedAdCost]);
+    setAdCostSalesUnitId(selectedAdCost?.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? "");
+  }, [data.salesUnits, selectedAdCost]);
 
   useEffect(() => {
     if (selectedSignatureId && data.signatures.some((signature) => signature.id === selectedSignatureId)) {
@@ -330,6 +334,65 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     } catch (error) {
       setAdCostError(
         error instanceof Error ? error.message : "Failed to save intentional-unmapped note.",
+      );
+    } finally {
+      setIsSavingAdCost(false);
+    }
+  }
+
+  async function handleSaveAdCostMapping() {
+    if (!selectedAdCost || !adCostSalesUnitId) {
+      setAdCostError("매핑할 판매단위를 선택해주세요.");
+      return;
+    }
+
+    setAdCostError(null);
+    setAdCostSuccess(null);
+    setIsSavingAdCost(true);
+    try {
+      const response = await fetch(`/api/ad-campaign-costs/${selectedAdCost.id}/mapping`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          canonicalSalesUnitId: adCostSalesUnitId,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+      if (!response.ok) {
+        throw new Error(payload?.message ?? "Failed to save ad cost mapping.");
+      }
+
+      refreshWithMessage("ad-cost", "광고 row를 판매단위에 수동 매핑했습니다.");
+    } catch (error) {
+      setAdCostError(error instanceof Error ? error.message : "Failed to save ad cost mapping.");
+    } finally {
+      setIsSavingAdCost(false);
+    }
+  }
+
+  async function handleRecalculateAdCostMapping() {
+    if (!selectedAdCost) {
+      return;
+    }
+
+    setAdCostError(null);
+    setAdCostSuccess(null);
+    setIsSavingAdCost(true);
+    try {
+      const response = await fetch(`/api/ad-campaign-costs/${selectedAdCost.id}/recalculate-mapping`, {
+        method: "POST",
+      });
+      const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+      if (!response.ok) {
+        throw new Error(payload?.message ?? "Failed to recalculate ad cost mapping.");
+      }
+
+      refreshWithMessage("ad-cost", "광고 row 매핑을 규칙 기준으로 다시 계산했습니다.");
+    } catch (error) {
+      setAdCostError(
+        error instanceof Error ? error.message : "Failed to recalculate ad cost mapping.",
       );
     } finally {
       setIsSavingAdCost(false);
@@ -620,6 +683,41 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 <p className="font-semibold text-ink">{selectedAdCost.campaignName}</p>
                 <p>광고비 {formatCurrency(selectedAdCost.totalCost)}</p>
                 <p>현재 상태 {selectedAdCost.mappingReason ?? selectedAdCost.mappingStatus}</p>
+              </div>
+
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">판매단위 선택</span>
+                <select
+                  className="input-shell"
+                  value={adCostSalesUnitId}
+                  onChange={(event) => setAdCostSalesUnitId(event.target.value)}
+                >
+                  <option value="">선택</option>
+                  {data.salesUnits.map((salesUnit) => (
+                    <option key={salesUnit.id} value={salesUnit.id}>
+                      {salesUnit.displayName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="flex flex-wrap gap-3">
+                <button
+                  className="button-shell button-primary"
+                  type="button"
+                  disabled={isBusy || !data.salesUnits.length}
+                  onClick={() => void handleSaveAdCostMapping()}
+                >
+                  판매단위로 수동 매핑
+                </button>
+                <button
+                  className="button-shell button-ghost"
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => void handleRecalculateAdCostMapping()}
+                >
+                  자동 규칙으로 다시 계산
+                </button>
               </div>
 
               <textarea

@@ -26,6 +26,7 @@ export type UploadState =
   | "EXPIRED";
 export type CampaignMappingReason =
   | "RULE_MATCHED"
+  | "MANUAL_MAPPED"
   | "NO_RULE"
   | "MULTIPLE_RULES"
   | "INTENTIONALLY_UNMAPPED";

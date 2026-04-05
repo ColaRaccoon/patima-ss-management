@@ -83,6 +83,8 @@ const toMappingReason = (value: string | null | undefined) => {
       return "NO_RULE_MATCH";
     case "MULTIPLE_RULES":
       return "MULTIPLE_RULE_MATCHES";
+    case "MANUAL_MAPPED":
+      return "MANUAL_MAPPED";
     case "INTENTIONALLY_UNMAPPED":
       return "INTENTIONALLY_UNMAPPED";
     default:

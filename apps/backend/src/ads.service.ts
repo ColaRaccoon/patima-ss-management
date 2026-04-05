@@ -4,6 +4,7 @@ import * as XLSX from "xlsx";
 import { AuditLogService } from "./audit-log.service";
 import {
   evaluateAdMapping,
+  getAdMappingOverride,
   getOverrideSnapshotHash,
   getRuleSnapshotHash,
   normalizeCampaignPattern,
@@ -112,17 +113,21 @@ export class AdsService implements OnModuleInit {
     };
 
     const previewRows: AdUploadPreviewRow[] = campaigns.map((campaign) => {
-      const inheritedNote =
+      const inheritedOverride =
         replacedUpload &&
         snapshot.adCampaignDailyCosts.find(
           (item) =>
             item.storeId === storeId &&
             item.sourceUploadId === replacedUpload.id &&
             item.reportDate === reportDate &&
-            item.normalizedCampaignName === normalizeText(campaign.campaignName) &&
-            item.mappingReason === "INTENTIONALLY_UNMAPPED",
-        )?.reasonNote;
-      const mapping = evaluateAdMapping(snapshot, storeId, normalizeText(campaign.campaignName), inheritedNote);
+            item.normalizedCampaignName === normalizeText(campaign.campaignName),
+        );
+      const mapping = evaluateAdMapping(
+        snapshot,
+        storeId,
+        normalizeText(campaign.campaignName),
+        inheritedOverride ? getAdMappingOverride(inheritedOverride) : null,
+      );
       return {
         id: createId(),
         uploadId: upload.id,
@@ -403,6 +408,7 @@ export class AdsService implements OnModuleInit {
     this.databaseService.write((draft) => {
       const target = draft.adCampaignDailyCosts.find((item) => item.id === adCostId)!;
       target.canonicalSalesUnitId = null;
+      target.matchedRuleCount = 0;
       target.mappingReason = "INTENTIONALLY_UNMAPPED";
       target.reasonNote = payload.reasonNote;
       target.reasonNoteInherited = false;
@@ -413,6 +419,87 @@ export class AdsService implements OnModuleInit {
       adCostId,
       mappingReason: "INTENTIONALLY_UNMAPPED",
       reasonNote: payload.reasonNote,
+    });
+  }
+
+  saveManualMapping(adCostId: string, payload: { canonicalSalesUnitId: string }) {
+    const snapshot = this.databaseService.getSnapshot();
+    const existing = snapshot.adCampaignDailyCosts.find((item) => item.id === adCostId);
+    if (!existing) {
+      throw new NotFoundException({
+        success: false,
+        message: "광고 row를 찾을 수 없습니다.",
+        errors: [{ field: "adCostId", reason: "MANUAL_OVERRIDE_NOT_FOUND" }],
+      });
+    }
+
+    const salesUnit = snapshot.canonicalSalesUnits.find(
+      (item) => item.id === payload.canonicalSalesUnitId,
+    );
+    if (!salesUnit) {
+      throw new NotFoundException({
+        success: false,
+        message: "판매단위를 찾을 수 없습니다.",
+        errors: [{ field: "canonicalSalesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
+      });
+    }
+
+    if (salesUnit.storeId !== existing.storeId) {
+      throw new BadRequestException({
+        success: false,
+        message: "같은 스토어의 판매단위만 연결할 수 있습니다.",
+        errors: [{ field: "canonicalSalesUnitId", reason: "CROSS_STORE_REFERENCE" }],
+      });
+    }
+
+    this.storeService.ensureWritable(existing.storeId);
+
+    this.databaseService.write((draft) => {
+      const target = draft.adCampaignDailyCosts.find((item) => item.id === adCostId)!;
+      target.canonicalSalesUnitId = payload.canonicalSalesUnitId;
+      target.matchedRuleCount = 0;
+      target.mappingReason = "MANUAL_MAPPED";
+      target.reasonNote = null;
+      target.reasonNoteInherited = false;
+      target.updatedAt = nowIso();
+    });
+
+    return formatApiSuccess({
+      adCostId,
+      canonicalSalesUnitId: payload.canonicalSalesUnitId,
+      mappingReason: "MANUAL_MAPPED",
+    });
+  }
+
+  recalculateMapping(adCostId: string) {
+    const snapshot = this.databaseService.getSnapshot();
+    const existing = snapshot.adCampaignDailyCosts.find((item) => item.id === adCostId);
+    if (!existing) {
+      throw new NotFoundException({
+        success: false,
+        message: "광고 row를 찾을 수 없습니다.",
+        errors: [{ field: "adCostId", reason: "MANUAL_OVERRIDE_NOT_FOUND" }],
+      });
+    }
+
+    this.storeService.ensureWritable(existing.storeId);
+    const mapping = evaluateAdMapping(snapshot, existing.storeId, existing.normalizedCampaignName);
+
+    this.databaseService.write((draft) => {
+      const target = draft.adCampaignDailyCosts.find((item) => item.id === adCostId)!;
+      target.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
+      target.matchedRuleCount = mapping.matchedRuleCount;
+      target.mappingReason = mapping.mappingReason;
+      target.reasonNote = mapping.reasonNote;
+      target.reasonNoteInherited = mapping.reasonNoteInherited;
+      target.updatedAt = nowIso();
+    });
+
+    return formatApiSuccess({
+      adCostId,
+      canonicalSalesUnitId: mapping.canonicalSalesUnitId,
+      mappingReason: mapping.mappingReason,
+      matchedRuleCount: mapping.matchedRuleCount,
     });
   }
 
