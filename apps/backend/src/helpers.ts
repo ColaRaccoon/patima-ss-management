@@ -44,6 +44,44 @@ export const createEmptyDatabase = (): DatabaseShape => ({
 
 export const createId = () => uuid();
 
+const HANGUL_REGEX = /[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/;
+const LATIN1_MOJIBAKE_HINT_REGEX = /[À-ÿ]/;
+
+export const repairMojibakeText = (value: string | null | undefined) => {
+  if (!value) {
+    return value ?? "";
+  }
+
+  if (HANGUL_REGEX.test(value) || !LATIN1_MOJIBAKE_HINT_REGEX.test(value)) {
+    return value;
+  }
+
+  const repaired = Buffer.from(value, "latin1").toString("utf8");
+  if (!HANGUL_REGEX.test(repaired) || repaired.includes("�")) {
+    return value;
+  }
+
+  return repaired;
+};
+
+export const getActiveConfirmedUploadIds = (
+  database: DatabaseShape,
+  storeId: string,
+  reportDate?: string,
+) =>
+  new Set(
+    database.adExcelUploads
+      .filter(
+        (upload) =>
+          upload.storeId === storeId &&
+          upload.isActive &&
+          upload.weekdayValidationStatus === "PASSED" &&
+          upload.state === "CONFIRMED" &&
+          (!reportDate || upload.reportDate === reportDate),
+      )
+      .map((upload) => upload.id),
+  );
+
 export const ensureStoreExists = (database: DatabaseShape, storeId: string): Store => {
   const store = database.stores.find((item) => item.id === storeId);
 
@@ -466,17 +504,7 @@ export const calculateDailyProfitRows = (
 
   const rowMap = new Map<string, DailySalesUnitProfit & { fallbackIncomplete: boolean }>();
 
-  const activeUploadIds = new Set(
-    database.adExcelUploads
-      .filter(
-        (upload) =>
-          upload.storeId === storeId &&
-          upload.isActive &&
-          upload.weekdayValidationStatus === "PASSED" &&
-          upload.state === "CONFIRMED",
-      )
-      .map((upload) => upload.id),
-  );
+  const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
 
   database.orderItems
     .filter(
@@ -584,17 +612,7 @@ export const calculateDashboardSummary = (
   date: string,
 ): DashboardSummary => {
   const rows = calculateDailyProfitRows(database, storeId, date, date);
-  const activeUploadIds = new Set(
-    database.adExcelUploads
-      .filter(
-        (upload) =>
-          upload.storeId === storeId &&
-          upload.isActive &&
-          upload.weekdayValidationStatus === "PASSED" &&
-          upload.state === "CONFIRMED",
-      )
-      .map((upload) => upload.id),
-  );
+  const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
   const eligibleOrders = database.orderItems.filter(
     (item) => item.storeId === storeId && item.paymentDate === date,
   );

@@ -370,8 +370,9 @@ export const mockUploads: AdUploadListItem[] = [
     weekdayValidationStatus: "PASSED",
     uploadStatus: "CONFIRMED",
     isActive: true,
-    replacedPreviousUpload: true,
-    replacedUploadId: "upload-0",
+    originalFileName: "2026-04-02-alpha.xlsx",
+    createdAt: "2026-04-02T09:10:00+09:00",
+    previewExpiresAt: null,
   },
   {
     uploadId: "upload-preview-1",
@@ -380,8 +381,9 @@ export const mockUploads: AdUploadListItem[] = [
     weekdayValidationStatus: "PASSED",
     uploadStatus: "PREVIEW_PARSED",
     isActive: false,
-    replacedPreviousUpload: false,
-    replacedUploadId: null,
+    originalFileName: "2026-04-03-preview-a.xlsx",
+    createdAt: "2026-04-03T09:15:00+09:00",
+    previewExpiresAt: "2026-04-10T23:59:59+09:00",
   },
 ];
 
@@ -391,11 +393,11 @@ export const mockPreview: AdPreviewSummary = {
   reportDate: "2026-04-03",
   detectedWeekday: "금요일",
   weekdayValidationStatus: "PASSED",
+  activeConfirmedUploadCount: 1,
   previewExpiresAt: "2026-04-10T23:59:59+09:00",
   previewState: "VALID",
   ruleSnapshotHash: "sha256:rule-snapshot",
   overrideSnapshotHash: "sha256:override-snapshot",
-  replaceCandidateUploadId: "upload-1",
   mappingPreviewSummary: {
     mappedCount: 20,
     unmappedCount: 5,

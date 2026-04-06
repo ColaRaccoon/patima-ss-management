@@ -543,15 +543,15 @@ export class NaverCommerceService {
       this.stringifyOptionCollection(product?.standardPurchaseOptions),
     ];
 
-    return (
+    const readableOptionInfo =
       optionPartsToText([
         productOrder.optionName,
         productOrder.optionValue,
-        productOrder.optionCode,
         detailEnvelope.optionName,
         ...selectedOptions,
-      ]) ?? null
-    );
+      ]) ?? null;
+
+    return pickString(productOrder.productOption, readableOptionInfo, productOrder.optionCode);
   }
 
   private stringifyOptionCollection(value: unknown): string | null {

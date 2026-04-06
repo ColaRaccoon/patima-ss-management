@@ -79,6 +79,42 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const deliveryFeeReferenceTotal =
     selectedDetail?.orderItems.reduce((total, item) => total + (item.deliveryFeeAmount ?? 0), 0) ?? 0;
   const hasConflict = data.unmappedSummary.conflictOrderItemCount > 0 || data.unmappedSummary.conflictCampaignCount > 0;
+  const dateAvailabilityNotice = (() => {
+    if (data.latestOrderDate && data.latestAdDate && !data.latestOverlapDate) {
+      return {
+        title: "Eligible orders and confirmed ads do not overlap yet.",
+        description: `Latest eligible order date is ${formatDate(data.latestOrderDate)} and latest confirmed ad date is ${formatDate(data.latestAdDate)}. The profits tab defaults to ${formatDate(data.dateTo)} until a shared date exists, so one side of the totals can still be 0.`,
+      };
+    }
+
+    if (
+      data.latestOrderDate &&
+      data.latestAdDate &&
+      data.latestOverlapDate &&
+      data.latestOrderDate !== data.latestAdDate
+    ) {
+      return {
+        title: "Orders and ads were last updated on different days.",
+        description: `Latest eligible order date is ${formatDate(data.latestOrderDate)}, latest confirmed ad date is ${formatDate(data.latestAdDate)}, and the latest shared date is ${formatDate(data.latestOverlapDate)}. The profits tab defaults to the shared date so quantity, revenue, fee, and ad cost line up.`,
+      };
+    }
+
+    if (!data.latestOrderDate && data.latestAdDate) {
+      return {
+        title: "Confirmed ad costs exist, but no eligible order rows are available yet.",
+        description: `Confirmed ad costs are available on ${formatDate(data.latestAdDate)}. Quantity, revenue, and fee stay 0 until sale rows are synced and mapped to a sales unit.`,
+      };
+    }
+
+    if (data.latestOrderDate && !data.latestAdDate) {
+      return {
+        title: "Eligible order rows exist, but confirmed ad costs are not available yet.",
+        description: `Eligible order rows are available on ${formatDate(data.latestOrderDate)}. Ad cost stays 0 until the ad upload is confirmed and mapped.`,
+      };
+    }
+
+    return null;
+  })();
 
   return (
     <div className="space-y-6">
@@ -89,6 +125,13 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       />
 
       <SourceBanner sources={data.sources} />
+
+      {dateAvailabilityNotice ? (
+        <div className="rounded-2xl border border-amber-300/40 bg-amber-100/70 px-4 py-4 text-sm leading-6 text-amber-900">
+          <p className="font-semibold">{dateAvailabilityNotice.title}</p>
+          <p className="mt-1">{dateAvailabilityNotice.description}</p>
+        </div>
+      ) : null}
 
       <Panel
         title="Filter date"

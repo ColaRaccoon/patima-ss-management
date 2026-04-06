@@ -53,6 +53,7 @@ export const getOverrideSnapshotHash = (database: DatabaseShape, storeId: string
       }))
       .filter((item): item is { row: AdCampaignDailyCost; override: AdMappingOverride } => item.override !== null)
       .map(({ row, override }) => ({
+        campaignId: row.campaignId,
         normalizedCampaignName: row.normalizedCampaignName,
         reportDate: row.reportDate,
         mappingReason: override.type,

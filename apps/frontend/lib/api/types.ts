@@ -108,10 +108,15 @@ export interface AdUploadListItem {
   reportDate: string;
   detectedWeekday: string | null;
   weekdayValidationStatus: WeekdayValidationStatus;
-  uploadStatus: "PREVIEW_PARSED" | "CONFIRMED" | "FAILED" | "REPLACED";
+  uploadStatus: "PREVIEW_PARSED" | "CONFIRMED" | "FAILED" | "REPLACED" | "EXPIRED" | "DELETED";
   isActive: boolean;
-  replacedPreviousUpload: boolean;
-  replacedUploadId: string | null;
+  originalFileName?: string | null;
+  createdAt?: string;
+  previewExpiresAt?: string | null;
+  ruleSnapshotHash?: string | null;
+  overrideSnapshotHash?: string | null;
+  replacedPreviousUpload?: boolean;
+  replacedUploadId?: string | null;
 }
 
 export interface AdPreviewSummary {
@@ -120,11 +125,12 @@ export interface AdPreviewSummary {
   reportDate: string;
   detectedWeekday: string;
   weekdayValidationStatus: WeekdayValidationStatus;
+  activeConfirmedUploadCount: number;
   previewExpiresAt: string;
   previewState: "VALID" | "STALE" | "EXPIRED";
   ruleSnapshotHash: string;
   overrideSnapshotHash: string;
-  replaceCandidateUploadId: string | null;
+  replaceCandidateUploadId?: string | null;
   mappingPreviewSummary: {
     mappedCount: number;
     unmappedCount: number;
@@ -134,6 +140,12 @@ export interface AdPreviewSummary {
   };
   requiresConfirm: boolean;
   status: "PREVIEW_PARSED";
+}
+
+export interface AdPreviewDetail extends AdPreviewSummary {
+  originalFileName: string | null;
+  createdAt: string | null;
+  rows: AdPreviewRowItem[];
 }
 
 export interface AdPreviewRowItem {
@@ -369,8 +381,7 @@ export interface MappingsPageData {
 export interface AdUploadsPageData {
   primaryStore: StoreListItem | null;
   uploads: AdUploadListItem[];
-  preview: AdPreviewSummary | null;
-  previewRows: AdPreviewRowItem[];
+  previews: AdPreviewDetail[];
   sources: SourceState[];
 }
 
@@ -385,6 +396,9 @@ export interface ProfitsPageData {
   primaryStore: StoreListItem | null;
   dateFrom: string;
   dateTo: string;
+  latestOrderDate: string | null;
+  latestAdDate: string | null;
+  latestOverlapDate: string | null;
   summary: DashboardSummary;
   profits: DailySalesUnitProfit[];
   unmappedSummary: UnmappedSummary;

@@ -43,7 +43,7 @@ function toErrorMessage(error: unknown) {
 export async function fetchApi<T>(params: {
   label: string;
   path: string;
-  fallback: T;
+  fallback?: T;
 }): Promise<ApiEnvelope<T>> {
   const endpoint = buildEndpoint(params.path);
 
@@ -70,9 +70,13 @@ export async function fetchApi<T>(params: {
       endpoint,
     };
   } catch (error) {
+    if (!("fallback" in params)) {
+      throw new Error(`${params.label}: ${toErrorMessage(error)}`);
+    }
+
     return {
       label: params.label,
-      data: params.fallback,
+      data: params.fallback as T,
       source: "mock",
       endpoint,
       error: toErrorMessage(error),

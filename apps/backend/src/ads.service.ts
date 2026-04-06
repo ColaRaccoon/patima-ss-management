@@ -1,5 +1,11 @@
 import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from "@nestjs/common";
-import { AdCampaignDailyCost, AdExcelUpload, AdUploadPreviewRow, normalizeText } from "@patima/shared";
+import {
+  AdCampaignDailyCost,
+  AdExcelUpload,
+  AdUploadPreviewRow,
+  DatabaseShape,
+  normalizeText,
+} from "@patima/shared";
 import * as XLSX from "xlsx";
 import { AuditLogService } from "./audit-log.service";
 import {
@@ -7,23 +13,23 @@ import {
   getAdMappingOverride,
   getOverrideSnapshotHash,
   getRuleSnapshotHash,
-  normalizeCampaignPattern,
 } from "./ad-mapping-engine";
 import { DatabaseService } from "./database.service";
 import {
   createId,
-  ensureStoreExists,
   formatApiSuccess,
+  getActiveConfirmedUploadIds,
   getAdMappingStatus,
   getWeekdayNameKo,
   hashBuffer,
   nowIso,
   paginate,
+  repairMojibakeText,
 } from "./helpers";
 import { OperationService } from "./operation.service";
 import { StoreService } from "./store.service";
 
-const REQUIRED_HEADERS = [
+export const AD_UPLOAD_REQUIRED_HEADERS = [
   "캠페인 ID",
   "캠페인 이름",
   "총비용",
@@ -46,14 +52,15 @@ export class AdsService implements OnModuleInit {
 
   onModuleInit(): void {
     this.operationService.registerRetryExecutor("AD_UPLOAD_CONFIRM", async (operation) => {
-      const request = operation.requestJson as { uploadId: string; confirmReplace: boolean };
-      return this.performConfirm(request.uploadId, request.confirmReplace);
+      const request = operation.requestJson as { uploadId: string };
+      return this.performConfirm(request.uploadId);
     });
   }
 
   previewUpload(storeId: string, reportDate: string, file: Express.Multer.File) {
     this.storeService.ensureWritable(storeId);
-    if (!file || !/\.xlsx$/i.test(file.originalname)) {
+    const originalFileName = repairMojibakeText(file?.originalname);
+    if (!file || !/\.xlsx$/i.test(originalFileName)) {
       throw new BadRequestException({
         success: false,
         message: "엑셀(.xlsx) 파일만 업로드할 수 있습니다.",
@@ -66,7 +73,7 @@ export class AdsService implements OnModuleInit {
     const rows = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1, raw: false });
     const header = (rows[0] ?? []).map((value) => this.normalizeHeaderCell(value));
 
-    REQUIRED_HEADERS.forEach((requiredHeader) => {
+    AD_UPLOAD_REQUIRED_HEADERS.forEach((requiredHeader) => {
       if (!header.includes(this.normalizeHeaderCell(requiredHeader))) {
         throw new BadRequestException({
           success: false,
@@ -89,20 +96,27 @@ export class AdsService implements OnModuleInit {
     }
 
     const snapshot = this.databaseService.getSnapshot();
-    const replacedUpload = snapshot.adExcelUploads.find(
-      (item) => item.storeId === storeId && item.reportDate === reportDate && item.isActive,
+    const activeConfirmedRows = this.getActiveConfirmedRows(snapshot, storeId, reportDate);
+    this.assertNoDuplicateCampaignIds(
+      campaigns.map((campaign) => campaign.campaignId),
+      "AD_UPLOAD_DUPLICATE_IN_FILE",
+    );
+    this.assertNoCampaignIdOverlap(
+      campaigns.map((campaign) => campaign.campaignId),
+      activeConfirmedRows,
+      "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
     );
 
     const upload: AdExcelUpload = {
       id: createId(),
       storeId,
       sourceType: "NAVER_DA_XLSX",
-      originalFileName: file.originalname,
+      originalFileName,
       fileHash: hashBuffer(file.buffer),
       reportDate,
       detectedWeekday: detectedWeekdays[0] ?? null,
       weekdayValidationStatus,
-      replacedUploadId: replacedUpload?.id ?? null,
+      replacedUploadId: null,
       previewRuleSnapshotHash: getRuleSnapshotHash(snapshot, storeId),
       previewOverrideSnapshotHash: getOverrideSnapshotHash(snapshot, storeId),
       previewCreatedAt: nowIso(),
@@ -114,19 +128,16 @@ export class AdsService implements OnModuleInit {
     };
 
     const previewRows: AdUploadPreviewRow[] = campaigns.map((campaign) => {
-      const inheritedOverride =
-        replacedUpload &&
-        snapshot.adCampaignDailyCosts.find(
-          (item) =>
-            item.storeId === storeId &&
-            item.sourceUploadId === replacedUpload.id &&
-            item.reportDate === reportDate &&
-            item.normalizedCampaignName === normalizeText(campaign.campaignName),
-        );
+      const normalizedCampaignName = normalizeText(campaign.campaignName);
+      const inheritedOverride = this.findInheritedOverride(
+        activeConfirmedRows,
+        campaign.campaignId,
+        normalizedCampaignName,
+      );
       const mapping = evaluateAdMapping(
         snapshot,
         storeId,
-        normalizeText(campaign.campaignName),
+        normalizedCampaignName,
         inheritedOverride ? getAdMappingOverride(inheritedOverride) : null,
       );
       return {
@@ -136,7 +147,7 @@ export class AdsService implements OnModuleInit {
         reportDate,
         campaignId: campaign.campaignId,
         campaignName: campaign.campaignName,
-        normalizedCampaignName: normalizeText(campaign.campaignName),
+        normalizedCampaignName,
         weekday: campaign.weekday,
         adType: campaign.adType,
         status: campaign.status,
@@ -168,7 +179,7 @@ export class AdsService implements OnModuleInit {
       targetId: upload.id,
       actorIdentifier: "LOCALHOST_ADMIN",
       beforeJson: null,
-      afterJson: { reportDate, originalFileName: file.originalname },
+      afterJson: { reportDate, originalFileName },
     });
 
     return formatApiSuccess({
@@ -176,7 +187,6 @@ export class AdsService implements OnModuleInit {
       reportDate,
       detectedWeekday: upload.detectedWeekday,
       weekdayValidationStatus,
-      replaceTargetUploadId: replacedUpload?.id ?? null,
       previewState: upload.state,
       previewExpiresAt: upload.previewExpiresAt,
       ruleSnapshotHash: upload.previewRuleSnapshotHash,
@@ -197,14 +207,22 @@ export class AdsService implements OnModuleInit {
 
     const items = snapshot.adUploadPreviewRows
       .filter((item) => item.uploadId === uploadId)
-      .sort((left, right) => left.campaignName.localeCompare(right.campaignName, "ko"));
+      .sort((left, right) => left.campaignName.localeCompare(right.campaignName, "ko"))
+      .map((item) => ({
+        ...item,
+        campaignName: repairMojibakeText(item.campaignName),
+        weekday: repairMojibakeText(item.weekday),
+        adType: repairMojibakeText(item.adType),
+        status: repairMojibakeText(item.status),
+        reasonNote: repairMojibakeText(item.reasonNote),
+      }));
     return formatApiSuccess(paginate(items, page, pageSize));
   }
 
   listUploads(storeId: string, page?: number, pageSize?: number) {
     const snapshot = this.databaseService.getSnapshot();
     const items = snapshot.adExcelUploads
-      .filter((item) => item.storeId === storeId)
+      .filter((item) => item.storeId === storeId && item.state !== "DELETED")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .map((item) => ({
         uploadId: item.id,
@@ -213,13 +231,78 @@ export class AdsService implements OnModuleInit {
         weekdayValidationStatus: item.weekdayValidationStatus,
         uploadStatus: item.state,
         isActive: item.isActive,
-        replacedPreviousUpload: !!item.replacedUploadId,
-        replacedUploadId: item.replacedUploadId,
+        originalFileName: repairMojibakeText(item.originalFileName),
+        createdAt: item.createdAt,
+        previewExpiresAt: item.previewExpiresAt,
+        ruleSnapshotHash: item.previewRuleSnapshotHash,
+        overrideSnapshotHash: item.previewOverrideSnapshotHash,
       }));
     return formatApiSuccess(paginate(items, page, pageSize));
   }
 
-  enqueueConfirm(uploadId: string, confirmReplace = false) {
+  deleteUpload(uploadId: string) {
+    const snapshot = this.databaseService.getSnapshot();
+    const upload = snapshot.adExcelUploads.find((item) => item.id === uploadId);
+    if (!upload) {
+      throw new NotFoundException({
+        success: false,
+        message: "업로드를 찾을 수 없습니다.",
+        errors: [{ field: "uploadId", reason: "UPLOAD_NOT_FOUND" }],
+      });
+    }
+
+    if (upload.state === "DELETED") {
+      throw new BadRequestException({
+        success: false,
+        message: "이미 삭제된 업로드입니다.",
+        errors: [{ field: "uploadId", reason: "AD_UPLOAD_ALREADY_DELETED" }],
+      });
+    }
+
+    this.storeService.ensureWritable(upload.storeId);
+
+    const previewRowCount = snapshot.adUploadPreviewRows.filter((item) => item.uploadId === upload.id).length;
+    const adCostCount = snapshot.adCampaignDailyCosts.filter((item) => item.sourceUploadId === upload.id).length;
+    const previousState = upload.state;
+    const wasActive = upload.isActive;
+
+    this.databaseService.write((draft) => {
+      draft.adUploadPreviewRows = draft.adUploadPreviewRows.filter((item) => item.uploadId !== upload.id);
+      draft.adCampaignDailyCosts = draft.adCampaignDailyCosts.filter((item) => item.sourceUploadId !== upload.id);
+
+      const target = draft.adExcelUploads.find((item) => item.id === upload.id)!;
+      target.state = "DELETED";
+      target.isActive = false;
+      target.updatedAt = nowIso();
+    });
+
+    this.auditLogService.record({
+      storeId: upload.storeId,
+      domain: "AD_UPLOAD",
+      action: "DELETE",
+      targetId: upload.id,
+      actorIdentifier: "LOCALHOST_ADMIN",
+      beforeJson: {
+        state: previousState,
+        isActive: wasActive,
+        previewRowCount,
+        adCostCount,
+      },
+      afterJson: {
+        state: "DELETED",
+        isActive: false,
+      },
+    });
+
+    return formatApiSuccess({
+      uploadId: upload.id,
+      previousState,
+      previewRowCount,
+      adCostCount,
+    });
+  }
+
+  enqueueConfirm(uploadId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const upload = snapshot.adExcelUploads.find((item) => item.id === uploadId);
     if (!upload) {
@@ -233,8 +316,8 @@ export class AdsService implements OnModuleInit {
     const operation = this.operationService.enqueue(
       upload.storeId,
       "AD_UPLOAD_CONFIRM",
-      { uploadId, confirmReplace },
-      () => this.performConfirm(uploadId, confirmReplace),
+      { uploadId },
+      () => this.performConfirm(uploadId),
     );
 
     return formatApiSuccess({
@@ -244,7 +327,7 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  async performConfirm(uploadId: string, confirmReplace: boolean) {
+  async performConfirm(uploadId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const upload = snapshot.adExcelUploads.find((item) => item.id === uploadId);
     if (!upload) {
@@ -255,15 +338,10 @@ export class AdsService implements OnModuleInit {
       });
     }
 
-    const latestPreview = snapshot.adExcelUploads
-      .filter((item) => item.storeId === upload.storeId && item.reportDate === upload.reportDate)
-      .filter((item) => item.state === "PREVIEW_PARSED")
-      .sort((left, right) => right.previewCreatedAt!.localeCompare(left.previewCreatedAt!))[0];
-
-    if (!latestPreview || latestPreview.id !== upload.id) {
+    if (upload.state !== "PREVIEW_PARSED") {
       throw new BadRequestException({
         success: false,
-        message: "가장 최신 preview만 확정할 수 있습니다.",
+        message: "Only preview uploads can be confirmed.",
         errors: [{ field: "uploadId", reason: "AD_UPLOAD_PREVIEW_STALE" }],
       });
     }
@@ -286,18 +364,10 @@ export class AdsService implements OnModuleInit {
 
     const currentRuleHash = getRuleSnapshotHash(snapshot, upload.storeId);
     const currentOverrideHash = getOverrideSnapshotHash(snapshot, upload.storeId);
-    const currentReplaceTarget = snapshot.adExcelUploads.find(
-      (item) =>
-        item.storeId === upload.storeId &&
-        item.reportDate === upload.reportDate &&
-        item.isActive &&
-        item.id !== upload.id,
-    );
 
     if (
       upload.previewRuleSnapshotHash !== currentRuleHash ||
-      upload.previewOverrideSnapshotHash !== currentOverrideHash ||
-      (upload.replacedUploadId ?? null) !== (currentReplaceTarget?.id ?? null)
+      upload.previewOverrideSnapshotHash !== currentOverrideHash
     ) {
       throw new BadRequestException({
         success: false,
@@ -306,31 +376,18 @@ export class AdsService implements OnModuleInit {
       });
     }
 
-    if (currentReplaceTarget && !confirmReplace) {
-      throw new BadRequestException({
-        success: false,
-        message: "기존 업로드를 대체하려면 최종 확인이 필요합니다.",
-        errors: [{ field: "confirmReplace", reason: "AD_UPLOAD_CONFIRMATION_REQUIRED" }],
-      });
-    }
-
     const previewRows = snapshot.adUploadPreviewRows.filter((item) => item.uploadId === upload.id);
+    this.assertNoDuplicateCampaignIds(
+      previewRows.map((row) => row.campaignId),
+      "AD_UPLOAD_DUPLICATE_IN_FILE",
+    );
+    this.assertNoCampaignIdOverlap(
+      previewRows.map((row) => row.campaignId),
+      this.getActiveConfirmedRows(snapshot, upload.storeId, upload.reportDate),
+      "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
+    );
 
     this.databaseService.write((draft) => {
-      draft.adExcelUploads
-        .filter(
-          (item) =>
-            item.storeId === upload.storeId &&
-            item.reportDate === upload.reportDate &&
-            item.isActive &&
-            item.id !== upload.id,
-        )
-        .forEach((item) => {
-          item.isActive = false;
-          item.state = "REPLACED";
-          item.updatedAt = nowIso();
-        });
-
       draft.adCampaignDailyCosts = draft.adCampaignDailyCosts.filter((item) => item.sourceUploadId !== upload.id);
       previewRows.forEach((row) => {
         const confirmed: AdCampaignDailyCost = {
@@ -349,20 +406,19 @@ export class AdsService implements OnModuleInit {
     this.auditLogService.record({
       storeId: upload.storeId,
       domain: "AD_UPLOAD",
-      action: currentReplaceTarget ? "REPLACE" : "UPDATE",
+      action: "UPDATE",
       targetId: upload.id,
       actorIdentifier: "LOCALHOST_ADMIN",
       beforeJson: null,
       afterJson: {
         reportDate: upload.reportDate,
-        replacedUploadId: currentReplaceTarget?.id ?? null,
+        confirmedRowCount: previewRows.length,
       },
     });
 
     return {
       uploadId: upload.id,
       confirmedRowCount: previewRows.length,
-      replacedUploadId: currentReplaceTarget?.id ?? null,
     };
   }
 
@@ -375,9 +431,7 @@ export class AdsService implements OnModuleInit {
     pageSize?: number;
   }) {
     const snapshot = this.databaseService.getSnapshot();
-    const activeUploadIds = new Set(
-      snapshot.adExcelUploads.filter((item) => item.storeId === query.storeId && item.isActive).map((item) => item.id),
-    );
+    const activeUploadIds = getActiveConfirmedUploadIds(snapshot, query.storeId);
 
     const items = snapshot.adCampaignDailyCosts
       .filter((item) => item.storeId === query.storeId && activeUploadIds.has(item.sourceUploadId))
@@ -387,7 +441,15 @@ export class AdsService implements OnModuleInit {
           ? getAdMappingStatus(item) === query.mappingStatus
           : true,
       )
-      .sort((left, right) => right.reportDate.localeCompare(left.reportDate));
+      .sort((left, right) => right.reportDate.localeCompare(left.reportDate))
+      .map((item) => ({
+        ...item,
+        campaignName: repairMojibakeText(item.campaignName),
+        weekday: repairMojibakeText(item.weekday),
+        adType: repairMojibakeText(item.adType),
+        status: repairMojibakeText(item.status),
+        reasonNote: repairMojibakeText(item.reasonNote),
+      }));
 
     return formatApiSuccess(paginate(items, query.page, query.pageSize));
   }
@@ -520,22 +582,22 @@ export class AdsService implements OnModuleInit {
 
     for (let index = 1; index < rows.length; index += 1) {
       const row = rows[index];
-      const campaignId = row[getColumnIndex("캠페인 ID")!] ?? "";
-      const campaignName = row[getColumnIndex("캠페인 이름")!] ?? "";
+      const campaignId = repairMojibakeText(row[getColumnIndex("캠페인 ID")!] ?? "");
+      const campaignName = repairMojibakeText(row[getColumnIndex("캠페인 이름")!] ?? "");
 
       if (!campaignId || campaignId.includes("결과")) {
         continue;
       }
 
       const nextRow = rows[index + 1] ?? [];
-      const detailName = nextRow[getColumnIndex("캠페인 이름")!] ?? "";
+      const detailName = repairMojibakeText(nextRow[getColumnIndex("캠페인 이름")!] ?? "");
       const weekday = WEEKDAYS.has(detailName) ? detailName : null;
       campaigns.push({
         campaignId,
         campaignName,
         weekday,
-        adType: row[getColumnIndex("광고 구분")!] ?? null,
-        status: row[getColumnIndex("상태")!] ?? null,
+        adType: repairMojibakeText(row[getColumnIndex("광고 구분")!] ?? null),
+        status: repairMojibakeText(row[getColumnIndex("상태")!] ?? null),
         totalCost: this.parseNumericCell(row[getColumnIndex("총비용")!] ?? 0),
         impressions: this.parseNumericCell(row[getColumnIndex("노출수")!] ?? 0),
         clicks: this.parseNumericCell(row[getColumnIndex("클릭수")!] ?? 0),
@@ -545,6 +607,83 @@ export class AdsService implements OnModuleInit {
     }
 
     return campaigns;
+  }
+
+  private getActiveConfirmedRows(snapshot: DatabaseShape, storeId: string, reportDate: string) {
+    const activeUploadIds = getActiveConfirmedUploadIds(snapshot, storeId, reportDate);
+    return snapshot.adCampaignDailyCosts
+      .filter(
+        (item) =>
+          item.storeId === storeId &&
+          item.reportDate === reportDate &&
+          activeUploadIds.has(item.sourceUploadId),
+      )
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  private findInheritedOverride(
+    activeConfirmedRows: AdCampaignDailyCost[],
+    campaignId: string,
+    normalizedCampaignName: string,
+  ) {
+    const matchedByCampaignId = activeConfirmedRows.find((item) => item.campaignId === campaignId);
+    if (matchedByCampaignId) {
+      return matchedByCampaignId;
+    }
+
+    const matchedByName = activeConfirmedRows.filter(
+      (item) => item.normalizedCampaignName === normalizedCampaignName,
+    );
+    return matchedByName.length === 1 ? matchedByName[0] : null;
+  }
+
+  private assertNoDuplicateCampaignIds(campaignIds: string[], reason: string) {
+    const duplicateCampaignIds = this.findDuplicateCampaignIds(campaignIds);
+    if (duplicateCampaignIds.length === 0) {
+      return;
+    }
+
+    throw new BadRequestException({
+      success: false,
+      message: `Duplicate campaignId values are not allowed in one upload. (${this.summarizeCampaignIds(duplicateCampaignIds)})`,
+      errors: [{ field: "campaignId", reason }],
+    });
+  }
+
+  private assertNoCampaignIdOverlap(
+    candidateCampaignIds: string[],
+    activeConfirmedRows: AdCampaignDailyCost[],
+    reason: string,
+  ) {
+    const activeConfirmedCampaignIds = new Set(activeConfirmedRows.map((item) => item.campaignId));
+    const duplicateCampaignIds = Array.from(
+      new Set(candidateCampaignIds.filter((campaignId) => activeConfirmedCampaignIds.has(campaignId))),
+    );
+    if (duplicateCampaignIds.length === 0) {
+      return;
+    }
+
+    throw new BadRequestException({
+      success: false,
+      message: `campaignId already exists in active confirmed uploads for this date. (${this.summarizeCampaignIds(duplicateCampaignIds)})`,
+      errors: [{ field: "campaignId", reason }],
+    });
+  }
+
+  private findDuplicateCampaignIds(campaignIds: string[]) {
+    const counts = new Map<string, number>();
+    campaignIds.forEach((campaignId) => {
+      counts.set(campaignId, (counts.get(campaignId) ?? 0) + 1);
+    });
+    return Array.from(counts.entries())
+      .filter(([, count]) => count > 1)
+      .map(([campaignId]) => campaignId)
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  private summarizeCampaignIds(campaignIds: string[]) {
+    const head = campaignIds.slice(0, 5).join(", ");
+    return campaignIds.length > 5 ? `${head} and ${campaignIds.length - 5} more` : head;
   }
 
   private normalizeHeaderCell(value: string | null | undefined) {

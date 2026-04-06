@@ -5,14 +5,14 @@ import {
   readUpstreamPayload,
 } from "@/lib/api/upstream";
 
-export async function POST(
+export async function DELETE(
   _request: Request,
   context: { params: Promise<{ uploadId: string }> },
 ) {
   const { uploadId } = await context.params;
 
-  const response = await fetch(buildUpstreamEndpoint(`/ad-uploads/${uploadId}/confirm`), {
-    method: "POST",
+  const response = await fetch(buildUpstreamEndpoint(`/ad-uploads/${uploadId}`), {
+    method: "DELETE",
     cache: "no-store",
     headers: {
       Accept: "application/json",
@@ -24,7 +24,7 @@ export async function POST(
     return NextResponse.json(
       {
         success: false,
-        message: extractUpstreamMessage(payload, "광고 업로드 확정에 실패했습니다."),
+        message: extractUpstreamMessage(payload, "광고 업로드 삭제에 실패했습니다."),
       },
       { status: response.status },
     );

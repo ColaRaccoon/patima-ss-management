@@ -23,7 +23,8 @@ export type UploadState =
   | "PREVIEW_PARSED"
   | "CONFIRMED"
   | "REPLACED"
-  | "EXPIRED";
+  | "EXPIRED"
+  | "DELETED";
 export type CampaignMappingReason =
   | "RULE_MATCHED"
   | "MANUAL_MAPPED"
@@ -172,7 +173,7 @@ export interface AdExcelUpload {
   reportDate: string;
   detectedWeekday: string | null;
   weekdayValidationStatus: WeekdayValidationStatus;
-  replacedUploadId: string | null;
+  replacedUploadId?: string | null;
   previewRuleSnapshotHash: string | null;
   previewOverrideSnapshotHash: string | null;
   previewCreatedAt: string | null;

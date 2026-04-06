@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { createSourceSignature, normalizeText } from "@patima/shared";
+import * as XLSX from "xlsx";
 import { evaluateAdMapping, getAdMappingOverride } from "./ad-mapping-engine";
+import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
 import {
   calculateDashboardSummary,
   calculateFee,
   createEmptyDatabase,
   getWeekdayNameKo,
+  repairMojibakeText,
   saleStatusFromNaverOrderState,
   saleStatusFromRawStatus,
 } from "./helpers";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
-import { createNaverClientSecretSign } from "./naver-commerce.service";
+import { NaverCommerceService, createNaverClientSecretSign } from "./naver-commerce.service";
+import { ProfitService } from "./profit.service";
 import { recalculateOrderMappingsForStore, resolveOrderSignatureAutoMapping } from "./sales-unit-auto-mapper";
 
 const run = (name: string, fn: () => void) => {
@@ -32,12 +36,143 @@ const createSalesUnit = (id: string, displayName: string, matchAliases: string[]
     updatedAt: new Date().toISOString(),
   }) as never;
 
+const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
+  database,
+  getSnapshot() {
+    return JSON.parse(JSON.stringify(this.database));
+  },
+  write(mutator: (draft: typeof database) => unknown) {
+    const draft = this.getSnapshot();
+    const result = mutator(draft);
+    this.database = draft;
+    return result;
+  },
+});
+
+const createAdsServiceHarness = () => {
+  const databaseService = createMemoryDatabaseService();
+  const adsService = new AdsService(
+    databaseService as never,
+    {
+      ensureWritable: () => undefined,
+    } as never,
+    {
+      registerRetryExecutor: () => undefined,
+      enqueue: () => {
+        throw new Error("enqueue not used in tests");
+      },
+    } as never,
+    {
+      record: () => null,
+    } as never,
+  );
+
+  return { databaseService, adsService };
+};
+
+const createAdUploadFile = (
+  reportDate: string,
+  campaigns: Array<{ campaignId: string; campaignName: string; totalCost: number }>,
+) => {
+  const sheetRows: string[][] = [AD_UPLOAD_REQUIRED_HEADERS.map((value) => String(value))];
+
+  campaigns.forEach((campaign) => {
+    sheetRows.push([
+      campaign.campaignId,
+      campaign.campaignName,
+      String(campaign.totalCost),
+      "0",
+      "0",
+      "0",
+      "0",
+    ]);
+    sheetRows.push([
+      "",
+      getWeekdayNameKo(reportDate),
+      "",
+      "",
+      "",
+      "",
+      "",
+    ]);
+  });
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(sheetRows), "Sheet1");
+
+  return {
+    originalname: `ads-${reportDate}.xlsx`,
+    buffer: XLSX.write(workbook, { bookType: "xlsx", type: "buffer" }),
+  } as never;
+};
+
+const createConfirmedUploadRow = (params: {
+  uploadId: string;
+  reportDate: string;
+  campaignId: string;
+  campaignName: string;
+  canonicalSalesUnitId: string | null;
+  totalCost: number;
+  mappingReason?: "RULE_MATCHED" | "MANUAL_MAPPED" | "NO_RULE" | "MULTIPLE_RULES" | "INTENTIONALLY_UNMAPPED";
+}) =>
+  ({
+    id: `ad-${params.uploadId}-${params.campaignId}`,
+    uploadId: params.uploadId,
+    sourceUploadId: params.uploadId,
+    storeId: "store-1",
+    reportDate: params.reportDate,
+    campaignId: params.campaignId,
+    campaignName: params.campaignName,
+    normalizedCampaignName: normalizeText(params.campaignName),
+    weekday: getWeekdayNameKo(params.reportDate),
+    adType: null,
+    status: "ACTIVE",
+    totalCost: params.totalCost,
+    impressions: 0,
+    clicks: 0,
+    totalConversions: 0,
+    totalConversionSales: 0,
+    matchedRuleCount: params.canonicalSalesUnitId ? 1 : 0,
+    canonicalSalesUnitId: params.canonicalSalesUnitId,
+    mappingReason: params.mappingReason ?? (params.canonicalSalesUnitId ? "RULE_MATCHED" : "NO_RULE"),
+    reasonNote: null,
+    reasonNoteInherited: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }) as never;
+
+const createConfirmedUpload = (params: { uploadId: string; reportDate: string; isActive?: boolean }) =>
+  ({
+    id: params.uploadId,
+    storeId: "store-1",
+    sourceType: "NAVER_DA_XLSX",
+    originalFileName: `${params.uploadId}.xlsx`,
+    fileHash: `hash-${params.uploadId}`,
+    reportDate: params.reportDate,
+    detectedWeekday: getWeekdayNameKo(params.reportDate),
+    weekdayValidationStatus: "PASSED",
+    replacedUploadId: null,
+    previewRuleSnapshotHash: null,
+    previewOverrideSnapshotHash: null,
+    previewCreatedAt: null,
+    previewExpiresAt: null,
+    state: "CONFIRMED",
+    isActive: params.isActive ?? true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }) as never;
+
 run("normalizeText keeps prefixes and symbols while normalizing whitespace and case", () => {
   assert.equal(normalizeText("  [Fast Delivery]\nRunning Hat: BLACK  "), "[fast delivery] running hat: black");
 });
 
 run("getWeekdayNameKo resolves KST weekday correctly", () => {
   assert.equal(getWeekdayNameKo("2026-03-25"), "수요일");
+});
+
+run("repairMojibakeText repairs UTF-8 Korean file names decoded as latin1", () => {
+  assert.equal(repairMojibakeText("ì¸í¼ëí°ìë¸.xlsx"), "인피니티서브.xlsx");
+  assert.equal(repairMojibakeText("already-fine.xlsx"), "already-fine.xlsx");
 });
 
 run("saleStatusFromRawStatus maps cancel request correctly", () => {
@@ -57,6 +192,54 @@ run("createNaverClientSecretSign produces a base64 bcrypt signature", () => {
   assert.equal(
     signature,
     "JDJhJDA0JGFiY2RlZmdoaWprbG1ub3BxcnN0dXV6NDlObEtMdDYyUWhPdnNjSTNNWnR4ZUlDQjNoYUpD",
+  );
+});
+
+run("NaverCommerceService prefers productOption over optionCode for readable option info", () => {
+  const service = Object.create(NaverCommerceService.prototype) as NaverCommerceService;
+
+  assert.equal(
+    (service as any).buildOptionInfo(
+      {
+        productOption: "컬러: 옵션3.핑크베이지+핑크베이지 / 사이즈: M(32~35cm)",
+        optionCode: "49765107855",
+      },
+      null,
+      {},
+    ),
+    "컬러: 옵션3.핑크베이지+핑크베이지 / 사이즈: M(32~35cm)",
+  );
+});
+
+run("NaverCommerceService omits optionCode when readable option fields are present", () => {
+  const service = Object.create(NaverCommerceService.prototype) as NaverCommerceService;
+
+  assert.equal(
+    (service as any).buildOptionInfo(
+      {
+        optionName: "컬러",
+        optionValue: "화이트",
+        optionCode: "49765107855",
+      },
+      null,
+      {},
+    ),
+    "컬러 / 화이트",
+  );
+});
+
+run("NaverCommerceService falls back to optionCode when it is the only option field", () => {
+  const service = Object.create(NaverCommerceService.prototype) as NaverCommerceService;
+
+  assert.equal(
+    (service as any).buildOptionInfo(
+      {
+        optionCode: "49765107855",
+      },
+      null,
+      {},
+    ),
+    "49765107855",
   );
 });
 
@@ -418,6 +601,307 @@ run("calculateDashboardSummary excludes conflict order revenue and conflict ad c
   assert.equal(summary.excludedConflictOrderRevenue, 50);
   assert.equal(summary.conflictCampaignCount, 1);
   assert.equal(summary.excludedConflictAdCost, 30);
+});
+
+run("AdsService confirms two same-date uploads and sums ad cost across active confirmed uploads", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+  const date = "2026-04-03";
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha", "beta"]));
+  });
+
+  const firstPreview = adsService.previewUpload(
+    "store-1",
+    date,
+    createAdUploadFile(date, [{ campaignId: "cmp-1001", campaignName: "alpha launch", totalCost: 120 }]),
+  );
+  void adsService.performConfirm(firstPreview.data.uploadId);
+
+  const secondPreview = adsService.previewUpload(
+    "store-1",
+    date,
+    createAdUploadFile(date, [{ campaignId: "cmp-1002", campaignName: "beta launch", totalCost: 80 }]),
+  );
+  void adsService.performConfirm(secondPreview.data.uploadId);
+
+  const snapshot = databaseService.getSnapshot();
+  const activeConfirmedUploads = snapshot.adExcelUploads.filter(
+    (item: { reportDate: string; isActive: boolean; state: string }) =>
+      item.reportDate === date && item.isActive && item.state === "CONFIRMED",
+  );
+  const summary = calculateDashboardSummary(snapshot, "store-1", date);
+
+  assert.equal(activeConfirmedUploads.length, 2);
+  assert.equal(summary.totalAdCost, 200);
+});
+
+run("AdsService rejects preview when campaignId overlaps an active confirmed upload on the same date", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+  const date = "2026-04-03";
+
+  databaseService.write((draft) => {
+    draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-existing", reportDate: date }));
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-existing",
+        reportDate: date,
+        campaignId: "cmp-dup",
+        campaignName: "alpha launch",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 55,
+      }),
+    );
+  });
+
+  assert.throws(
+    () =>
+      adsService.previewUpload(
+        "store-1",
+        date,
+        createAdUploadFile(date, [{ campaignId: "cmp-dup", campaignName: "beta launch", totalCost: 30 }]),
+      ),
+    (error: unknown) =>
+      error instanceof Error &&
+      "getResponse" in error &&
+      JSON.stringify((error as { getResponse: () => unknown }).getResponse()).includes(
+        "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
+      ),
+  );
+});
+
+run("AdsService rejects preview when the new file contains duplicate campaignIds", () => {
+  const { adsService } = createAdsServiceHarness();
+  const date = "2026-04-03";
+
+  assert.throws(
+    () =>
+      adsService.previewUpload(
+        "store-1",
+        date,
+        createAdUploadFile(date, [
+          { campaignId: "cmp-dup", campaignName: "alpha launch", totalCost: 30 },
+          { campaignId: "cmp-dup", campaignName: "beta launch", totalCost: 40 },
+        ]),
+      ),
+    (error: unknown) =>
+      error instanceof Error &&
+      "getResponse" in error &&
+      JSON.stringify((error as { getResponse: () => unknown }).getResponse()).includes("AD_UPLOAD_DUPLICATE_IN_FILE"),
+  );
+});
+
+run("ProfitService detail and summary include only active confirmed uploads", () => {
+  const databaseService = createMemoryDatabaseService();
+  const profitService = new ProfitService(databaseService as never);
+  const date = "2026-04-03";
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
+    draft.adExcelUploads.push(
+      createConfirmedUpload({ uploadId: "upload-active", reportDate: date, isActive: true }),
+      createConfirmedUpload({ uploadId: "upload-inactive", reportDate: date, isActive: false }),
+    );
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-active",
+        reportDate: date,
+        campaignId: "cmp-1001",
+        campaignName: "alpha launch",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 20,
+      }),
+      createConfirmedUploadRow({
+        uploadId: "upload-inactive",
+        reportDate: date,
+        campaignId: "cmp-1002",
+        campaignName: "alpha old",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 999,
+      }),
+    );
+  });
+
+  const summary = calculateDashboardSummary(databaseService.getSnapshot(), "store-1", date);
+  const detail = profitService.getDailySalesUnitDetail("store-1", "sales-1", date);
+
+  assert.equal(summary.totalAdCost, 20);
+  assert.equal(detail.data.summary.totalAdCost, 20);
+  assert.equal(detail.data.adCampaigns.length, 1);
+  assert.equal(detail.data.adCampaigns[0].adCostId, "ad-upload-active-cmp-1001");
+});
+
+run("ProfitService latest activity date prefers latest overlap even over later eligible orders and ads", () => {
+  const databaseService = createMemoryDatabaseService();
+  const profitService = new ProfitService(databaseService as never);
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
+    draft.orderItems.push({
+      id: "order-overlap",
+      storeId: "store-1",
+      paymentDate: "2026-04-04",
+      saleStatus: "SALE",
+      canonicalSalesUnitId: "sales-1",
+    } as never);
+    draft.orderItems.push({
+      id: "order-latest-eligible",
+      storeId: "store-1",
+      paymentDate: "2026-04-05",
+      saleStatus: "SALE",
+      canonicalSalesUnitId: "sales-1",
+    } as never);
+    draft.adExcelUploads.push(
+      createConfirmedUpload({ uploadId: "upload-overlap", reportDate: "2026-04-04" }),
+      createConfirmedUpload({ uploadId: "upload-latest-ad", reportDate: "2026-04-06" }),
+    );
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-overlap",
+        reportDate: "2026-04-04",
+        campaignId: "cmp-overlap",
+        campaignName: "overlap campaign",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 10,
+      }),
+      createConfirmedUploadRow({
+        uploadId: "upload-latest-ad",
+        reportDate: "2026-04-06",
+        campaignId: "cmp-latest-ad",
+        campaignName: "latest ad campaign",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 10,
+      }),
+    );
+  });
+
+  const latestDate = profitService.getLatestActivityDate("store-1");
+  assert.equal(latestDate.data.latestOrderDate, "2026-04-05");
+  assert.equal(latestDate.data.latestAdDate, "2026-04-06");
+  assert.equal(latestDate.data.latestOverlapDate, "2026-04-04");
+  assert.equal(latestDate.data.date, "2026-04-04");
+});
+
+run("ProfitService latest activity date ignores ineligible latest orders and falls back to the latest eligible order", () => {
+  const databaseService = createMemoryDatabaseService();
+  const profitService = new ProfitService(databaseService as never);
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
+    draft.orderItems.push(
+      {
+        id: "order-eligible",
+        storeId: "store-1",
+        paymentDate: "2026-04-03",
+        saleStatus: "SALE",
+        canonicalSalesUnitId: "sales-1",
+      } as never,
+      {
+        id: "order-canceled",
+        storeId: "store-1",
+        paymentDate: "2026-04-06",
+        saleStatus: "CANCELED",
+        canonicalSalesUnitId: "sales-1",
+      } as never,
+      {
+        id: "order-unmapped",
+        storeId: "store-1",
+        paymentDate: "2026-04-05",
+        saleStatus: "SALE",
+        canonicalSalesUnitId: null,
+      } as never,
+    );
+    draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-no-overlap", reportDate: "2026-04-04" }));
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-no-overlap",
+        reportDate: "2026-04-04",
+        campaignId: "cmp-no-overlap",
+        campaignName: "no overlap campaign",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 25,
+      }),
+    );
+  });
+
+  const latestDate = profitService.getLatestActivityDate("store-1");
+  assert.equal(latestDate.data.latestOrderDate, "2026-04-03");
+  assert.equal(latestDate.data.latestAdDate, "2026-04-04");
+  assert.equal(latestDate.data.latestOverlapDate, null);
+  assert.equal(latestDate.data.date, "2026-04-03");
+});
+
+run("ProfitService latest activity date falls back to the latest ad date when no eligible orders exist", () => {
+  const databaseService = createMemoryDatabaseService();
+  const profitService = new ProfitService(databaseService as never);
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
+    draft.orderItems.push(
+      {
+        id: "order-canceled-only",
+        storeId: "store-1",
+        paymentDate: "2026-04-05",
+        saleStatus: "CANCELED",
+        canonicalSalesUnitId: "sales-1",
+      } as never,
+      {
+        id: "order-without-sales-unit-only",
+        storeId: "store-1",
+        paymentDate: "2026-04-04",
+        saleStatus: "SALE",
+        canonicalSalesUnitId: null,
+      } as never,
+    );
+    draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-ad-only", reportDate: "2026-04-06" }));
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-ad-only",
+        reportDate: "2026-04-06",
+        campaignId: "cmp-ad-only",
+        campaignName: "ad only campaign",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 30,
+      }),
+    );
+  });
+
+  const latestDate = profitService.getLatestActivityDate("store-1");
+  assert.equal(latestDate.data.latestOrderDate, null);
+  assert.equal(latestDate.data.latestAdDate, "2026-04-06");
+  assert.equal(latestDate.data.latestOverlapDate, null);
+  assert.equal(latestDate.data.date, "2026-04-06");
+});
+
+run("AdsService deleteUpload deactivates the upload and removes related ad rows", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+  const date = "2026-04-03";
+
+  databaseService.write((draft) => {
+    draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-delete", reportDate: date, isActive: true }));
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-delete",
+        reportDate: date,
+        campaignId: "cmp-delete",
+        campaignName: "duplicate launch",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 45,
+      }),
+    );
+  });
+
+  const result = adsService.deleteUpload("upload-delete");
+  const snapshot = databaseService.getSnapshot();
+  const upload = snapshot.adExcelUploads.find((item: { id: string }) => item.id === "upload-delete");
+
+  assert.equal(result.data.uploadId, "upload-delete");
+  assert.equal(result.data.previousState, "CONFIRMED");
+  assert.equal(result.data.adCostCount, 1);
+  assert.equal(upload?.state, "DELETED");
+  assert.equal(upload?.isActive, false);
+  assert.equal(snapshot.adCampaignDailyCosts.some((item: { sourceUploadId: string }) => item.sourceUploadId === "upload-delete"), false);
+  assert.equal(calculateDashboardSummary(snapshot, "store-1", date).totalAdCost, 0);
 });
 
 console.log("All backend checks passed.");

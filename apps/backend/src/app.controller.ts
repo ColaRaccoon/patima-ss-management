@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   ParseIntPipe,
@@ -224,8 +225,13 @@ export class AppController {
   }
 
   @Post("ad-uploads/:uploadId/confirm")
-  confirmUpload(@Param("uploadId") uploadId: string, @Body() body: { confirmReplace?: boolean }) {
-    return this.adsService.enqueueConfirm(uploadId, body.confirmReplace ?? false);
+  confirmUpload(@Param("uploadId") uploadId: string) {
+    return this.adsService.enqueueConfirm(uploadId);
+  }
+
+  @Delete("ad-uploads/:uploadId")
+  deleteUpload(@Param("uploadId") uploadId: string) {
+    return this.adsService.deleteUpload(uploadId);
   }
 
   @Get("ad-campaign-costs")
@@ -341,6 +347,11 @@ export class AppController {
   @Get("dashboard/summary")
   getDashboardSummary(@Query("storeId") storeId: string, @Query("date") date: string) {
     return this.profitService.getDashboardSummary(storeId, date);
+  }
+
+  @Get("profits/latest-date")
+  getLatestProfitDate(@Query("storeId") storeId: string) {
+    return this.profitService.getLatestActivityDate(storeId);
   }
 
   @Get("profits/daily-sales-units")

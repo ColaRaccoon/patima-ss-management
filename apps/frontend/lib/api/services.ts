@@ -9,7 +9,6 @@ import {
   mockOperationDetail,
   mockOperations,
   mockOrderItems,
-  mockPreview,
   mockPreviewRows,
   mockProfitDetailPreview,
   mockProfits,
@@ -23,8 +22,8 @@ import {
   MOCK_SELECTED_DATE,
 } from "@/lib/api/mock-data";
 import type {
+  AdPreviewDetail,
   AdPreviewRowItem,
-  AdPreviewSummary,
   AdUploadListItem,
   AdUploadsPageData,
   CampaignCostListItem,
@@ -78,12 +77,16 @@ const pickPrimaryStore = (stores: StoreListItem[]) =>
   stores.find((store) => store.isPrimary) ?? stores[0] ?? null;
 
 const MAX_FRONTEND_PAGE_SIZE = 200;
+const USE_AD_UPLOADS_MOCK_FALLBACK = false;
+const USE_PROFITS_MOCK_FALLBACK = false;
 
 const toMappingReason = (value: string | null | undefined) => {
   switch (value) {
     case "NO_RULE":
+    case "NO_RULE_MATCH":
       return "NO_RULE_MATCH";
     case "MULTIPLE_RULES":
+    case "MULTIPLE_RULE_MATCHES":
       return "MULTIPLE_RULE_MATCHES";
     case "MANUAL_MAPPED":
       return "MANUAL_MAPPED";
@@ -109,7 +112,7 @@ async function fetchAllRecordPages<T>(params: {
   label: string;
   path: string;
   query: Record<string, string | number | boolean | null | undefined>;
-  fallback: T[];
+  fallback?: T[];
 }) {
   let page = 1;
   let collected: T[] = [];
@@ -134,7 +137,11 @@ async function fetchAllRecordPages<T>(params: {
         page,
         pageSize: MAX_FRONTEND_PAGE_SIZE,
       }),
-      fallback: { items: page === 1 ? params.fallback : [] },
+      ...("fallback" in params
+        ? {
+            fallback: { items: page === 1 ? (params.fallback ?? []) : [] },
+          }
+        : {}),
     });
 
     if (!baseResponse) {
@@ -251,11 +258,11 @@ function createMockDailySalesUnitDetail(
   };
 }
 
-async function getStores() {
+async function getStores(useFallback = true) {
   return fetchApi<StoreListItem[]>({
     label: "Stores",
     path: "/stores",
-    fallback: mockStores,
+    ...(useFallback ? { fallback: mockStores } : {}),
   });
 }
 
@@ -267,25 +274,57 @@ async function getCredential(storeId: string) {
   });
 }
 
-async function getDashboardSummary(storeId: string, date: string) {
+async function getDashboardSummary(storeId: string, date: string, useFallback = true) {
   return fetchApi<DashboardSummary>({
     label: "Dashboard summary",
     path: withQuery("/dashboard/summary", { storeId, date }),
-    fallback: mockDashboardSummary,
+    ...(useFallback ? { fallback: mockDashboardSummary } : {}),
   });
 }
 
-async function getProfitRows(storeId: string, dateFrom: string, dateTo: string) {
-  const response = await fetchAllRecordPages<DailySalesUnitProfit>({
-    label: "Profit rows",
-    path: "/profits/daily-sales-units",
-    query: {
-      storeId,
-      dateFrom,
-      dateTo,
-    },
-    fallback: mockProfits,
+async function getLatestProfitDate(storeId: string, useFallback = true) {
+  return fetchApi<{
+    date: string | null;
+    latestOrderDate: string | null;
+    latestAdDate: string | null;
+    latestOverlapDate: string | null;
+  }>({
+    label: "Latest profit date",
+    path: withQuery("/profits/latest-date", { storeId }),
+    ...(useFallback
+      ? {
+          fallback: {
+            date: MOCK_SELECTED_DATE,
+            latestOrderDate: MOCK_SELECTED_DATE,
+            latestAdDate: MOCK_SELECTED_DATE,
+            latestOverlapDate: MOCK_SELECTED_DATE,
+          },
+        }
+      : {}),
   });
+}
+
+async function getProfitRows(storeId: string, dateFrom: string, dateTo: string, useFallback = true) {
+  const response = useFallback
+    ? await fetchAllRecordPages<DailySalesUnitProfit>({
+        label: "Profit rows",
+        path: "/profits/daily-sales-units",
+        query: {
+          storeId,
+          dateFrom,
+          dateTo,
+        },
+        fallback: mockProfits,
+      })
+    : await fetchAllRecordPages<DailySalesUnitProfit>({
+        label: "Profit rows",
+        path: "/profits/daily-sales-units",
+        query: {
+          storeId,
+          dateFrom,
+          dateTo,
+        },
+      });
 
   return { ...response, data: response.data };
 }
@@ -295,6 +334,7 @@ async function getDailySalesUnitDetail(
   salesUnitId: string,
   date: string,
   fallbackRow?: DailySalesUnitProfit | null,
+  useFallback = true,
 ) {
   return fetchApi<DailySalesUnitDetail>({
     label: "Profit detail",
@@ -302,17 +342,21 @@ async function getDailySalesUnitDetail(
       storeId,
       date,
     }),
-    fallback:
-      createMockDailySalesUnitDetail(fallbackRow) ??
-      createMockDailySalesUnitDetail(mockProfits[0])!,
+    ...(useFallback
+      ? {
+          fallback:
+            createMockDailySalesUnitDetail(fallbackRow) ??
+            createMockDailySalesUnitDetail(mockProfits[0])!,
+        }
+      : {}),
   });
 }
 
-async function getUnmappedSummary(storeId: string, dateFrom: string, dateTo: string) {
+async function getUnmappedSummary(storeId: string, dateFrom: string, dateTo: string, useFallback = true) {
   return fetchApi({
     label: "Unmapped summary",
     path: withQuery("/profits/unmapped-summary", { storeId, dateFrom, dateTo }),
-    fallback: mockUnmappedSummary,
+    ...(useFallback ? { fallback: mockUnmappedSummary } : {}),
   });
 }
 
@@ -378,33 +422,40 @@ async function getOrderSourceSignatures(
   storeId: string,
   filters?: Pick<OrdersPageFilters, "mappingStatus" | "productName" | "optionInfo">,
 ) {
-  const response = await fetchApi<{ items: OrderSourceSignatureListItem[] }>({
+  const response = await fetchAllRecordPages<OrderSourceSignatureListItem>({
     label: "Order signatures",
-    path: withQuery("/order-source-signatures", {
+    path: "/order-source-signatures",
+    query: {
       storeId,
       mappingStatus: filters?.mappingStatus ?? "ALL",
       q: [filters?.productName, filters?.optionInfo].filter(Boolean).join(" ") || undefined,
-      page: 1,
-      pageSize: 50,
-    }),
-    fallback: { items: mockSignatures },
+    },
+    fallback: mockSignatures,
   });
-  return { ...response, data: response.data.items };
+  return { ...response, data: response.data };
 }
 
-async function getSalesUnits(storeId: string) {
-  const response = await fetchApi<{ items: SalesUnitListItem[] }>({
-    label: "Sales units",
-    path: withQuery("/canonical-sales-units", {
-      storeId,
-      page: 1,
-      pageSize: 100,
-    }),
-    fallback: { items: mockSalesUnits },
-  });
+async function getSalesUnits(storeId: string, useFallback = true) {
+  const response = useFallback
+    ? await fetchAllRecordPages<SalesUnitListItem>({
+        label: "Sales units",
+        path: "/canonical-sales-units",
+        query: {
+          storeId,
+        },
+        fallback: mockSalesUnits,
+      })
+    : await fetchAllRecordPages<SalesUnitListItem>({
+        label: "Sales units",
+        path: "/canonical-sales-units",
+        query: {
+          storeId,
+        },
+      });
+
   return {
     ...response,
-    data: response.data.items.map((item) => ({
+    data: response.data.map((item) => ({
       ...item,
       matchAliases:
         Array.isArray((item as Partial<SalesUnitListItem>).matchAliases) &&
@@ -415,7 +466,7 @@ async function getSalesUnits(storeId: string) {
   };
 }
 
-async function getAdUploads(storeId: string) {
+async function getAdUploads(storeId: string, useFallback = true) {
   const response = await fetchApi<{ items: AdUploadListItem[] }>({
     label: "Ad uploads",
     path: withQuery("/ad-uploads", {
@@ -423,32 +474,41 @@ async function getAdUploads(storeId: string) {
       page: 1,
       pageSize: 20,
     }),
-    fallback: { items: mockUploads },
+    ...(useFallback ? { fallback: { items: mockUploads } } : {}),
   });
   return { ...response, data: response.data.items };
 }
 
-async function getPreviewRows(uploadId: string, salesUnits: SalesUnitListItem[]) {
-  const response = await fetchApi<{ items: Array<Record<string, unknown>> }>({
-    label: "Ad preview rows",
-    path: withQuery(`/ad-uploads/${uploadId}/preview-rows`, {
-      page: 1,
-      pageSize: 50,
-    }),
-    fallback: { items: mockPreviewRows as unknown as Array<Record<string, unknown>> },
-  });
+async function getPreviewRows(
+  uploadId: string,
+  salesUnits: SalesUnitListItem[],
+  useFallback = true,
+) {
+  const response = useFallback
+    ? await fetchAllRecordPages<Record<string, unknown>>({
+        label: "Ad preview rows",
+        path: `/ad-uploads/${uploadId}/preview-rows`,
+        query: {},
+        fallback: mockPreviewRows as unknown as Array<Record<string, unknown>>,
+      })
+    : await fetchAllRecordPages<Record<string, unknown>>({
+        label: "Ad preview rows",
+        path: `/ad-uploads/${uploadId}/preview-rows`,
+        query: {},
+      });
 
-  const items = response.data.items.map((item, index) => {
+  const items = response.data.map((item, index) => {
     const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
     const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
     const mappingStatus = toAdMappingStatus(canonicalSalesUnitId, mappingReason);
     return {
-      rowNo: index + 1,
+      rowNo: Number(item.rowNo ?? index + 1),
       campaignId: String(item.campaignId),
       campaignName: String(item.campaignName),
       adType: item.adType ? String(item.adType) : null,
-      adStatus: item.status ? String(item.status) : null,
-      weekdayLabel: item.weekday ? String(item.weekday) : null,
+      adStatus: item.status ? String(item.status) : item.adStatus ? String(item.adStatus) : null,
+      weekdayLabel:
+        item.weekday ? String(item.weekday) : item.weekdayLabel ? String(item.weekdayLabel) : null,
       totalCost: Number(item.totalCost ?? 0),
       mappingStatus,
       mappingReason,
@@ -468,7 +528,12 @@ async function getPreviewRows(uploadId: string, salesUnits: SalesUnitListItem[])
   return { ...response, data: items };
 }
 
-async function getAdCosts(storeId: string, dateFrom: string, dateTo: string, salesUnits: SalesUnitListItem[]) {
+async function getAdCosts(
+  storeId: string,
+  salesUnits: SalesUnitListItem[],
+  dateFrom?: string,
+  dateTo?: string,
+) {
   const response = await fetchAllRecordPages({
     label: "Ad costs",
     path: "/ad-campaign-costs",
@@ -504,17 +569,16 @@ async function getAdCosts(storeId: string, dateFrom: string, dateTo: string, sal
 }
 
 async function getCampaignMappings(storeId: string, salesUnits: SalesUnitListItem[]) {
-  const response = await fetchApi<{ items: Array<Record<string, unknown>> }>({
+  const response = await fetchAllRecordPages<Record<string, unknown>>({
     label: "Campaign mappings",
-    path: withQuery("/campaign-mappings", {
+    path: "/campaign-mappings",
+    query: {
       storeId,
-      page: 1,
-      pageSize: 50,
-    }),
-    fallback: { items: mockCampaignMappings as unknown as Array<Record<string, unknown>> },
+    },
+    fallback: mockCampaignMappings as unknown as Array<Record<string, unknown>>,
   });
 
-  const items = response.data.items.map((item) => ({
+  const items = response.data.map((item) => ({
     id: String(item.id),
     storeId: String(item.storeId),
     adChannel: "NAVER_DA",
@@ -715,7 +779,7 @@ export async function getMappingsPageData(): Promise<MappingsPageData> {
       productName: "",
       optionInfo: "",
     }),
-    getAdCosts(primaryStore.id, MOCK_DATE_FROM, MOCK_DATE_TO, salesUnitResponse.data),
+    getAdCosts(primaryStore.id, salesUnitResponse.data),
     getCampaignMappings(primaryStore.id, salesUnitResponse.data),
   ]);
 
@@ -736,60 +800,73 @@ export async function getMappingsPageData(): Promise<MappingsPageData> {
 }
 
 export async function getAdUploadsPageData(): Promise<AdUploadsPageData> {
-  const storeResponse = await getStores();
+  const storeResponse = await getStores(USE_AD_UPLOADS_MOCK_FALLBACK);
   const primaryStore = pickPrimaryStore(storeResponse.data);
 
   if (!primaryStore) {
     return {
       primaryStore: null,
       uploads: [],
-      preview: null,
-      previewRows: [],
+      previews: [],
       sources: collectSources(storeResponse),
     };
   }
 
-  const salesUnitResponse = await getSalesUnits(primaryStore.id);
-  const uploadsResponse = await getAdUploads(primaryStore.id);
-  const previewUpload =
-    uploadsResponse.data.find((upload) => upload.uploadStatus === "PREVIEW_PARSED") ??
-    uploadsResponse.data[0] ??
-    null;
-  const previewRowsResponse = previewUpload
-    ? await getPreviewRows(previewUpload.uploadId, salesUnitResponse.data)
-    : null;
+  const salesUnitResponse = await getSalesUnits(primaryStore.id, USE_AD_UPLOADS_MOCK_FALLBACK);
+  const uploadsResponse = await getAdUploads(primaryStore.id, USE_AD_UPLOADS_MOCK_FALLBACK);
+  const previewUploads = uploadsResponse.data.filter((upload) => upload.uploadStatus === "PREVIEW_PARSED");
+  const previewRowsResponses = await Promise.all(
+    previewUploads.map((upload) =>
+      getPreviewRows(upload.uploadId, salesUnitResponse.data, USE_AD_UPLOADS_MOCK_FALLBACK),
+    ),
+  );
+  const previews: AdPreviewDetail[] = previewUploads.map((previewUpload, index) => {
+    const rows = previewRowsResponses[index]?.data ?? [];
+    const activeConfirmedUploadCount = uploadsResponse.data.filter(
+      (upload) =>
+        upload.reportDate === previewUpload.reportDate &&
+        upload.isActive &&
+        upload.uploadStatus === "CONFIRMED",
+    ).length;
 
-  const preview: AdPreviewSummary | null = previewUpload
-    ? {
-        ...mockPreview,
-        uploadId: previewUpload.uploadId,
-        reportDate: previewUpload.reportDate,
-        detectedWeekday: previewUpload.detectedWeekday ?? mockPreview.detectedWeekday,
-        weekdayValidationStatus: previewUpload.weekdayValidationStatus,
-        replaceCandidateUploadId: previewUpload.replacedUploadId,
-        rowCount: previewRowsResponse?.data.length ?? 0,
-        mappingPreviewSummary: {
-          mappedCount: previewRowsResponse?.data.filter((row) => row.mappingStatus === "MAPPED").length ?? 0,
-          unmappedCount: previewRowsResponse?.data.filter((row) => row.mappingStatus === "UNMAPPED").length ?? 0,
-          conflictCount: previewRowsResponse?.data.filter((row) => row.mappingStatus === "CONFLICT").length ?? 0,
-          multipleRuleMatchCount:
-            previewRowsResponse?.data.filter((row) => row.mappingReason === "MULTIPLE_RULE_MATCHES").length ?? 0,
-          intentionallyUnmappedCount:
-            previewRowsResponse?.data.filter((row) => row.mappingReason === "INTENTIONALLY_UNMAPPED").length ?? 0,
-        },
-      }
-    : null;
+    return {
+      uploadId: previewUpload.uploadId,
+      originalFileName: previewUpload.originalFileName ?? null,
+      createdAt: previewUpload.createdAt ?? null,
+      reportDate: previewUpload.reportDate,
+      detectedWeekday: previewUpload.detectedWeekday ?? "-",
+      weekdayValidationStatus: previewUpload.weekdayValidationStatus,
+      activeConfirmedUploadCount,
+      rowCount: rows.length,
+      previewExpiresAt: previewUpload.previewExpiresAt ?? new Date(Date.now() + 7 * 86_400_000).toISOString(),
+      previewState:
+        previewUpload.previewExpiresAt && previewUpload.previewExpiresAt < new Date().toISOString()
+          ? "EXPIRED"
+          : "VALID",
+      ruleSnapshotHash: previewUpload.ruleSnapshotHash ?? "",
+      overrideSnapshotHash: previewUpload.overrideSnapshotHash ?? "",
+      mappingPreviewSummary: {
+        mappedCount: rows.filter((row) => row.mappingStatus === "MAPPED").length,
+        unmappedCount: rows.filter((row) => row.mappingStatus === "UNMAPPED").length,
+        conflictCount: rows.filter((row) => row.mappingStatus === "CONFLICT").length,
+        multipleRuleMatchCount: rows.filter((row) => row.mappingReason === "MULTIPLE_RULE_MATCHES").length,
+        intentionallyUnmappedCount: rows.filter((row) => row.mappingReason === "INTENTIONALLY_UNMAPPED").length,
+      },
+      requiresConfirm: previewUpload.weekdayValidationStatus === "PASSED",
+      status: "PREVIEW_PARSED",
+      rows,
+    };
+  });
 
   return {
     primaryStore,
     uploads: uploadsResponse.data,
-    preview,
-    previewRows: previewRowsResponse?.data ?? [],
+    previews,
     sources: collectSources(
       storeResponse,
       salesUnitResponse,
       uploadsResponse,
-      ...(previewRowsResponse ? [previewRowsResponse] : []),
+      ...previewRowsResponses,
     ),
   };
 }
@@ -823,17 +900,18 @@ export async function getProfitsPageData(params?: {
 }): Promise<ProfitsPageData> {
   const requestedDateFrom = params?.dateFrom?.trim();
   const requestedDateTo = params?.dateTo?.trim();
-  const fallbackDate = MOCK_SELECTED_DATE;
-  const dateFrom = requestedDateFrom || requestedDateTo || fallbackDate;
-  const dateTo = requestedDateTo || requestedDateFrom || fallbackDate;
-  const storeResponse = await getStores();
+  const storeResponse = await getStores(USE_PROFITS_MOCK_FALLBACK);
   const primaryStore = pickPrimaryStore(storeResponse.data);
 
   if (!primaryStore) {
+    const fallbackDate = requestedDateFrom || requestedDateTo || MOCK_SELECTED_DATE;
     return {
       primaryStore: null,
-      dateFrom,
-      dateTo,
+      dateFrom: fallbackDate,
+      dateTo: fallbackDate,
+      latestOrderDate: null,
+      latestAdDate: null,
+      latestOverlapDate: null,
       summary: mockDashboardSummary,
       profits: [],
       unmappedSummary: mockUnmappedSummary,
@@ -842,10 +920,23 @@ export async function getProfitsPageData(params?: {
     };
   }
 
+  const latestDateResponse =
+    requestedDateFrom || requestedDateTo
+      ? null
+      : await getLatestProfitDate(primaryStore.id, USE_PROFITS_MOCK_FALLBACK);
+  const resolvedDate =
+    requestedDateFrom ||
+    requestedDateTo ||
+    latestDateResponse?.data.date ||
+    nowInSeoul() ||
+    MOCK_SELECTED_DATE;
+  const dateFrom = requestedDateFrom || requestedDateTo || resolvedDate;
+  const dateTo = requestedDateTo || requestedDateFrom || resolvedDate;
+
   const [summaryResponse, profitResponse, unmappedResponse] = await Promise.all([
-    getDashboardSummary(primaryStore.id, dateTo || MOCK_SELECTED_DATE),
-    getProfitRows(primaryStore.id, dateFrom, dateTo),
-    getUnmappedSummary(primaryStore.id, dateFrom, dateTo),
+    getDashboardSummary(primaryStore.id, dateTo || MOCK_SELECTED_DATE, USE_PROFITS_MOCK_FALLBACK),
+    getProfitRows(primaryStore.id, dateFrom, dateTo, USE_PROFITS_MOCK_FALLBACK),
+    getUnmappedSummary(primaryStore.id, dateFrom, dateTo, USE_PROFITS_MOCK_FALLBACK),
   ]);
 
   const firstProfit = profitResponse.data[0] ?? null;
@@ -856,6 +947,7 @@ export async function getProfitsPageData(params?: {
           firstProfit.canonicalSalesUnitId,
           firstProfit.date,
           firstProfit,
+          USE_PROFITS_MOCK_FALLBACK,
         )
       : null;
 
@@ -863,12 +955,16 @@ export async function getProfitsPageData(params?: {
     primaryStore,
     dateFrom,
     dateTo,
+    latestOrderDate: latestDateResponse?.data.latestOrderDate ?? null,
+    latestAdDate: latestDateResponse?.data.latestAdDate ?? null,
+    latestOverlapDate: latestDateResponse?.data.latestOverlapDate ?? null,
     summary: summaryResponse.data,
     profits: profitResponse.data,
     unmappedSummary: unmappedResponse.data,
     selectedDetail: detailResponse?.data ?? null,
     sources: collectSources(
       storeResponse,
+      ...(latestDateResponse ? [latestDateResponse] : []),
       summaryResponse,
       profitResponse,
       unmappedResponse,

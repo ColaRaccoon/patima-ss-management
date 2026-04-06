@@ -5,15 +5,61 @@ import {
   calculateDailyProfitRows,
   calculateFee,
   formatApiSuccess,
+  getActiveConfirmedUploadIds,
   getAdMappingStatus,
   getCostSettingForDate,
   getOrderItemMappingStatus,
   paginate,
+  repairMojibakeText,
 } from "./helpers";
 
 @Injectable()
 export class ProfitService {
   constructor(private readonly databaseService: DatabaseService) {}
+
+  getLatestActivityDate(storeId: string) {
+    const snapshot = this.databaseService.getSnapshot();
+    const activeUploadIds = getActiveConfirmedUploadIds(snapshot, storeId);
+    const salesUnitIds = new Set(
+      snapshot.canonicalSalesUnits.filter((item) => item.storeId === storeId).map((item) => item.id),
+    );
+    const eligibleOrderDates = snapshot.orderItems
+      .filter(
+        (item) =>
+          item.storeId === storeId &&
+          item.paymentDate &&
+          item.saleStatus === "SALE" &&
+          item.canonicalSalesUnitId &&
+          salesUnitIds.has(item.canonicalSalesUnitId),
+      )
+      .map((item) => item.paymentDate!)
+      .sort((left, right) => left.localeCompare(right));
+    const eligibleAdDates = snapshot.adCampaignDailyCosts
+      .filter(
+        (item) =>
+          item.storeId === storeId &&
+          item.canonicalSalesUnitId &&
+          salesUnitIds.has(item.canonicalSalesUnitId) &&
+          activeUploadIds.has(item.sourceUploadId),
+      )
+      .map((item) => item.reportDate)
+      .sort((left, right) => left.localeCompare(right));
+    const latestOrderDate = eligibleOrderDates.at(-1) ?? null;
+    const latestAdDate = eligibleAdDates.at(-1) ?? null;
+    const orderDates = new Set(eligibleOrderDates);
+    const latestOverlapDate = eligibleAdDates
+      .filter((date) => orderDates.has(date))
+      .sort((left, right) => left.localeCompare(right))
+      .at(-1) ?? null;
+    const date = latestOverlapDate ?? latestOrderDate ?? latestAdDate ?? null;
+
+    return formatApiSuccess({
+      date,
+      latestOrderDate,
+      latestAdDate,
+      latestOverlapDate,
+    });
+  }
 
   getDashboardSummary(storeId: string, date: string) {
     return formatApiSuccess(calculateDashboardSummary(this.databaseService.getSnapshot(), storeId, date));
@@ -39,6 +85,7 @@ export class ProfitService {
 
   getDailySalesUnitDetail(storeId: string, salesUnitId: string, date: string) {
     const snapshot = this.databaseService.getSnapshot();
+    const activeUploadIds = getActiveConfirmedUploadIds(snapshot, storeId, date);
     const salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === salesUnitId && item.storeId === storeId);
     if (!salesUnit) {
       throw new NotFoundException({
@@ -78,7 +125,8 @@ export class ProfitService {
       (item) =>
         item.storeId === storeId &&
         item.canonicalSalesUnitId === salesUnitId &&
-        item.reportDate === date,
+        item.reportDate === date &&
+        activeUploadIds.has(item.sourceUploadId),
     );
 
     const aggregatedFeeCandidates = orderItems.reduce(
@@ -121,7 +169,7 @@ export class ProfitService {
       })),
       adCampaigns: adCampaigns.map((item) => ({
         adCostId: item.id,
-        campaignName: item.campaignName,
+        campaignName: repairMojibakeText(item.campaignName),
         reportDate: item.reportDate,
         totalCost: item.totalCost,
       })),
@@ -164,9 +212,7 @@ export class ProfitService {
 
   getUnmappedSummary(storeId: string, dateFrom: string, dateTo: string) {
     const snapshot = this.databaseService.getSnapshot();
-    const activeUploadIds = new Set(
-      snapshot.adExcelUploads.filter((item) => item.storeId === storeId && item.isActive).map((item) => item.id),
-    );
+    const activeUploadIds = getActiveConfirmedUploadIds(snapshot, storeId);
     const unmappedOrderItems = snapshot.orderItems.filter(
       (item) =>
         item.storeId === storeId &&
