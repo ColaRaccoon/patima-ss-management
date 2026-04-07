@@ -76,8 +76,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
     );
   }
 
-  const deliveryFeeReferenceTotal =
-    selectedDetail?.orderItems.reduce((total, item) => total + (item.deliveryFeeAmount ?? 0), 0) ?? 0;
+  const deliveryFeeReferenceTotal = selectedDetail?.deliveryFeeSummary.totalDeliveryFeeAmount ?? 0;
   const hasConflict = data.unmappedSummary.conflictOrderItemCount > 0 || data.unmappedSummary.conflictCampaignCount > 0;
   const dateAvailabilityNotice = (() => {
     if (data.latestOrderDate && data.latestAdDate && !data.latestOverlapDate) {
@@ -95,14 +94,14 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
     ) {
       return {
         title: "Orders and ads were last updated on different days.",
-        description: `Latest eligible order date is ${formatDate(data.latestOrderDate)}, latest confirmed ad date is ${formatDate(data.latestAdDate)}, and the latest shared date is ${formatDate(data.latestOverlapDate)}. The profits tab defaults to the shared date so quantity, revenue, fee, and ad cost line up.`,
+        description: `Latest eligible order date is ${formatDate(data.latestOrderDate)}, latest confirmed ad date is ${formatDate(data.latestAdDate)}, and the latest shared date is ${formatDate(data.latestOverlapDate)}. The profits tab defaults to the shared date so quantity, product revenue, fee, and ad cost line up.`,
       };
     }
 
     if (!data.latestOrderDate && data.latestAdDate) {
       return {
         title: "Confirmed ad costs exist, but no eligible order rows are available yet.",
-        description: `Confirmed ad costs are available on ${formatDate(data.latestAdDate)}. Quantity, revenue, and fee stay 0 until sale rows are synced and mapped to a sales unit.`,
+        description: `Confirmed ad costs are available on ${formatDate(data.latestAdDate)}. Quantity, product revenue, and fee stay 0 until sale rows are synced and mapped to a sales unit.`,
       };
     }
 
@@ -121,10 +120,18 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       <PageHeader
         eyebrow="Profits"
         title="Sales-unit profit analysis"
-        description={`Range ${formatDateRange(data.dateFrom, data.dateTo)}. Conflict and unmapped rows are excluded from the aggregated totals.`}
+        description={`Range ${formatDateRange(data.dateFrom, data.dateTo)}. Conflict and unmapped rows are excluded, and delivery fees stay separate from product revenue until the shipping rule is finalized.`}
       />
 
       <SourceBanner sources={data.sources} />
+
+      <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-900">
+        <p className="font-semibold">Delivery fees are tracked separately for now.</p>
+        <p className="mt-1">
+          Product revenue, rough profit, and estimated net profit currently exclude delivery fees until the shipping
+          rule and any shipping-cost/subsidy handling are finalized.
+        </p>
+      </div>
 
       {dateAvailabilityNotice ? (
         <div className="rounded-2xl border border-amber-300/40 bg-amber-100/70 px-4 py-4 text-sm leading-6 text-amber-900">
@@ -160,12 +167,23 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
         </form>
       </Panel>
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Revenue" value={formatCurrency(data.summary.totalRevenue)} />
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+        <StatCard
+          label="Product revenue"
+          value={formatCurrency(data.summary.totalProductRevenue)}
+          hint="Delivery fee reference shown separately."
+        />
+        <StatCard
+          label="Delivery fee reference"
+          value={formatCurrency(data.summary.totalDeliveryFeeAmount)}
+          hint="Reference only for now."
+          tone="muted"
+        />
         <StatCard label="Ad cost" value={formatCurrency(data.summary.totalAdCost)} tone="accent" />
         <StatCard
           label="Rough profit"
           value={formatCurrency(data.summary.roughProfit)}
+          hint="Product revenue - ad cost"
           tone={data.summary.roughProfit >= 0 ? "success" : "danger"}
         />
         <StatCard
@@ -184,7 +202,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
         <div className="rounded-2xl border border-red-300/40 bg-red-100/70 px-4 py-4 text-sm leading-6 text-red-800">
           <p className="font-semibold">Conflict mappings are excluded from profit totals.</p>
           <p className="mt-1">
-            Order revenue {formatCurrency(data.unmappedSummary.conflictOrderRevenue)} / Ad cost {formatCurrency(data.unmappedSummary.conflictAdCost)}
+            Order product revenue {formatCurrency(data.unmappedSummary.conflictOrderRevenue)} / Ad cost {formatCurrency(data.unmappedSummary.conflictAdCost)}
           </p>
         </div>
       ) : null}
@@ -254,8 +272,13 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
               },
               {
                 key: "revenue",
-                title: "Revenue",
-                render: (row) => formatCurrency(row.totalRevenue),
+                title: "Product revenue",
+                render: (row) => formatCurrency(row.totalProductRevenue),
+              },
+              {
+                key: "buyerShipping",
+                title: "Delivery fee ref",
+                render: (row) => formatCurrency(row.totalDeliveryFeeAmount),
               },
               {
                 key: "adCost",
@@ -287,13 +310,13 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           <Panel title="Excluded totals">
             <div className="grid gap-3">
               <StatCard
-                label="Unmapped order revenue"
+                label="Unmapped order product revenue"
                 value={formatCurrency(data.unmappedSummary.unmappedOrderRevenue)}
                 hint={`${formatNumber(data.unmappedSummary.unmappedOrderItemCount)} items`}
                 tone="warning"
               />
               <StatCard
-                label="Conflict order revenue"
+                label="Conflict order product revenue"
                 value={formatCurrency(data.unmappedSummary.conflictOrderRevenue)}
                 hint={`${formatNumber(data.unmappedSummary.conflictOrderItemCount)} items`}
                 tone="danger"
@@ -338,11 +361,19 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                   Orders {formatNumber(selectedDetail.orderItems.length)} / Ads {formatNumber(selectedDetail.adCampaigns.length)}
                 </p>
                 <p>Total quantity {formatNumber(selectedDetail.summary.totalQuantity)}</p>
+                <p>Product revenue {formatCurrency(selectedDetail.summary.totalProductRevenue)}</p>
+                <p>Delivery fee reference {formatCurrency(deliveryFeeReferenceTotal)}</p>
                 <p>Computed fee cost {formatCurrency(selectedDetail.costBreakdown.computedFeeCost)}</p>
                 <p>Fallback fee portion {formatCurrency(selectedDetail.costBreakdown.fallbackFeeCostPortion)}</p>
-                <p>Delivery reference {formatCurrency(deliveryFeeReferenceTotal)}</p>
-                <p>Excluded order revenue {formatCurrency(selectedDetail.excludedSummary.excludedOrderRevenue)}</p>
-                <p>Excluded conflict order revenue {formatCurrency(selectedDetail.excludedSummary.excludedConflictOrderRevenue)}</p>
+                <p>
+                  Delivery fee excluded from product revenue/net profit:{" "}
+                  {selectedDetail.deliveryFeeSummary.includedInProductRevenue ||
+                  selectedDetail.deliveryFeeSummary.includedInEstimatedNetProfit
+                    ? "No"
+                    : "Yes"}
+                </p>
+                <p>Excluded order product revenue {formatCurrency(selectedDetail.excludedSummary.excludedOrderRevenue)}</p>
+                <p>Excluded conflict order product revenue {formatCurrency(selectedDetail.excludedSummary.excludedConflictOrderRevenue)}</p>
                 <p>Excluded ad cost {formatCurrency(selectedDetail.excludedSummary.excludedAdCost)}</p>
                 <p>Excluded conflict ad cost {formatCurrency(selectedDetail.excludedSummary.excludedConflictAdCost)}</p>
                 {isLoadingDetail ? <p>Loading detail...</p> : null}

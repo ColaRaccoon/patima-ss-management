@@ -288,6 +288,11 @@ export interface DailySalesUnitDetail {
     reportDate: string;
     totalCost: number;
   }>;
+  deliveryFeeSummary: {
+    totalDeliveryFeeAmount: number;
+    includedInProductRevenue: boolean;
+    includedInEstimatedNetProfit: boolean;
+  };
   costBreakdown: {
     costSettingStatus: ProfitStatus;
     unitCostPerQuantity: number;

@@ -102,6 +102,8 @@ export class ProfitService {
         displayName: salesUnit.displayName,
         totalQuantity: 0,
         totalRevenue: 0,
+        totalProductRevenue: 0,
+        totalDeliveryFeeAmount: 0,
         totalAdCost: 0,
         totalUnitCost: 0,
         totalFeeCost: 0,
@@ -173,6 +175,11 @@ export class ProfitService {
         reportDate: item.reportDate,
         totalCost: item.totalCost,
       })),
+      deliveryFeeSummary: {
+        totalDeliveryFeeAmount: summary.totalDeliveryFeeAmount,
+        includedInProductRevenue: false,
+        includedInEstimatedNetProfit: false,
+      },
       costBreakdown: {
         costSettingStatus: summary.profitStatus,
         unitCostPerQuantity: activeCostSetting?.unitCost ?? 0,

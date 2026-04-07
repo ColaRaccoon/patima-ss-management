@@ -268,7 +268,10 @@ export interface PaginationResult<T> {
 
 export interface DashboardSummary {
   date: string;
+  // Kept for compatibility; currently equals totalProductRevenue and excludes shipping.
   totalRevenue: number;
+  totalProductRevenue: number;
+  totalDeliveryFeeAmount: number;
   totalAdCost: number;
   roughProfit: number;
   estimatedNetProfit: number | null;
@@ -295,7 +298,10 @@ export interface DailySalesUnitProfit {
   canonicalSalesUnitId: string;
   displayName: string;
   totalQuantity: number;
+  // Kept for compatibility; currently equals totalProductRevenue and excludes shipping.
   totalRevenue: number;
+  totalProductRevenue: number;
+  totalDeliveryFeeAmount: number;
   totalAdCost: number;
   totalUnitCost: number;
   totalFeeCost: number;

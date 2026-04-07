@@ -5,6 +5,7 @@ import { evaluateAdMapping, getAdMappingOverride } from "./ad-mapping-engine";
 import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
 import {
   calculateDashboardSummary,
+  calculateDailyProfitRows,
   calculateFee,
   createEmptyDatabase,
   getWeekdayNameKo,
@@ -507,7 +508,7 @@ run("calculateDashboardSummary excludes conflict order revenue and conflict ad c
       quantity: 1,
       productPaymentAmount: 100,
       totalProductAmount: null,
-      deliveryFeeAmount: null,
+      deliveryFeeAmount: 12,
       paymentCommission: null,
       knowledgeShoppingSellingInterlockCommission: null,
       saleCommission: null,
@@ -539,7 +540,7 @@ run("calculateDashboardSummary excludes conflict order revenue and conflict ad c
       quantity: 1,
       productPaymentAmount: 50,
       totalProductAmount: null,
-      deliveryFeeAmount: null,
+      deliveryFeeAmount: 30,
       paymentCommission: null,
       knowledgeShoppingSellingInterlockCommission: null,
       saleCommission: null,
@@ -596,11 +597,95 @@ run("calculateDashboardSummary excludes conflict order revenue and conflict ad c
   const summary = calculateDashboardSummary(database, "store-1", date);
 
   assert.equal(summary.totalRevenue, 100);
+  assert.equal(summary.totalProductRevenue, 100);
+  assert.equal(summary.totalDeliveryFeeAmount, 12);
   assert.equal(summary.totalAdCost, 20);
   assert.equal(summary.conflictOrderItemCount, 1);
   assert.equal(summary.excludedConflictOrderRevenue, 50);
   assert.equal(summary.conflictCampaignCount, 1);
   assert.equal(summary.excludedConflictAdCost, 30);
+});
+
+run("profit rows keep delivery fee separate from product revenue and net profit", () => {
+  const database = createEmptyDatabase();
+  const date = "2026-04-02";
+
+  database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Diet Socks", ["dietsocks"]));
+  database.salesUnitCostSettings.push({
+    id: "cost-1",
+    storeId: "store-1",
+    canonicalSalesUnitId: "sales-1",
+    unitCost: 10,
+    feeRate: 0.1,
+    otherCost: 5,
+    isActive: true,
+    deactivatedAt: null,
+    effectiveFrom: date,
+    effectiveTo: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.orderSourceSignatures.push({
+    id: "sig-1",
+    storeId: "store-1",
+    sourceSignature: createSourceSignature("diet socks", null),
+    rawProductNameSnapshot: "diet socks",
+    rawOptionInfoSnapshot: null,
+    normalizedProductName: normalizeText("diet socks"),
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: "sales-1",
+    mappingStatus: "MAPPED",
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.orderItems.push({
+    id: "order-1",
+    storeId: "store-1",
+    orderId: "record-1",
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: "sales-1",
+    externalProductOrderId: "external-1",
+    externalProductId: null,
+    packageNumber: null,
+    rawProductName: "diet socks",
+    rawOptionInfo: null,
+    normalizedProductName: normalizeText("diet socks"),
+    normalizedOptionInfo: "",
+    sourceSignature: createSourceSignature("diet socks", null),
+    quantity: 1,
+    productPaymentAmount: 100,
+    totalProductAmount: 100,
+    deliveryFeeAmount: 20,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: date,
+    paymentDate: date,
+    saleStatus: "SALE",
+    orderStatus: "DELIVERED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+
+  const rows = calculateDailyProfitRows(database, "store-1", date, date);
+  const summary = calculateDashboardSummary(database, "store-1", date);
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].totalRevenue, 100);
+  assert.equal(rows[0].totalProductRevenue, 100);
+  assert.equal(rows[0].totalDeliveryFeeAmount, 20);
+  assert.equal(rows[0].roughProfit, 100);
+  assert.equal(rows[0].estimatedNetProfit, 75);
+  assert.equal(summary.totalRevenue, 100);
+  assert.equal(summary.totalProductRevenue, 100);
+  assert.equal(summary.totalDeliveryFeeAmount, 20);
+  assert.equal(summary.roughProfit, 100);
+  assert.equal(summary.estimatedNetProfit, 75);
 });
 
 run("AdsService confirms two same-date uploads and sums ad cost across active confirmed uploads", () => {
@@ -727,8 +812,80 @@ run("ProfitService detail and summary include only active confirmed uploads", ()
 
   assert.equal(summary.totalAdCost, 20);
   assert.equal(detail.data.summary.totalAdCost, 20);
+  assert.equal(detail.data.deliveryFeeSummary.totalDeliveryFeeAmount, 0);
   assert.equal(detail.data.adCampaigns.length, 1);
   assert.equal(detail.data.adCampaigns[0].adCostId, "ad-upload-active-cmp-1001");
+});
+
+run("ProfitService keeps delivery fee references separate from product revenue and net profit", () => {
+  const databaseService = createMemoryDatabaseService();
+  const profitService = new ProfitService(databaseService as never);
+  const date = "2026-04-02";
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
+    draft.salesUnitCostSettings.push({
+      id: "cost-1",
+      storeId: "store-1",
+      canonicalSalesUnitId: "sales-1",
+      unitCost: 0,
+      feeRate: 0,
+      otherCost: 0,
+      isActive: true,
+      deactivatedAt: null,
+      effectiveFrom: date,
+      effectiveTo: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as never);
+    draft.orderItems.push({
+      id: "order-item-1",
+      storeId: "store-1",
+      orderId: "record-1",
+      orderSourceSignatureId: null,
+      canonicalSalesUnitId: "sales-1",
+      externalProductOrderId: "external-1",
+      externalProductId: null,
+      packageNumber: null,
+      rawProductName: "alpha",
+      rawOptionInfo: null,
+      normalizedProductName: normalizeText("alpha"),
+      normalizedOptionInfo: "",
+      sourceSignature: createSourceSignature("alpha", null),
+      quantity: 1,
+      productPaymentAmount: 100,
+      totalProductAmount: 100,
+      deliveryFeeAmount: 30,
+      paymentCommission: 0,
+      knowledgeShoppingSellingInterlockCommission: 0,
+      saleCommission: 0,
+      channelCommission: 0,
+      orderDate: date,
+      paymentDate: date,
+      saleStatus: "SALE",
+      orderStatus: "DELIVERED",
+      isCanceled: false,
+      isReturned: false,
+      rawPayload: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as never);
+  });
+
+  const summary = calculateDashboardSummary(databaseService.getSnapshot(), "store-1", date);
+  const detail = profitService.getDailySalesUnitDetail("store-1", "sales-1", date);
+
+  assert.equal(summary.totalRevenue, 100);
+  assert.equal(summary.totalProductRevenue, 100);
+  assert.equal(summary.totalDeliveryFeeAmount, 30);
+  assert.equal(summary.roughProfit, 100);
+  assert.equal(summary.estimatedNetProfit, 100);
+  assert.equal(detail.data.summary.totalRevenue, 100);
+  assert.equal(detail.data.summary.totalProductRevenue, 100);
+  assert.equal(detail.data.summary.totalDeliveryFeeAmount, 30);
+  assert.equal(detail.data.deliveryFeeSummary.totalDeliveryFeeAmount, 30);
+  assert.equal(detail.data.deliveryFeeSummary.includedInProductRevenue, false);
+  assert.equal(detail.data.deliveryFeeSummary.includedInEstimatedNetProfit, false);
 });
 
 run("ProfitService latest activity date prefers latest overlap even over later eligible orders and ads", () => {

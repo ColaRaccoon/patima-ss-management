@@ -533,6 +533,8 @@ export const calculateDailyProfitRows = (
           displayName: salesUnit.displayName,
           totalQuantity: 0,
           totalRevenue: 0,
+          totalProductRevenue: 0,
+          totalDeliveryFeeAmount: 0,
           totalAdCost: 0,
           totalUnitCost: 0,
           totalFeeCost: 0,
@@ -544,7 +546,8 @@ export const calculateDailyProfitRows = (
         };
 
       row.totalQuantity += item.quantity;
-      row.totalRevenue += item.productPaymentAmount;
+      row.totalProductRevenue += item.productPaymentAmount;
+      row.totalDeliveryFeeAmount += item.deliveryFeeAmount ?? 0;
       row.totalFeeCost += fee.totalFeeCost;
       row.totalUnitCost += (costSetting?.unitCost ?? 0) * item.quantity;
       row.totalOtherCost += (costSetting?.otherCost ?? 0) * item.quantity;
@@ -576,6 +579,8 @@ export const calculateDailyProfitRows = (
           displayName: salesUnit.displayName,
           totalQuantity: 0,
           totalRevenue: 0,
+          totalProductRevenue: 0,
+          totalDeliveryFeeAmount: 0,
           totalAdCost: 0,
           totalUnitCost: 0,
           totalFeeCost: 0,
@@ -592,6 +597,7 @@ export const calculateDailyProfitRows = (
 
   return Array.from(rowMap.values())
     .map((row) => {
+      row.totalRevenue = row.totalProductRevenue;
       row.roughProfit = row.totalRevenue - row.totalAdCost;
       row.profitStatus = computeProfitStatus(row.fallbackIncomplete);
       row.estimatedNetProfit = row.fallbackIncomplete
@@ -613,6 +619,11 @@ export const calculateDashboardSummary = (
 ): DashboardSummary => {
   const rows = calculateDailyProfitRows(database, storeId, date, date);
   const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
+  const totalProductRevenue = rows.reduce((total, row) => total + row.totalProductRevenue, 0);
+  const totalDeliveryFeeAmount = rows.reduce(
+    (total, row) => total + row.totalDeliveryFeeAmount,
+    0,
+  );
   const eligibleOrders = database.orderItems.filter(
     (item) => item.storeId === storeId && item.paymentDate === date,
   );
@@ -643,7 +654,9 @@ export const calculateDashboardSummary = (
 
   return {
     date,
-    totalRevenue: rows.reduce((total, row) => total + row.totalRevenue, 0),
+    totalRevenue: totalProductRevenue,
+    totalProductRevenue,
+    totalDeliveryFeeAmount,
     totalAdCost: rows.reduce((total, row) => total + row.totalAdCost, 0),
     roughProfit: rows.reduce((total, row) => total + row.roughProfit, 0),
     estimatedNetProfit:

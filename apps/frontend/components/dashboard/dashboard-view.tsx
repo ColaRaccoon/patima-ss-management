@@ -29,7 +29,7 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
       <PageHeader
         eyebrow="Dashboard"
         title={`${data.primaryStore.name} summary`}
-        description="Daily profit, excluded totals, and recent operations in one place."
+        description="Daily profit, excluded totals, and recent operations in one place. Delivery fees stay separate from product revenue until the shipping rule is finalized."
         actions={
           <>
             <Link className="button-shell button-secondary" href="/profits">
@@ -44,11 +44,25 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
 
       <SourceBanner sources={data.sources} />
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-900">
+        <p className="font-semibold">Delivery fees are shown separately from profit totals.</p>
+        <p className="mt-1">
+          Product revenue, rough profit, and estimated net profit currently exclude delivery fees until the shipping
+          rule and any shipping-cost/subsidy handling are finalized.
+        </p>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <StatCard
-          label={`Revenue on ${formatDate(data.selectedDate)}`}
-          value={formatCurrency(data.summary.totalRevenue)}
+          label={`Product revenue on ${formatDate(data.selectedDate)}`}
+          value={formatCurrency(data.summary.totalProductRevenue)}
           hint={`Sales units ${formatNumber(data.summary.salesUnitCount)}`}
+        />
+        <StatCard
+          label="Delivery fee reference"
+          value={formatCurrency(data.summary.totalDeliveryFeeAmount)}
+          hint="Reference only for now."
+          tone="muted"
         />
         <StatCard
           label="Ad cost"
@@ -59,7 +73,7 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
         <StatCard
           label="Rough profit"
           value={formatCurrency(data.summary.roughProfit)}
-          hint="Revenue - ad cost"
+          hint="Product revenue - ad cost"
           tone={data.summary.roughProfit >= 0 ? "success" : "warning"}
         />
         <StatCard
@@ -81,7 +95,7 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
             Orders {formatNumber(data.summary.conflictOrderItemCount)} / Ads {formatNumber(data.summary.conflictCampaignCount)}
           </p>
           <p>
-            Excluded revenue {formatCurrency(data.summary.excludedConflictOrderRevenue)} / Excluded ad cost {formatCurrency(data.summary.excludedConflictAdCost)}
+            Excluded product revenue {formatCurrency(data.summary.excludedConflictOrderRevenue)} / Excluded ad cost {formatCurrency(data.summary.excludedConflictAdCost)}
           </p>
         </div>
       ) : null}
@@ -129,7 +143,7 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
               tone="muted"
             />
             <StatCard
-              label="Total excluded revenue"
+              label="Total excluded product revenue"
               value={formatCurrency(data.summary.excludedOrderRevenue)}
               tone="warning"
             />
@@ -175,7 +189,7 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
 
       <Panel
         title="Daily sales-unit profit rows"
-        description="Rows shown here already exclude conflict and unmapped data from the aggregated totals."
+        description="Rows shown here already exclude conflict and unmapped data, and delivery fee references stay outside the current profit math."
       >
         <DataTable
           caption="Daily sales-unit profit rows"
@@ -197,8 +211,13 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
             },
             {
               key: "totalRevenue",
-              title: "Revenue",
-              render: (row) => formatCurrency(row.totalRevenue),
+              title: "Product revenue",
+              render: (row) => formatCurrency(row.totalProductRevenue),
+            },
+            {
+              key: "totalDeliveryFeeAmount",
+              title: "Delivery fee ref",
+              render: (row) => formatCurrency(row.totalDeliveryFeeAmount),
             },
             {
               key: "totalAdCost",

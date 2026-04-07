@@ -225,6 +225,11 @@ function createMockDailySalesUnitDetail(
     summary: row,
     orderItems: [],
     adCampaigns: [],
+    deliveryFeeSummary: {
+      totalDeliveryFeeAmount: row.totalDeliveryFeeAmount,
+      includedInProductRevenue: false,
+      includedInEstimatedNetProfit: false,
+    },
     costBreakdown: {
       costSettingStatus: mockProfitDetailPreview.profitStatus,
       unitCostPerQuantity: 0,
