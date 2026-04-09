@@ -76,7 +76,6 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
     );
   }
 
-  const deliveryFeeReferenceTotal = selectedDetail?.deliveryFeeSummary.totalDeliveryFeeAmount ?? 0;
   const hasConflict = data.unmappedSummary.conflictOrderItemCount > 0 || data.unmappedSummary.conflictCampaignCount > 0;
   const dateAvailabilityNotice = (() => {
     if (data.latestOrderDate && data.latestAdDate && !data.latestOverlapDate) {
@@ -276,11 +275,6 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                 render: (row) => formatCurrency(row.totalProductRevenue),
               },
               {
-                key: "buyerShipping",
-                title: "Delivery fee ref",
-                render: (row) => formatCurrency(row.totalDeliveryFeeAmount),
-              },
-              {
                 key: "adCost",
                 title: "Ad cost",
                 render: (row) => formatCurrency(row.totalAdCost),
@@ -362,16 +356,9 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                 </p>
                 <p>Total quantity {formatNumber(selectedDetail.summary.totalQuantity)}</p>
                 <p>Product revenue {formatCurrency(selectedDetail.summary.totalProductRevenue)}</p>
-                <p>Delivery fee reference {formatCurrency(deliveryFeeReferenceTotal)}</p>
                 <p>Computed fee cost {formatCurrency(selectedDetail.costBreakdown.computedFeeCost)}</p>
                 <p>Fallback fee portion {formatCurrency(selectedDetail.costBreakdown.fallbackFeeCostPortion)}</p>
-                <p>
-                  Delivery fee excluded from product revenue/net profit:{" "}
-                  {selectedDetail.deliveryFeeSummary.includedInProductRevenue ||
-                  selectedDetail.deliveryFeeSummary.includedInEstimatedNetProfit
-                    ? "No"
-                    : "Yes"}
-                </p>
+                <p>Delivery fee reference is shown only at the store/date summary level.</p>
                 <p>Excluded order product revenue {formatCurrency(selectedDetail.excludedSummary.excludedOrderRevenue)}</p>
                 <p>Excluded conflict order product revenue {formatCurrency(selectedDetail.excludedSummary.excludedConflictOrderRevenue)}</p>
                 <p>Excluded ad cost {formatCurrency(selectedDetail.excludedSummary.excludedAdCost)}</p>

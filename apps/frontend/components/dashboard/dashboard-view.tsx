@@ -215,11 +215,6 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
               render: (row) => formatCurrency(row.totalProductRevenue),
             },
             {
-              key: "totalDeliveryFeeAmount",
-              title: "Delivery fee ref",
-              render: (row) => formatCurrency(row.totalDeliveryFeeAmount),
-            },
-            {
               key: "totalAdCost",
               title: "Ad cost",
               render: (row) => formatCurrency(row.totalAdCost),
