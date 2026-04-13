@@ -401,6 +401,8 @@ export const migrateCanonicalSalesUnit = (
     displayName,
     matchAliases,
     normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
+    linkedProductIds: raw.linkedProductIds ?? [],
+    linkedOptionCodes: raw.linkedOptionCodes ?? [],
     memo: raw.memo ?? null,
     isActive: raw.isActive,
     deactivatedAt: raw.deactivatedAt ?? null,

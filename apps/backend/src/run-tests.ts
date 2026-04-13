@@ -15,6 +15,7 @@ import {
 } from "./helpers";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { NaverCommerceService, createNaverClientSecretSign } from "./naver-commerce.service";
+import { OrderMappingService } from "./order-mapping.service";
 import { ProfitService } from "./profit.service";
 import { recalculateOrderMappingsForStore, resolveOrderSignatureAutoMapping } from "./sales-unit-auto-mapper";
 
@@ -70,6 +71,47 @@ const createAdsServiceHarness = () => {
 
   return { databaseService, adsService };
 };
+
+const createOrderMappingServiceHarness = () => {
+  const databaseService = createMemoryDatabaseService();
+  const enqueueCalls: Array<{ storeId: string; requestJson: Record<string, unknown> }> = [];
+  const orderMappingService = new OrderMappingService(
+    databaseService as never,
+    {
+      registerRetryExecutor: () => undefined,
+      enqueue: (storeId: string, _operationType: string, requestJson: Record<string, unknown>) => {
+        enqueueCalls.push({ storeId, requestJson });
+        return { id: `operation-${enqueueCalls.length}` };
+      },
+    } as never,
+    {
+      ensureWritable: () => undefined,
+    } as never,
+    {
+      create: () => {
+        throw new Error("create not used in this test");
+      },
+    } as never,
+  );
+
+  return { databaseService, orderMappingService, enqueueCalls };
+};
+
+const createOrderSourceSignature = (id: string, productName: string, storeId = "store-1") =>
+  ({
+    id,
+    storeId,
+    rawProductNameSnapshot: productName,
+    rawOptionInfoSnapshot: null,
+    normalizedProductName: normalizeText(productName),
+    normalizedOptionInfo: "",
+    sourceSignature: createSourceSignature(productName, null),
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED",
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }) as never;
 
 const createAdUploadFile = (
   reportDate: string,
@@ -416,6 +458,75 @@ run("recalculateOrderMappingsForStore marks ambiguous alias matches as conflict"
   assert.equal(database.orderSourceSignatures[0].mappingStatus, "CONFLICT");
   assert.equal(database.orderSourceSignatures[0].canonicalSalesUnitId, null);
   assert.equal(database.orderItems[0].canonicalSalesUnitId, null);
+});
+
+run("OrderMappingService saveMappings deduplicates signatures and enqueues one recalculation", () => {
+  const { databaseService, orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Diet Socks", ["diet socks"]));
+    draft.orderSourceSignatures.push(
+      createOrderSourceSignature("sig-1", "diet socks"),
+      createOrderSourceSignature("sig-2", "diet socks black"),
+    );
+  });
+
+  const result = orderMappingService.saveMappings(["sig-1", "sig-1", "sig-2"], {
+    canonicalSalesUnitId: "sales-1",
+  });
+  const snapshot = databaseService.getSnapshot();
+  const first = snapshot.orderSourceSignatures.find((item: { id: string }) => item.id === "sig-1");
+  const second = snapshot.orderSourceSignatures.find((item: { id: string }) => item.id === "sig-2");
+
+  assert.equal(result.data.updatedCount, 2);
+  assert.equal(enqueueCalls.length, 1);
+  assert.deepEqual(enqueueCalls[0]?.requestJson.signatureIds, ["sig-1", "sig-2"]);
+  assert.equal(first?.canonicalSalesUnitId, "sales-1");
+  assert.equal(second?.canonicalSalesUnitId, "sales-1");
+  assert.equal(first?.mappingStatus, "MAPPED");
+  assert.equal(second?.mappingStatus, "MAPPED");
+});
+
+run("OrderMappingService createAndMapMany skips order recalculation during sales-unit creation", () => {
+  const databaseService = createMemoryDatabaseService();
+  const createCalls: Array<{ options?: { skipOrderRecalculation?: boolean } }> = [];
+  const orderMappingService = new OrderMappingService(
+    databaseService as never,
+    {
+      registerRetryExecutor: () => undefined,
+      enqueue: () => ({ id: "operation-1" }),
+    } as never,
+    {
+      ensureWritable: () => undefined,
+    } as never,
+    {
+      create: (payload: { displayName: string; matchAliases?: string[] | null }, options?: { skipOrderRecalculation?: boolean }) => {
+        createCalls.push({ options });
+        databaseService.write((draft) => {
+          draft.canonicalSalesUnits.push(
+            createSalesUnit("sales-created", payload.displayName, payload.matchAliases ?? []),
+          );
+        });
+        return {
+          data: {
+            id: "sales-created",
+          },
+        };
+      },
+    } as never,
+  );
+
+  databaseService.write((draft) => {
+    draft.orderSourceSignatures.push(createOrderSourceSignature("sig-create", "alpha pack"));
+  });
+
+  orderMappingService.createAndMapMany(["sig-create"], {
+    displayName: "Alpha Pack",
+    matchAliases: ["alpha pack"],
+    memo: null,
+  });
+
+  assert.equal(createCalls[0]?.options?.skipOrderRecalculation, true);
 });
 
 run("evaluateAdMapping falls back to alias matching without a campaign rule", () => {
@@ -1059,6 +1170,122 @@ run("AdsService deleteUpload deactivates the upload and removes related ad rows"
   assert.equal(upload?.isActive, false);
   assert.equal(snapshot.adCampaignDailyCosts.some((item: { sourceUploadId: string }) => item.sourceUploadId === "upload-delete"), false);
   assert.equal(calculateDashboardSummary(snapshot, "store-1", date).totalAdCost, 0);
+});
+
+run("AdsService saveManualMappings applies one sales unit to multiple rows", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-1",
+        reportDate: "2026-04-03",
+        campaignId: "cmp-1",
+        campaignName: "alpha launch",
+        canonicalSalesUnitId: null,
+        totalCost: 120,
+      }),
+      createConfirmedUploadRow({
+        uploadId: "upload-2",
+        reportDate: "2026-04-03",
+        campaignId: "cmp-2",
+        campaignName: "alpha retarget",
+        canonicalSalesUnitId: null,
+        totalCost: 80,
+      }),
+    );
+  });
+
+  const result = adsService.saveManualMappings(
+    ["ad-upload-1-cmp-1", "ad-upload-2-cmp-2"],
+    { canonicalSalesUnitId: "sales-1" },
+  );
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(result.data.updatedCount, 2);
+  snapshot.adCampaignDailyCosts.forEach((item: any) => {
+    assert.equal(item.canonicalSalesUnitId, "sales-1");
+    assert.equal(item.mappingReason, "MANUAL_MAPPED");
+    assert.equal(item.matchedRuleCount, 0);
+    assert.equal(item.reasonNote, null);
+    assert.equal(item.reasonNoteInherited, false);
+  });
+});
+
+run("AdsService saveManualMappings rejects inactive sales units", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+  const inactiveSalesUnit = createSalesUnit("sales-1", "Alpha Unit", ["alpha"]) as Record<string, unknown>;
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(
+      {
+        ...inactiveSalesUnit,
+        isActive: false,
+        deactivatedAt: new Date().toISOString(),
+      } as never,
+    );
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-5",
+        reportDate: "2026-04-03",
+        campaignId: "cmp-5",
+        campaignName: "alpha launch",
+        canonicalSalesUnitId: null,
+        totalCost: 20,
+      }),
+    );
+  });
+
+  assert.throws(
+    () =>
+      adsService.saveManualMappings(["ad-upload-5-cmp-5"], {
+        canonicalSalesUnitId: "sales-1",
+      }),
+    (error: unknown) =>
+      error instanceof Error &&
+      "getResponse" in error &&
+      JSON.stringify((error as { getResponse: () => unknown }).getResponse()).includes("비활성화된 판매단위"),
+  );
+});
+
+run("AdsService setIntentionalUnmappedMany applies one note to multiple rows", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+
+  databaseService.write((draft) => {
+    draft.adCampaignDailyCosts.push(
+      createConfirmedUploadRow({
+        uploadId: "upload-3",
+        reportDate: "2026-04-03",
+        campaignId: "cmp-3",
+        campaignName: "beta launch",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 50,
+      }),
+      createConfirmedUploadRow({
+        uploadId: "upload-4",
+        reportDate: "2026-04-03",
+        campaignId: "cmp-4",
+        campaignName: "beta retention",
+        canonicalSalesUnitId: "sales-1",
+        totalCost: 40,
+      }),
+    );
+  });
+
+  const result = adsService.setIntentionalUnmappedMany(
+    ["ad-upload-3-cmp-3", "ad-upload-4-cmp-4"],
+    { reasonNote: "merged into brand spend" },
+  );
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(result.data.updatedCount, 2);
+  snapshot.adCampaignDailyCosts.forEach((item: any) => {
+    assert.equal(item.canonicalSalesUnitId, null);
+    assert.equal(item.mappingReason, "INTENTIONALLY_UNMAPPED");
+    assert.equal(item.reasonNote, "merged into brand spend");
+    assert.equal(item.reasonNoteInherited, false);
+  });
 });
 
 console.log("All backend checks passed.");

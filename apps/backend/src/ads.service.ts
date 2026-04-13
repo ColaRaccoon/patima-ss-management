@@ -455,26 +455,7 @@ export class AdsService implements OnModuleInit {
   }
 
   setIntentionalUnmapped(adCostId: string, payload: { reasonNote: string }) {
-    const snapshot = this.databaseService.getSnapshot();
-    const existing = snapshot.adCampaignDailyCosts.find((item) => item.id === adCostId);
-    if (!existing) {
-      throw new NotFoundException({
-        success: false,
-        message: "광고 row를 찾을 수 없습니다.",
-        errors: [{ field: "adCostId", reason: "MANUAL_OVERRIDE_NOT_FOUND" }],
-      });
-    }
-    this.storeService.ensureWritable(existing.storeId);
-
-    this.databaseService.write((draft) => {
-      const target = draft.adCampaignDailyCosts.find((item) => item.id === adCostId)!;
-      target.canonicalSalesUnitId = null;
-      target.matchedRuleCount = 0;
-      target.mappingReason = "INTENTIONALLY_UNMAPPED";
-      target.reasonNote = payload.reasonNote;
-      target.reasonNoteInherited = false;
-      target.updatedAt = nowIso();
-    });
+    this.setIntentionalUnmappedInternal([adCostId], payload);
 
     return formatApiSuccess({
       adCostId,
@@ -483,17 +464,79 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  saveManualMapping(adCostId: string, payload: { canonicalSalesUnitId: string }) {
-    const snapshot = this.databaseService.getSnapshot();
-    const existing = snapshot.adCampaignDailyCosts.find((item) => item.id === adCostId);
-    if (!existing) {
-      throw new NotFoundException({
-        success: false,
-        message: "광고 row를 찾을 수 없습니다.",
-        errors: [{ field: "adCostId", reason: "MANUAL_OVERRIDE_NOT_FOUND" }],
-      });
-    }
+  setIntentionalUnmappedMany(adCostIds: string[], payload: { reasonNote: string }) {
+    const result = this.setIntentionalUnmappedInternal(adCostIds, payload);
+    return formatApiSuccess({
+      adCostIds: result.adCostIds,
+      updatedCount: result.adCostIds.length,
+      mappingReason: "INTENTIONALLY_UNMAPPED",
+      reasonNote: payload.reasonNote,
+    });
+  }
 
+  saveManualMapping(adCostId: string, payload: { canonicalSalesUnitId: string }) {
+    this.saveManualMappingsInternal([adCostId], payload);
+    return formatApiSuccess({
+      adCostId,
+      canonicalSalesUnitId: payload.canonicalSalesUnitId,
+      mappingReason: "MANUAL_MAPPED",
+    });
+  }
+
+  saveManualMappings(adCostIds: string[], payload: { canonicalSalesUnitId: string }) {
+    const result = this.saveManualMappingsInternal(adCostIds, payload);
+    return formatApiSuccess({
+      adCostIds: result.adCostIds,
+      canonicalSalesUnitId: payload.canonicalSalesUnitId,
+      updatedCount: result.adCostIds.length,
+      mappingReason: "MANUAL_MAPPED",
+    });
+  }
+
+  recalculateMapping(adCostId: string) {
+    const result = this.recalculateMappingsInternal([adCostId]);
+    return formatApiSuccess({
+      adCostId,
+      canonicalSalesUnitId: result.mappings[0]?.canonicalSalesUnitId ?? null,
+      mappingReason: result.mappings[0]?.mappingReason ?? "NO_RULE",
+      matchedRuleCount: result.mappings[0]?.matchedRuleCount ?? 0,
+    });
+  }
+
+  recalculateMappings(adCostIds: string[]) {
+    const result = this.recalculateMappingsInternal(adCostIds);
+    return formatApiSuccess({
+      adCostIds: result.adCostIds,
+      updatedCount: result.adCostIds.length,
+      mappings: result.mappings,
+    });
+  }
+
+  private setIntentionalUnmappedInternal(adCostIds: string[], payload: { reasonNote: string }) {
+    const { dedupedIds, storeId } = this.resolveAdCostBatch(adCostIds);
+    this.storeService.ensureWritable(storeId);
+    const targetIds = new Set(dedupedIds);
+    const timestamp = nowIso();
+    this.databaseService.write((draft) => {
+      draft.adCampaignDailyCosts.forEach((item) => {
+        if (!targetIds.has(item.id)) {
+          return;
+        }
+        item.canonicalSalesUnitId = null;
+        item.matchedRuleCount = 0;
+        item.mappingReason = "INTENTIONALLY_UNMAPPED";
+        item.reasonNote = payload.reasonNote;
+        item.reasonNoteInherited = false;
+        item.updatedAt = timestamp;
+      });
+    });
+
+    return { adCostIds: dedupedIds };
+  }
+
+  private saveManualMappingsInternal(adCostIds: string[], payload: { canonicalSalesUnitId: string }) {
+    const snapshot = this.databaseService.getSnapshot();
+    const { dedupedIds, storeId, adCosts } = this.resolveAdCostBatch(adCostIds, snapshot);
     const salesUnit = snapshot.canonicalSalesUnits.find(
       (item) => item.id === payload.canonicalSalesUnitId,
     );
@@ -505,7 +548,7 @@ export class AdsService implements OnModuleInit {
       });
     }
 
-    if (salesUnit.storeId !== existing.storeId) {
+    if (salesUnit.storeId !== storeId) {
       throw new BadRequestException({
         success: false,
         message: "같은 스토어의 판매단위만 연결할 수 있습니다.",
@@ -513,55 +556,118 @@ export class AdsService implements OnModuleInit {
       });
     }
 
-    this.storeService.ensureWritable(existing.storeId);
-
-    this.databaseService.write((draft) => {
-      const target = draft.adCampaignDailyCosts.find((item) => item.id === adCostId)!;
-      target.canonicalSalesUnitId = payload.canonicalSalesUnitId;
-      target.matchedRuleCount = 0;
-      target.mappingReason = "MANUAL_MAPPED";
-      target.reasonNote = null;
-      target.reasonNoteInherited = false;
-      target.updatedAt = nowIso();
-    });
-
-    return formatApiSuccess({
-      adCostId,
-      canonicalSalesUnitId: payload.canonicalSalesUnitId,
-      mappingReason: "MANUAL_MAPPED",
-    });
-  }
-
-  recalculateMapping(adCostId: string) {
-    const snapshot = this.databaseService.getSnapshot();
-    const existing = snapshot.adCampaignDailyCosts.find((item) => item.id === adCostId);
-    if (!existing) {
-      throw new NotFoundException({
+    if (!salesUnit.isActive) {
+      throw new BadRequestException({
         success: false,
-        message: "광고 row를 찾을 수 없습니다.",
-        errors: [{ field: "adCostId", reason: "MANUAL_OVERRIDE_NOT_FOUND" }],
+        message: "비활성화된 판매단위에는 매핑할 수 없습니다.",
+        errors: [{ field: "canonicalSalesUnitId", reason: "INVALID_VALUE" }],
       });
     }
 
-    this.storeService.ensureWritable(existing.storeId);
-    const mapping = evaluateAdMapping(snapshot, existing.storeId, existing.normalizedCampaignName);
+    if (adCosts.some((item) => item.storeId !== storeId)) {
+      throw new BadRequestException({
+        success: false,
+        message: "같은 스토어의 광고 row만 함께 수정할 수 있습니다.",
+        errors: [{ field: "adCostIds", reason: "CROSS_STORE_REFERENCE" }],
+      });
+    }
 
+    this.storeService.ensureWritable(storeId);
+    const targetIds = new Set(dedupedIds);
+    const timestamp = nowIso();
     this.databaseService.write((draft) => {
-      const target = draft.adCampaignDailyCosts.find((item) => item.id === adCostId)!;
-      target.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
-      target.matchedRuleCount = mapping.matchedRuleCount;
-      target.mappingReason = mapping.mappingReason;
-      target.reasonNote = mapping.reasonNote;
-      target.reasonNoteInherited = mapping.reasonNoteInherited;
-      target.updatedAt = nowIso();
+      draft.adCampaignDailyCosts.forEach((item) => {
+        if (!targetIds.has(item.id)) {
+          return;
+        }
+        item.canonicalSalesUnitId = payload.canonicalSalesUnitId;
+        item.matchedRuleCount = 0;
+        item.mappingReason = "MANUAL_MAPPED";
+        item.reasonNote = null;
+        item.reasonNoteInherited = false;
+        item.updatedAt = timestamp;
+      });
     });
 
-    return formatApiSuccess({
-      adCostId,
-      canonicalSalesUnitId: mapping.canonicalSalesUnitId,
-      mappingReason: mapping.mappingReason,
-      matchedRuleCount: mapping.matchedRuleCount,
+    return { adCostIds: dedupedIds };
+  }
+
+  private recalculateMappingsInternal(adCostIds: string[]) {
+    const snapshot = this.databaseService.getSnapshot();
+    const { dedupedIds, storeId, adCosts } = this.resolveAdCostBatch(adCostIds, snapshot);
+    this.storeService.ensureWritable(storeId);
+    const targetIds = new Set(dedupedIds);
+    const mappings = adCosts.map((item) => ({
+      adCostId: item.id,
+      ...evaluateAdMapping(snapshot, item.storeId, item.normalizedCampaignName),
+    }));
+    const mappingById = new Map(mappings.map((item) => [item.adCostId, item]));
+    const timestamp = nowIso();
+    this.databaseService.write((draft) => {
+      draft.adCampaignDailyCosts.forEach((item) => {
+        if (!targetIds.has(item.id)) {
+          return;
+        }
+        const mapping = mappingById.get(item.id);
+        if (!mapping) {
+          return;
+        }
+        item.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
+        item.matchedRuleCount = mapping.matchedRuleCount;
+        item.mappingReason = mapping.mappingReason;
+        item.reasonNote = mapping.reasonNote;
+        item.reasonNoteInherited = mapping.reasonNoteInherited;
+        item.updatedAt = timestamp;
+      });
     });
+
+    return {
+      adCostIds: dedupedIds,
+      mappings: mappings.map((item) => ({
+        adCostId: item.adCostId,
+        canonicalSalesUnitId: item.canonicalSalesUnitId,
+        mappingReason: item.mappingReason,
+        matchedRuleCount: item.matchedRuleCount,
+      })),
+    };
+  }
+
+  private resolveAdCostBatch(adCostIds: string[], snapshot = this.databaseService.getSnapshot()) {
+    const dedupedIds = Array.from(new Set(adCostIds.filter(Boolean)));
+    if (!dedupedIds.length) {
+      throw new BadRequestException({
+        success: false,
+        message: "수정할 광고 row를 하나 이상 선택해 주세요.",
+        errors: [{ field: "adCostIds", reason: "INVALID_VALUE" }],
+      });
+    }
+
+    const adCosts = dedupedIds.map((adCostId) => {
+      const adCost = snapshot.adCampaignDailyCosts.find((item) => item.id === adCostId);
+      if (!adCost) {
+        throw new NotFoundException({
+          success: false,
+          message: "광고 row를 찾을 수 없습니다.",
+          errors: [{ field: "adCostIds", reason: "MANUAL_OVERRIDE_NOT_FOUND" }],
+        });
+      }
+      return adCost;
+    });
+
+    const storeIds = Array.from(new Set(adCosts.map((item) => item.storeId)));
+    if (storeIds.length !== 1) {
+      throw new BadRequestException({
+        success: false,
+        message: "같은 스토어의 광고 row만 함께 수정할 수 있습니다.",
+        errors: [{ field: "adCostIds", reason: "CROSS_STORE_REFERENCE" }],
+      });
+    }
+
+    return {
+      dedupedIds,
+      storeId: storeIds[0],
+      adCosts,
+    };
   }
 
   private parseCampaignRows(rows: string[][], header: string[]) {

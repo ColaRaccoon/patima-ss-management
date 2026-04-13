@@ -91,6 +91,8 @@ export interface OrderSourceSignatureListItem {
   canonicalSalesUnitId: string | null;
   canonicalDisplayName: string | null;
   usageCount: number;
+  externalProductId: string | null;
+  optionCode: string | null;
 }
 
 export interface SalesUnitListItem {
@@ -98,6 +100,8 @@ export interface SalesUnitListItem {
   storeId: string;
   displayName: string;
   matchAliases: string[];
+  linkedProductIds: string[];
+  linkedOptionCodes: string[];
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;

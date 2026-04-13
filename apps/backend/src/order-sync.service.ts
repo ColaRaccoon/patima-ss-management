@@ -199,6 +199,7 @@ export class OrderSyncService implements OnModuleInit {
             canonicalSalesUnitId: null,
             externalProductOrderId: entry.externalProductOrderId,
             externalProductId: product.externalProductId,
+            optionCode: entry.optionCode,
             packageNumber: entry.packageNumber,
             rawProductName: entry.rawProductName,
             rawOptionInfo: entry.rawOptionInfo,
@@ -349,10 +350,20 @@ export class OrderSyncService implements OnModuleInit {
     const keyword = query.q ? normalizeText(query.q) : null;
     const snapshot = this.databaseService.getSnapshot();
     const usageMap = new Map<string, number>();
+    // 시그니처별 대표 externalProductId/optionCode 수집 (UI에서 ID매핑/텍스트매핑 구분용)
+    const signatureExternalProductIdMap = new Map<string, string>();
+    const signatureOptionCodeMap = new Map<string, string>();
     snapshot.orderItems
       .filter((item) => item.storeId === query.storeId && item.orderSourceSignatureId)
       .forEach((item) => {
         usageMap.set(item.orderSourceSignatureId!, (usageMap.get(item.orderSourceSignatureId!) ?? 0) + 1);
+        // 첫 번째로 발견된 값을 대표값으로 사용
+        if (item.externalProductId && !signatureExternalProductIdMap.has(item.orderSourceSignatureId!)) {
+          signatureExternalProductIdMap.set(item.orderSourceSignatureId!, item.externalProductId);
+        }
+        if (item.optionCode && !signatureOptionCodeMap.has(item.orderSourceSignatureId!)) {
+          signatureOptionCodeMap.set(item.orderSourceSignatureId!, item.optionCode);
+        }
       });
 
     const items = snapshot.orderSourceSignatures
@@ -381,6 +392,8 @@ export class OrderSyncService implements OnModuleInit {
           canonicalSalesUnitId: item.canonicalSalesUnitId,
           canonicalDisplayName: salesUnit?.displayName ?? null,
           usageCount: usageMap.get(item.id) ?? 0,
+          externalProductId: signatureExternalProductIdMap.get(item.id) ?? null,
+          optionCode: signatureOptionCodeMap.get(item.id) ?? null,
         };
       });
 
@@ -490,6 +503,7 @@ export class OrderSyncService implements OnModuleInit {
           externalProductId: `demo-product-${normalizeText(template.standardKey)}`,
           rawProductName: template.productName,
           rawOptionInfo: template.optionInfo,
+          optionCode: null,
           quantity: template.quantity,
           productPaymentAmount: template.price * template.quantity,
           totalProductAmount: template.price * template.quantity,

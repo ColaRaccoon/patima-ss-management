@@ -20,7 +20,14 @@ interface SalesUnitPayload {
   storeId: string;
   displayName: string;
   matchAliases?: string[] | null;
+  linkedProductIds?: string[] | null;
+  linkedOptionCodes?: string[] | null;
   memo?: string | null;
+}
+
+interface SalesUnitCreateOptions {
+  skipOrderRecalculation?: boolean;
+  skipAdRecalculation?: boolean;
 }
 
 @Injectable()
@@ -49,7 +56,7 @@ export class SalesUnitService {
     return formatApiSuccess(paginate(items, page, pageSize));
   }
 
-  create(payload: SalesUnitPayload) {
+  create(payload: SalesUnitPayload, options?: SalesUnitCreateOptions) {
     this.storeService.ensureWritable(payload.storeId);
     const displayName = payload.displayName.trim();
     const matchAliases = sanitizeMatchAliases(payload.matchAliases ?? []);
@@ -61,6 +68,8 @@ export class SalesUnitService {
       displayName,
       matchAliases,
       normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
+      linkedProductIds: payload.linkedProductIds ?? [],
+      linkedOptionCodes: payload.linkedOptionCodes ?? [],
       memo: payload.memo ?? null,
       isActive: true,
       deactivatedAt: null,
@@ -73,8 +82,12 @@ export class SalesUnitService {
     this.databaseService.write((draft) => {
       ensureStoreExists(draft, payload.storeId);
       draft.canonicalSalesUnits.push(created);
-      recalculateOrderMappingsForStore(draft, payload.storeId);
-      recalculateAdMappingsForStore(draft, payload.storeId);
+      if (!options?.skipOrderRecalculation) {
+        recalculateOrderMappingsForStore(draft, payload.storeId);
+      }
+      if (!options?.skipAdRecalculation) {
+        recalculateAdMappingsForStore(draft, payload.storeId);
+      }
     });
 
     this.auditLogService.record({
@@ -111,6 +124,8 @@ export class SalesUnitService {
       displayName,
       matchAliases,
       normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
+      linkedProductIds: payload.linkedProductIds ?? existing.linkedProductIds ?? [],
+      linkedOptionCodes: payload.linkedOptionCodes ?? existing.linkedOptionCodes ?? [],
       memo: payload.memo ?? null,
       updatedAt: nowIso(),
     };

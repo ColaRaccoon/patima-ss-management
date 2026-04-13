@@ -82,6 +82,8 @@ export interface CanonicalSalesUnit {
   displayName: string;
   matchAliases: string[];
   normalizedMatchAliases: string[];
+  linkedProductIds: string[];
+  linkedOptionCodes: string[];
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;
@@ -126,6 +128,7 @@ export interface OrderItem {
   canonicalSalesUnitId: string | null;
   externalProductOrderId: string;
   externalProductId: string | null;
+  optionCode: string | null;
   packageNumber: string | null;
   rawProductName: string;
   rawOptionInfo: string | null;

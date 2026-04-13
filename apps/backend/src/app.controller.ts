@@ -16,6 +16,7 @@ import { AdsService } from "./ads.service";
 import { CampaignMappingService } from "./campaign-mapping.service";
 import { CostService } from "./cost.service";
 import { CredentialService } from "./credential.service";
+import { MappingSeedService } from "./mapping-seed.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
 import { OperationService } from "./operation.service";
@@ -37,6 +38,7 @@ export class AppController {
     private readonly costService: CostService,
     private readonly profitService: ProfitService,
     private readonly operationService: OperationService,
+    private readonly mappingSeedService: MappingSeedService,
   ) {}
 
   @Get("health")
@@ -163,6 +165,37 @@ export class AppController {
     return this.orderMappingService.createAndMap(signatureId, body);
   }
 
+  @Post("order-source-signatures/batch-mapping")
+  saveOrderMappings(
+    @Body() body:
+      | { signatureIds: string[]; canonicalSalesUnitId: string }
+      | {
+          signatureIds: string[];
+          displayName: string;
+          matchAliases?: string[] | null;
+          linkedProductIds?: string[] | null;
+          linkedOptionCodes?: string[] | null;
+          memo?: string | null;
+        },
+  ) {
+    if ("canonicalSalesUnitId" in body) {
+      return this.orderMappingService.saveMappings(body.signatureIds, body);
+    }
+    return this.orderMappingService.createAndMapMany(body.signatureIds, body);
+  }
+
+  @Post("mapping-seed/:storeId")
+  generateInitialMappingSeed(@Param("storeId") storeId: string) {
+    const result = this.mappingSeedService.generateInitialMappings(storeId);
+    return formatApiSuccess(result);
+  }
+
+  // [DEBUG] optionManageCode 확인용 임시 엔드포인트 - 확인 후 제거 예정
+  @Get("debug/option-manage-codes/:storeId")
+  debugOptionManageCodes(@Param("storeId") storeId: string) {
+    return formatApiSuccess(this.mappingSeedService.debugGetOptionManageCodes(storeId));
+  }
+
   @Get("canonical-sales-units")
   getSalesUnits(
     @Query("storeId") storeId: string,
@@ -174,14 +207,14 @@ export class AppController {
   }
 
   @Post("canonical-sales-units")
-  createSalesUnit(@Body() body: { storeId: string; displayName: string; matchAliases?: string[] | null; memo?: string | null }) {
+  createSalesUnit(@Body() body: { storeId: string; displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null }) {
     return this.salesUnitService.create(body);
   }
 
   @Patch("canonical-sales-units/:salesUnitId")
   updateSalesUnit(
     @Param("salesUnitId") salesUnitId: string,
-    @Body() body: { displayName: string; matchAliases?: string[] | null; memo?: string | null },
+    @Body() body: { displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null },
   ) {
     return this.salesUnitService.update(salesUnitId, body);
   }
@@ -258,6 +291,11 @@ export class AppController {
     return this.adsService.setIntentionalUnmapped(adCostId, body);
   }
 
+  @Post("ad-campaign-costs/batch-intentional-unmapped")
+  setIntentionalUnmappedMany(@Body() body: { adCostIds: string[]; reasonNote: string }) {
+    return this.adsService.setIntentionalUnmappedMany(body.adCostIds, body);
+  }
+
   @Post("ad-campaign-costs/:adCostId/mapping")
   saveAdCampaignMapping(
     @Param("adCostId") adCostId: string,
@@ -266,9 +304,19 @@ export class AppController {
     return this.adsService.saveManualMapping(adCostId, body);
   }
 
+  @Post("ad-campaign-costs/batch-mapping")
+  saveAdCampaignMappings(@Body() body: { adCostIds: string[]; canonicalSalesUnitId: string }) {
+    return this.adsService.saveManualMappings(body.adCostIds, body);
+  }
+
   @Post("ad-campaign-costs/:adCostId/recalculate-mapping")
   recalculateAdCampaignMapping(@Param("adCostId") adCostId: string) {
     return this.adsService.recalculateMapping(adCostId);
+  }
+
+  @Post("ad-campaign-costs/batch-recalculate-mapping")
+  recalculateAdCampaignMappings(@Body() body: { adCostIds: string[] }) {
+    return this.adsService.recalculateMappings(body.adCostIds);
   }
 
   @Get("campaign-mappings")
