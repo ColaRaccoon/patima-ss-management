@@ -739,7 +739,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   <option value="">판매단위 선택</option>
                   {data.salesUnits.map((salesUnit) => (
                     <option key={salesUnit.id} value={salesUnit.id}>
-                      {salesUnit.displayName}
+                      {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
                     </option>
                   ))}
                 </select>
@@ -972,7 +972,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   <option value="">판매단위 선택</option>
                   {data.salesUnits.map((salesUnit) => (
                     <option key={salesUnit.id} value={salesUnit.id}>
-                      {salesUnit.displayName}
+                      {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
                     </option>
                   ))}
                 </select>
@@ -1060,7 +1060,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 <option value="">판매단위 선택</option>
                 {data.salesUnits.map((salesUnit) => (
                   <option key={salesUnit.id} value={salesUnit.id}>
-                    {salesUnit.displayName}
+                    {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
                   </option>
                 ))}
               </select>

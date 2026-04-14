@@ -227,6 +227,11 @@ export class OrderSyncService implements OnModuleInit {
             updatedAt: nowIso(),
           };
 
+          // optionManageCode가 있으면 추가
+          if (entry.optionManageCode) {
+            payload.optionManageCode = entry.optionManageCode;
+          }
+
           if (existingItem) {
             Object.assign(existingItem, payload);
           } else {

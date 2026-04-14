@@ -84,11 +84,13 @@ export interface CanonicalSalesUnit {
   normalizedMatchAliases: string[];
   linkedProductIds: string[];
   linkedOptionCodes: string[];
+  linkedManageCodes?: string[];
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  isStoreLevel?: boolean;
 }
 
 export interface OrderSourceSignature {
@@ -129,6 +131,7 @@ export interface OrderItem {
   externalProductOrderId: string;
   externalProductId: string | null;
   optionCode: string | null;
+  optionManageCode?: string;
   packageNumber: string | null;
   rawProductName: string;
   rawOptionInfo: string | null;
@@ -312,6 +315,7 @@ export interface DailySalesUnitProfit {
   roughProfit: number;
   estimatedNetProfit: number | null;
   profitStatus: ProfitStatus;
+  isStoreLevel?: boolean;
 }
 
 export interface DatabaseShape {

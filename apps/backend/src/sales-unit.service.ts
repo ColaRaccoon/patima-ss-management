@@ -38,6 +38,62 @@ export class SalesUnitService {
     private readonly auditLogService: AuditLogService,
   ) {}
 
+  /**
+   * 스토어 전체 광고비 판매단위를 확인하고 없으면 자동 생성
+   * 스토어당 1개만 존재해야 함
+   */
+  ensureStoreLevelSalesUnit(storeId: string): string {
+    const snapshot = this.databaseService.getSnapshot();
+    const store = snapshot.stores.find((s) => s.id === storeId);
+    if (!store) {
+      throw new Error(`Store ${storeId} not found`);
+    }
+
+    // 기존 스토어 레벨 판매단위 확인
+    const existing = snapshot.canonicalSalesUnits.find(
+      (u) => u.storeId === storeId && u.isStoreLevel === true,
+    );
+
+    if (existing) {
+      return existing.id;
+    }
+
+    // 없으면 자동 생성
+    const displayName = `[${store.name}] 전체 광고비`;
+    const newUnit: CanonicalSalesUnit = {
+      id: createId(),
+      storeId,
+      displayName,
+      matchAliases: [],
+      normalizedMatchAliases: [],
+      linkedProductIds: [],
+      linkedOptionCodes: [],
+      linkedManageCodes: [],
+      memo: "자동 생성된 스토어 전체 광고비 판매단위",
+      isActive: true,
+      deactivatedAt: null,
+      isStoreLevel: true,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+
+    this.databaseService.write((draft) => {
+      draft.canonicalSalesUnits.push(newUnit);
+    });
+
+    this.auditLogService.record({
+      storeId,
+      domain: "SALES_UNIT",
+      action: "CREATE_STORE_LEVEL",
+      targetId: newUnit.id,
+      actorIdentifier: "LOCALHOST_ADMIN",
+      beforeJson: null,
+      afterJson: newUnit,
+    });
+
+    return newUnit.id;
+  }
+
   list(storeId: string, q?: string, page?: number, pageSize?: number) {
     const keyword = q ? normalizeText(q) : null;
     const aliasKeyword = q ? normalizeMatchAlias(q) : null;
@@ -70,9 +126,11 @@ export class SalesUnitService {
       normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
       linkedProductIds: payload.linkedProductIds ?? [],
       linkedOptionCodes: payload.linkedOptionCodes ?? [],
+      linkedManageCodes: [],
       memo: payload.memo ?? null,
       isActive: true,
       deactivatedAt: null,
+      isStoreLevel: false,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };

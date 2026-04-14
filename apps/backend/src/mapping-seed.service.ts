@@ -24,6 +24,7 @@ interface MappingSeedResult {
     displayName: string;
     linkedProductIds: string[];
     linkedOptionCodes: string[];
+    linkedManageCodes?: string[];
   }[];
 }
 
@@ -39,6 +40,7 @@ interface RegularProductGroup {
 interface BundledCategoryGroup {
   category: string;
   optionCodes: Set<string>;
+  manageCodes: Set<string>;
   /** 함께배송 파싱 실패 시 fallback 용 */
   rawProductNames: Set<string>;
 }
@@ -125,6 +127,7 @@ export class MappingSeedService {
               bundledGroups.set(normalizedKey, {
                 category: category.trim(), // 표시명은 원본 유지
                 optionCodes: new Set(),
+                manageCodes: new Set(),
                 rawProductNames: new Set(),
               });
             }
@@ -132,6 +135,11 @@ export class MappingSeedService {
             // 실제 네이버 optionCode를 저장해야 auto-mapper가 매칭 가능
             // (파싱된 텍스트값 "블랙"이 아닌 네이버 숫자 코드 "3327191532")
             if (item.optionCode) group.optionCodes.add(item.optionCode);
+            // optionManageCode가 있으면 관리코드도 저장
+            const manageCode = (item.rawPayload as any)?.detail?.productOrder?.optionManageCode;
+            if (manageCode && typeof manageCode === 'string' && manageCode.trim()) {
+              group.manageCodes.add(manageCode.trim());
+            }
             group.rawProductNames.add(item.rawProductName);
           });
         } else {
@@ -233,13 +241,20 @@ export class MappingSeedService {
       bundledGroups.forEach((group) => {
         const displayName = group.category;
         const optionCodes = Array.from(group.optionCodes);
+        const manageCodes = Array.from(group.manageCodes);
         const existing = this.findExistingSalesUnit(draft, storeId, displayName);
 
         if (existing) {
           const uniqueOptionCodes = Array.from(
             new Set([...existing.linkedOptionCodes, ...optionCodes]),
           );
+          const uniqueManageCodes = manageCodes.length > 0
+            ? Array.from(new Set([...(existing.linkedManageCodes ?? []), ...manageCodes]))
+            : existing.linkedManageCodes;
           existing.linkedOptionCodes = uniqueOptionCodes;
+          if (manageCodes.length > 0) {
+            existing.linkedManageCodes = uniqueManageCodes;
+          }
           existing.updatedAt = nowIso();
           result.mergedCount++;
           result.details.push({
@@ -248,6 +263,7 @@ export class MappingSeedService {
             displayName: existing.displayName,
             linkedProductIds: existing.linkedProductIds,
             linkedOptionCodes: existing.linkedOptionCodes,
+            linkedManageCodes: existing.linkedManageCodes,
           });
         } else {
           // ID 기반 매핑만 사용 — matchAliases 비워서 텍스트 충돌 방지
@@ -257,6 +273,7 @@ export class MappingSeedService {
             [],
             optionCodes,
             [], // 텍스트 매칭 비활성화: ID 기반(linkedOptionCodes)으로만 매핑
+            manageCodes.length > 0 ? manageCodes : undefined,
           );
           draft.canonicalSalesUnits.push(newUnit);
           result.createdCount++;
@@ -266,6 +283,7 @@ export class MappingSeedService {
             displayName: newUnit.displayName,
             linkedProductIds: newUnit.linkedProductIds,
             linkedOptionCodes: newUnit.linkedOptionCodes,
+            linkedManageCodes: newUnit.linkedManageCodes,
           });
         }
       });
@@ -352,11 +370,12 @@ export class MappingSeedService {
     linkedProductIds: string[],
     linkedOptionCodes: string[],
     customMatchAliases?: string[],
+    linkedManageCodes?: string[],
   ): CanonicalSalesUnit {
     const matchAliases = customMatchAliases ? customMatchAliases : [displayName];
     const normalizedMatchAliases = normalizeMatchAliasList(matchAliases);
 
-    return {
+    const unit: CanonicalSalesUnit = {
       id: createId(),
       storeId,
       displayName,
@@ -370,53 +389,12 @@ export class MappingSeedService {
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
-  }
 
-  /** [DEBUG] rawPayload에서 optionManageCode 추출 - 확인 후 제거 예정 */
-  debugGetOptionManageCodes(storeId: string) {
-    const snapshot = this.databaseService.getSnapshot();
+    if (linkedManageCodes && linkedManageCodes.length > 0) {
+      unit.linkedManageCodes = linkedManageCodes;
+    }
 
-    // 1. 함께배송 아이템들의 optionCode 현황
-    const bundledItems = snapshot.orderItems
-      .filter((item) => item.storeId === storeId && item.rawOptionInfo?.includes("[함께배송"))
-      .slice(0, 30)
-      .map((item) => {
-        const payload = item.rawPayload as any;
-        const productOrder = payload?.detail?.productOrder ?? payload?.detail ?? {};
-        return {
-          rawOptionInfo: item.rawOptionInfo,
-          optionCode: item.optionCode,
-          optionManageCode: productOrder.optionManageCode ?? null,
-        };
-      });
-
-    // 2. 현재 생성된 함께배송 판매단위의 linkedOptionCodes 현황
-    const bundledSalesUnits = snapshot.canonicalSalesUnits
-      .filter((unit) => unit.storeId === storeId && (unit.linkedProductIds.length === 0))
-      .map((unit) => ({
-        displayName: unit.displayName,
-        linkedOptionCodes: unit.linkedOptionCodes,
-      }));
-
-    // 3. 같은 옵션텍스트에 다른 optionCode가 붙는지 확인
-    const optionTextToCodesMap = new Map<string, Set<string>>();
-    snapshot.orderItems
-      .filter((item) => item.storeId === storeId && item.rawOptionInfo?.includes("[함께배송") && item.optionCode)
-      .forEach((item) => {
-        const key = item.rawOptionInfo!;
-        if (!optionTextToCodesMap.has(key)) optionTextToCodesMap.set(key, new Set());
-        optionTextToCodesMap.get(key)!.add(item.optionCode!);
-      });
-
-    const optionCodeStability = Array.from(optionTextToCodesMap.entries())
-      .filter(([, codes]) => codes.size > 1)
-      .map(([optionText, codes]) => ({
-        optionText,
-        codeCount: codes.size,
-        codes: Array.from(codes),
-      }));
-
-    return { bundledItems, bundledSalesUnits, optionCodeStability };
+    return unit;
   }
 
   private findExistingSalesUnit(

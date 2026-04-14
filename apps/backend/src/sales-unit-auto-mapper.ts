@@ -15,7 +15,7 @@ interface AutoMatchResolution {
 
 interface ItemIdMappingResult {
   resolvedUnitId: string | null;
-  resolvedBy: "optionCode" | "productId" | "fallback" | null;
+  resolvedBy: "optionManageCode" | "optionCode" | "productId" | "fallback" | null;
 }
 
 const dedupe = (values: Array<string | null | undefined>): string[] =>
@@ -65,6 +65,15 @@ const buildOrderLookupValues = (signature: OrderSourceSignature): string[] =>
 
 const buildCampaignLookupValues = (normalizedCampaignName: string): string[] =>
   dedupe([normalizeMatchAlias(normalizedCampaignName)]);
+
+function resolveByOptionManageCode(
+  salesUnits: CanonicalSalesUnit[],
+  optionManageCode: string | null | undefined,
+): string | null {
+  if (!optionManageCode) return null;
+  const matched = salesUnits.find((u) => u.linkedManageCodes?.includes(optionManageCode));
+  return matched?.id ?? null;
+}
 
 function resolveByOptionCode(
   salesUnits: CanonicalSalesUnit[],
@@ -116,8 +125,20 @@ export const resolveCampaignAutoMapping = (
 export const resolveOrderItemByIds = (
   salesUnits: CanonicalSalesUnit[],
   item: OrderItem,
+  optionManageCode?: string,
 ): ItemIdMappingResult => {
-  // 1순위: optionCode → linkedOptionCodes (함께배송 특수 케이스)
+  // 1순위: optionManageCode → linkedManageCodes (함께배송 관리코드)
+  if (optionManageCode) {
+    const resolvedByManageCode = resolveByOptionManageCode(salesUnits, optionManageCode);
+    if (resolvedByManageCode) {
+      return {
+        resolvedUnitId: resolvedByManageCode,
+        resolvedBy: "optionManageCode",
+      };
+    }
+  }
+
+  // 2순위: optionCode → linkedOptionCodes (함께배송 옵션코드 폴백)
   const resolvedByOptionCode = resolveByOptionCode(salesUnits, item.optionCode);
   if (resolvedByOptionCode) {
     return {
@@ -126,7 +147,7 @@ export const resolveOrderItemByIds = (
     };
   }
 
-  // 2순위: externalProductId → linkedProductIds (일반 상품)
+  // 3순위: externalProductId → linkedProductIds (일반 상품)
   const resolvedByProductId = resolveByProductId(salesUnits, item.externalProductId);
   if (resolvedByProductId) {
     return {
@@ -135,7 +156,7 @@ export const resolveOrderItemByIds = (
     };
   }
 
-  // 3순위: fallback (텍스트 매칭은 시그니처 기반으로 진행, 여기서는 null 반환)
+  // 4순위: fallback (텍스트 매칭은 시그니처 기반으로 진행, 여기서는 null 반환)
   return {
     resolvedUnitId: null,
     resolvedBy: null,
@@ -212,8 +233,19 @@ export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeI
         // 함께배송 아이템인지 판별 (rawOptionInfo에 "[함께배송" 포함)
         const isBundledItem = item.rawOptionInfo?.includes("[함께배송") ?? false;
 
-        // 우선순위 2: ID 매핑 시도 (optionCode → linkedOptionCodes)
-        if (item.optionCode) {
+        // 우선순위 2: ID 매핑 시도 (optionManageCode → linkedManageCodes)
+        if (isBundledItem && item.optionManageCode) {
+          const matched = idMappingSalesUnits.find((u) =>
+            u.linkedManageCodes?.includes(item.optionManageCode!),
+          );
+          if (matched) {
+            resolvedUnitId = matched.id;
+            mappingMethod = "optionManageCode";
+          }
+        }
+
+        // 우선순위 3: ID 매핑 시도 (optionCode → linkedOptionCodes)
+        if (!resolvedUnitId && item.optionCode) {
           const resolvedId = optionCodeMap.get(item.optionCode);
           if (resolvedId) {
             resolvedUnitId = resolvedId;
@@ -221,7 +253,7 @@ export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeI
           }
         }
 
-        // 우선순위 3: ID 매핑 시도 (externalProductId → linkedProductIds)
+        // 우선순위 4: ID 매핑 시도 (externalProductId → linkedProductIds)
         // ⚠️ 함께배송 아이템은 메인 상품과 같은 externalProductId를 공유하므로
         //    productId fallback을 사용하면 메인 상품에 잘못 매핑됨 → 함께배송은 건너뜀
         if (!resolvedUnitId && item.externalProductId && !isBundledItem) {
@@ -232,7 +264,7 @@ export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeI
           }
         }
 
-        // 우선순위 4: 기존 시그니처 기반 텍스트 매칭 (fallback)
+        // 우선순위 5: 기존 시그니처 기반 텍스트 매칭 (fallback)
         if (!resolvedUnitId && signature) {
           const signatureStatus = getSignatureMappingStatus(signature);
           if (signatureStatus === "MAPPED" && signature.canonicalSalesUnitId) {
@@ -240,6 +272,11 @@ export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeI
             mappingMethod = "text-fallback";
           }
         }
+      }
+
+      // 매핑 방식 디버그 로그 (debug 레벨)
+      if (mappingMethod) {
+        console.debug(`[AutoMapper] Item ${item.externalProductOrderId}: resolved via ${mappingMethod}`);
       }
 
       // 비활성화 판매단위 검사 및 할당 가능 여부 확인

@@ -190,12 +190,6 @@ export class AppController {
     return formatApiSuccess(result);
   }
 
-  // [DEBUG] optionManageCode 확인용 임시 엔드포인트 - 확인 후 제거 예정
-  @Get("debug/option-manage-codes/:storeId")
-  debugOptionManageCodes(@Param("storeId") storeId: string) {
-    return formatApiSuccess(this.mappingSeedService.debugGetOptionManageCodes(storeId));
-  }
-
   @Get("canonical-sales-units")
   getSalesUnits(
     @Query("storeId") storeId: string,

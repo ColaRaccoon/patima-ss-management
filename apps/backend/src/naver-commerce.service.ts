@@ -26,6 +26,7 @@ export interface SyncedOrderItemInput {
   rawProductName: string;
   rawOptionInfo: string | null;
   optionCode: string | null;
+  optionManageCode?: string;
   quantity: number;
   productPaymentAmount: number;
   totalProductAmount: number | null;
@@ -483,6 +484,8 @@ export class NaverCommerceService {
       productOrder.decisionDate,
     );
 
+    const optionManageCode = pickString(productOrder.optionManageCode);
+
     const result: SyncedOrderItemInput = {
       externalOrderId,
       externalProductOrderId,
@@ -536,16 +539,9 @@ export class NaverCommerceService {
       },
     };
 
-    // [DEBUG] optionManageCode 수신 여부 확인 - 함께배송 관리코드 테스트용, 확인 후 제거 예정
-    if (rawOptionInfo?.includes("[함께배송") || pickString(productOrder.optionManageCode)?.startsWith("BDL_")) {
-      console.log("[DEBUG optionManageCode]", {
-        rawProductName,
-        rawOptionInfo,
-        optionCode: pickString(productOrder.optionCode),
-        optionManageCode: pickString(productOrder.optionManageCode),
-        sellerManageCode: pickString(productOrder.sellerManageCode),
-        sellerManagerCode: pickString(productOrder.sellerManagerCode),
-      });
+    // optionManageCode가 있으면 추가 (빈 문자열은 제외)
+    if (optionManageCode) {
+      result.optionManageCode = optionManageCode;
     }
 
     return result;
