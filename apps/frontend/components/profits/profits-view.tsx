@@ -10,9 +10,13 @@ import { SourceBanner } from "@/components/shared/source-banner";
 import { StatCard } from "@/components/shared/stat-card";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { readApiResponse } from "@/lib/api/browser";
-import type { DailySalesUnitDetail, ProfitsPageData } from "@/lib/api/types";
+import type { DailySalesUnitDetail, DailySalesUnitProfit, ProfitsPageData } from "@/lib/api/types";
 import { formatCurrency, formatDate, formatDateRange, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
+
+interface ExpandedGroups {
+  [groupId: string]: boolean;
+}
 
 export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const router = useRouter();
@@ -30,6 +34,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
+  const [expandedGroups, setExpandedGroups] = useState<ExpandedGroups>({});
 
   useEffect(() => {
     setSelectedDate(data.dateTo);
@@ -209,104 +214,151 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
         <div className="space-y-4">
           {(() => {
             const storeLevelRows = data.profits.filter((row) => row.isStoreLevel);
-            const regularRows = data.profits.filter((row) => !row.isStoreLevel);
+            const groupAndRegularRows = data.profits.filter((row) => !row.isStoreLevel && !row.parentSalesUnitId);
 
-            const renderTable = (rows: typeof data.profits, title: string) => (
-              <Panel title={title} description="행을 선택하면 해당 원가 구성과 제외된 합계를 확인할 수 있습니다.">
-                <DataTable
-                  caption={title}
-                  columns={[
-                    {
-                      key: "select",
-                      title: "선택",
-                      render: (row) => (
-                        <button
-                          className="button-shell button-ghost"
-                          type="button"
-                          onClick={async () => {
-                            const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
-                            if (rowKey === selectedProfitKey && selectedDetail?.date === row.date) {
-                              return;
-                            }
+            const renderExpandableTable = (rows: typeof data.profits, title: string) => {
+              // 확장 가능한 구조로 변환: 그룹 행 + 그룹에 속한 자식들
+              const expandableRows: (DailySalesUnitProfit & { _isChild?: boolean; _parentId?: string })[] = [];
 
-                            setSelectedProfitKey(rowKey);
-                            setDetailError(null);
-                            setIsLoadingDetail(true);
-                            try {
-                              const detail = await readApiResponse<DailySalesUnitDetail>(
-                                await fetch(
-                                  `/api/profits/daily-sales-units/${row.canonicalSalesUnitId}?storeId=${data.primaryStore!.id}&date=${row.date}`,
-                                  {
-                                    cache: "no-store",
-                                  },
-                                ),
-                                "손익 상세를 불러오지 못했습니다.",
-                              );
-                              setSelectedDetail(detail);
-                            } catch (error) {
-                              setDetailError(
-                                error instanceof Error ? error.message : "손익 상세를 불러오지 못했습니다.",
-                              );
-                            } finally {
-                              setIsLoadingDetail(false);
-                            }
-                          }}
-                        >
-                          {`${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey ? "선택됨" : "열기"}
-                        </button>
-                      ),
-                    },
-                    {
-                      key: "salesUnit",
-                      title: "판매단위",
-                      render: (row) => (
-                        <div>
-                          <p className="font-semibold text-ink">{row.displayName}</p>
-                          <p className="mt-1 text-xs text-ink/55">{row.date}</p>
-                        </div>
-                      ),
-                    },
-                    {
-                      key: "quantity",
-                      title: "수량",
-                      render: (row) => (row.isStoreLevel ? "-" : formatNumber(row.totalQuantity)),
-                    },
-                    {
-                      key: "revenue",
-                      title: "상품 매출",
-                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalProductRevenue)),
-                    },
-                    {
-                      key: "adCost",
-                      title: "광고비",
-                      render: (row) => formatCurrency(row.totalAdCost),
-                    },
-                    {
-                      key: "feeCost",
-                      title: "수수료",
-                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalFeeCost)),
-                    },
-                    {
-                      key: "roughProfit",
-                      title: "대략 손익",
-                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.roughProfit)),
-                    },
-                    {
-                      key: "netProfit",
-                      title: "순이익",
-                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.estimatedNetProfit)),
-                    },
-                  ]}
-                  rows={rows}
-                  getRowKey={(row) => `${row.canonicalSalesUnitId}-${row.date}`}
-                />
-              </Panel>
-            );
+              rows.forEach((row) => {
+                expandableRows.push(row);
+                // 그룹이고 확장된 경우 자식을 추가
+                if (row.isGroup && expandedGroups[`${row.canonicalSalesUnitId}-${row.date}`] && row.childRows) {
+                  row.childRows.forEach((childRow: DailySalesUnitProfit) => {
+                    expandableRows.push({ ...childRow, _isChild: true, _parentId: row.canonicalSalesUnitId });
+                  });
+                }
+              });
+
+              return (
+                <Panel title={title} description="행을 선택하면 해당 원가 구성과 제외된 합계를 확인할 수 있습니다.">
+                  <DataTable
+                    caption={title}
+                    columns={[
+                      {
+                        key: "expand",
+                        title: "",
+                        render: (row) => {
+                          if (!row.isGroup || !row.childRows?.length) return null;
+                          const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
+                          return (
+                            <button
+                              className="button-shell button-ghost p-1 text-xs"
+                              type="button"
+                              onClick={() =>
+                                setExpandedGroups((current) => ({
+                                  ...current,
+                                  [rowKey]: !current[rowKey],
+                                }))
+                              }
+                            >
+                              {expandedGroups[rowKey] ? "▼" : "▸"}
+                            </button>
+                          );
+                        },
+                      },
+                      {
+                        key: "select",
+                        title: "선택",
+                        render: (row) => (
+                          <button
+                            className="button-shell button-ghost"
+                            type="button"
+                            onClick={async () => {
+                              const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
+                              if (rowKey === selectedProfitKey && selectedDetail?.date === row.date) {
+                                return;
+                              }
+
+                              setSelectedProfitKey(rowKey);
+                              setDetailError(null);
+                              setIsLoadingDetail(true);
+                              try {
+                                const detail = await readApiResponse<DailySalesUnitDetail>(
+                                  await fetch(
+                                    `/api/profits/daily-sales-units/${row.canonicalSalesUnitId}?storeId=${data.primaryStore!.id}&date=${row.date}`,
+                                    {
+                                      cache: "no-store",
+                                    },
+                                  ),
+                                  "손익 상세를 불러오지 못했습니다.",
+                                );
+                                setSelectedDetail(detail);
+                              } catch (error) {
+                                setDetailError(
+                                  error instanceof Error ? error.message : "손익 상세를 불러오지 못했습니다.",
+                                );
+                              } finally {
+                                setIsLoadingDetail(false);
+                              }
+                            }}
+                          >
+                            {`${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey ? "선택됨" : "열기"}
+                          </button>
+                        ),
+                      },
+                      {
+                        key: "salesUnit",
+                        title: "판매단위",
+                        render: (row) => {
+                          const hasSingleItem = row.displayName.includes("단품");
+                          const hasBundle = row.displayName.includes("1+1");
+                          return (
+                            <div className={row._isChild ? "ml-6 text-xs" : ""}>
+                              <div className="flex items-center gap-2">
+                                {row._isChild && <span className="text-amber-600">└</span>}
+                                <p className={row._isChild ? "text-xs font-normal" : "font-semibold text-ink"}>{row.displayName}</p>
+                                {row.isGroup && <span className="inline-block rounded-full bg-purple-100 px-1.5 py-0.5 text-xs font-semibold text-purple-700">그룹</span>}
+                                {hasSingleItem && <span className="inline-block rounded-full bg-blue-100 px-1.5 py-0.5 text-xs font-semibold text-blue-700">[단품]</span>}
+                                {hasBundle && <span className="inline-block rounded-full bg-pink-100 px-1.5 py-0.5 text-xs font-semibold text-pink-700">[1+1]</span>}
+                              </div>
+                              <p className="mt-1 text-xs text-ink/55">{row.date}</p>
+                            </div>
+                          );
+                        },
+                      },
+                      {
+                        key: "quantity",
+                        title: "수량",
+                        render: (row) => (row.isStoreLevel || row.isGroup || row._isChild ? formatNumber(row.totalQuantity) : formatNumber(row.totalQuantity)),
+                      },
+                      {
+                        key: "revenue",
+                        title: "상품 매출",
+                        render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalProductRevenue)),
+                      },
+                      {
+                        key: "adCost",
+                        title: "광고비",
+                        render: (row) => (row._isChild ? "-" : formatCurrency(row.totalAdCost)),
+                      },
+                      {
+                        key: "feeCost",
+                        title: "수수료",
+                        render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalFeeCost)),
+                      },
+                      {
+                        key: "roughProfit",
+                        title: "대략 손익",
+                        render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.roughProfit)),
+                      },
+                      {
+                        key: "netProfit",
+                        title: "순이익",
+                        render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.estimatedNetProfit)),
+                      },
+                    ]}
+                    rows={expandableRows}
+                    getRowKey={(row) => `${row.canonicalSalesUnitId}-${row.date}-${row._parentId ? row._parentId : ''}`}
+                  />
+                </Panel>
+              );
+            };
 
             return (
               <>
-                {storeLevelRows.length > 0 && renderTable(storeLevelRows, "스토어 전체 광고비")}
-                {regularRows.length > 0 && renderTable(regularRows, "일자별 손익 행")}
+                {storeLevelRows.length > 0 && renderExpandableTable(storeLevelRows, "스토어 전체 광고비")}
+                {groupAndRegularRows.length > 0 && renderExpandableTable(groupAndRegularRows, "일자별 손익 행")}
               </>
             );
           })()}

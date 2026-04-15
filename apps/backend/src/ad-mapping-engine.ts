@@ -158,6 +158,22 @@ export const getAdMappingOverride = (
   return null;
 };
 
+/**
+ * 자식 판매단위를 부모 판매단위로 승격시키는 헬퍼 함수.
+ * 자식이면 부모로 승격, 아니면 그대로 반환.
+ */
+function resolveTargetSalesUnitId(database: DatabaseShape, candidateId: string | null): string | null {
+  if (!candidateId) {
+    return null;
+  }
+  const candidate = database.canonicalSalesUnits.find((u) => u.id === candidateId);
+  if (!candidate) {
+    return candidateId;
+  }
+  // 자식이면 부모로 승격, 아니면 그대로
+  return candidate.parentSalesUnitId ?? candidate.id;
+}
+
 export const evaluateAdMapping = (
   database: DatabaseShape,
   storeId: string,
@@ -165,8 +181,9 @@ export const evaluateAdMapping = (
   override?: AdMappingOverride | null,
 ): AdMappingEvaluation => {
   if (override?.type === "MANUAL_MAPPED") {
+    const resolvedId = resolveTargetSalesUnitId(database, override.canonicalSalesUnitId);
     return {
-      canonicalSalesUnitId: override.canonicalSalesUnitId,
+      canonicalSalesUnitId: resolvedId,
       matchedRuleCount: 0,
       mappingReason: "MANUAL_MAPPED",
       reasonNote: null,
@@ -189,8 +206,9 @@ export const evaluateAdMapping = (
     normalizedCampaignName.includes(rule.normalizedCampaignPattern),
   );
   if (matches.length === 1) {
+    const resolvedId = resolveTargetSalesUnitId(database, matches[0].canonicalSalesUnitId);
     return {
-      canonicalSalesUnitId: matches[0].canonicalSalesUnitId,
+      canonicalSalesUnitId: resolvedId,
       matchedRuleCount: 1,
       mappingReason: "RULE_MATCHED",
       reasonNote: null,
@@ -242,8 +260,9 @@ export const evaluateAdMapping = (
           normalizeText(u.displayName) === normalizeText(keywordRule.displayNamePattern),
       );
       if (targetUnit) {
+        const resolvedId = resolveTargetSalesUnitId(database, targetUnit.id);
         return {
-          canonicalSalesUnitId: targetUnit.id,
+          canonicalSalesUnitId: resolvedId,
           matchedRuleCount: 1,
           mappingReason: "RULE_MATCHED",
           reasonNote: `키워드 규칙: ${keywordRule.keywords.join(", ")} → ${keywordRule.displayNamePattern}`,
@@ -259,8 +278,9 @@ export const evaluateAdMapping = (
     normalizedCampaignName,
   );
   if (fallback.canonicalSalesUnitId) {
+    const resolvedId = resolveTargetSalesUnitId(database, fallback.canonicalSalesUnitId);
     return {
-      canonicalSalesUnitId: fallback.canonicalSalesUnitId,
+      canonicalSalesUnitId: resolvedId,
       matchedRuleCount: fallback.candidateCount,
       mappingReason: "RULE_MATCHED",
       reasonNote: null,
@@ -318,6 +338,8 @@ export const recalculateAdMappingsForStore = (database: DatabaseShape, storeId: 
         isActive: true,
         deactivatedAt: null,
         isStoreLevel: true,
+        parentSalesUnitId: null,
+        isGroup: false,
         createdAt: nowIso(),
         updatedAt: nowIso(),
       });

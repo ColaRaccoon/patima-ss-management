@@ -85,7 +85,7 @@ export class CampaignMappingService implements OnModuleInit {
         continue; // 이미 있으면 스킵
       }
 
-      // 대상 판매단위 찾기
+      // 대상 판매단위 찾기 (그룹 우선, 없으면 단일 유닛)
       let targetSalesUnitId: string | null = null;
 
       if (pattern.displayNamePattern === "STORE_LEVEL") {
@@ -95,14 +95,27 @@ export class CampaignMappingService implements OnModuleInit {
         );
         targetSalesUnitId = storeLevelUnit?.id ?? null;
       } else {
-        // 일반 판매단위 찾기
-        const targetUnit = snapshot.canonicalSalesUnits.find(
+        // 그룹 판매단위를 우선으로 찾기
+        const groupUnit = snapshot.canonicalSalesUnits.find(
           (u) =>
             u.storeId === storeId &&
             u.isActive &&
+            u.isGroup &&
             normalizeText(u.displayName) === normalizeText(pattern.displayNamePattern),
         );
-        targetSalesUnitId = targetUnit?.id ?? null;
+        if (groupUnit) {
+          targetSalesUnitId = groupUnit.id;
+        } else {
+          // 그룹이 없으면 단일 유닛 찾기
+          const targetUnit = snapshot.canonicalSalesUnits.find(
+            (u) =>
+              u.storeId === storeId &&
+              u.isActive &&
+              !u.isGroup &&
+              normalizeText(u.displayName) === normalizeText(pattern.displayNamePattern),
+          );
+          targetSalesUnitId = targetUnit?.id ?? null;
+        }
       }
 
       // 대상 판매단위가 없으면 스킵 (아직 생성되지 않은 판매단위)
@@ -137,7 +150,7 @@ export class CampaignMappingService implements OnModuleInit {
   create(payload: { storeId: string; canonicalSalesUnitId: string; campaignPattern: string }) {
     this.storeService.ensureWritable(payload.storeId);
     const snapshot = this.databaseService.getSnapshot();
-    const salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === payload.canonicalSalesUnitId);
+    let salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === payload.canonicalSalesUnitId);
     if (!salesUnit) {
       throw new NotFoundException({
         success: false,
@@ -146,6 +159,16 @@ export class CampaignMappingService implements OnModuleInit {
       });
     }
     ensureNoCrossStoreReference(payload.storeId, salesUnit.storeId, "canonicalSalesUnitId");
+
+    // 자식 ID를 광고 매핑에 저장하려고 하면 차단 또는 자동으로 부모로 승격
+    let targetSalesUnitId = payload.canonicalSalesUnitId;
+    if (salesUnit.parentSalesUnitId) {
+      throw new BadRequestException({
+        success: false,
+        message: "그룹 자식 판매단위에는 광고를 직접 매핑할 수 없습니다.",
+        errors: [{ field: "canonicalSalesUnitId", reason: "CANNOT_MAP_TO_GROUP_CHILD" }],
+      });
+    }
     const normalized = normalizeCampaignPattern(payload.campaignPattern);
     if (!normalized) {
       throw new BadRequestException({
@@ -181,7 +204,7 @@ export class CampaignMappingService implements OnModuleInit {
       if (inactive) {
         inactive.isActive = true;
         inactive.deactivatedAt = null;
-        inactive.canonicalSalesUnitId = payload.canonicalSalesUnitId;
+        inactive.canonicalSalesUnitId = targetSalesUnitId;
         inactive.campaignPattern = payload.campaignPattern;
         inactive.updatedAt = nowIso();
         mapping = { ...inactive };
@@ -190,7 +213,7 @@ export class CampaignMappingService implements OnModuleInit {
           id: createId(),
           storeId: payload.storeId,
           channel: "NAVER_DA",
-          canonicalSalesUnitId: payload.canonicalSalesUnitId,
+          canonicalSalesUnitId: targetSalesUnitId,
           campaignPattern: payload.campaignPattern,
           normalizedCampaignPattern: normalized,
           isActive: true,
@@ -226,6 +249,25 @@ export class CampaignMappingService implements OnModuleInit {
       });
     }
     this.storeService.ensureWritable(existing.storeId);
+
+    // 자식 ID에 대한 검증
+    const salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === payload.canonicalSalesUnitId);
+    if (!salesUnit) {
+      throw new NotFoundException({
+        success: false,
+        message: "표준 판매단위를 찾을 수 없습니다.",
+        errors: [{ field: "canonicalSalesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
+      });
+    }
+    ensureNoCrossStoreReference(existing.storeId, salesUnit.storeId, "canonicalSalesUnitId");
+
+    if (salesUnit.parentSalesUnitId) {
+      throw new BadRequestException({
+        success: false,
+        message: "그룹 자식 판매단위에는 광고를 직접 매핑할 수 없습니다.",
+        errors: [{ field: "canonicalSalesUnitId", reason: "CANNOT_MAP_TO_GROUP_CHILD" }],
+      });
+    }
 
     this.databaseService.write((draft) => {
       const target = draft.campaignMappings.find((item) => item.id === mappingId)!;

@@ -223,6 +223,37 @@ export class AppController {
     return this.salesUnitService.activate(salesUnitId);
   }
 
+  @Post("canonical-sales-units/group/create")
+  createSalesUnitGroup(
+    @Body() body: { storeId: string; displayName: string; childSalesUnitIds: string[] },
+  ) {
+    return this.salesUnitService.createSalesUnitGroup(body.storeId, body.displayName, body.childSalesUnitIds);
+  }
+
+  @Post("canonical-sales-units/group/:groupId/attach-child")
+  attachChildToGroup(
+    @Param("groupId") groupId: string,
+    @Body() body: { storeId: string; childId: string },
+  ) {
+    return this.salesUnitService.attachChildToGroup(body.storeId, groupId, body.childId);
+  }
+
+  @Post("canonical-sales-units/group/:childId/detach-child")
+  detachChildFromGroup(
+    @Param("childId") childId: string,
+    @Body() body: { storeId: string },
+  ) {
+    return this.salesUnitService.detachChildFromGroup(body.storeId, childId);
+  }
+
+  @Post("canonical-sales-units/group/:groupId/dissolve")
+  dissolveGroup(
+    @Param("groupId") groupId: string,
+    @Body() body: { storeId: string },
+  ) {
+    return this.salesUnitService.dissolveGroup(body.storeId, groupId);
+  }
+
   @Post("ad-uploads/preview")
   @UseInterceptors(FileInterceptor("file"))
   previewAdUpload(
@@ -402,6 +433,7 @@ export class AppController {
     @Query("dateFrom") dateFrom: string,
     @Query("dateTo") dateTo: string,
     @Query("canonicalSalesUnitId") canonicalSalesUnitId?: string,
+    @Query("includeGroupChildren") includeGroupChildren?: string,
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
@@ -410,6 +442,7 @@ export class AppController {
       dateFrom,
       dateTo,
       canonicalSalesUnitId,
+      includeGroupChildren: includeGroupChildren === "true",
       page: page ? Number(page) : undefined,
       pageSize: pageSize ? Number(pageSize) : undefined,
     });

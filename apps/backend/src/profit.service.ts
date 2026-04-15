@@ -70,6 +70,7 @@ export class ProfitService {
     dateFrom: string;
     dateTo: string;
     canonicalSalesUnitId?: string;
+    includeGroupChildren?: boolean;
     page?: number;
     pageSize?: number;
   }) {
@@ -79,6 +80,7 @@ export class ProfitService {
       query.dateFrom,
       query.dateTo,
       query.canonicalSalesUnitId,
+      query.includeGroupChildren,
     );
     return formatApiSuccess(paginate(rows, query.page, query.pageSize));
   }

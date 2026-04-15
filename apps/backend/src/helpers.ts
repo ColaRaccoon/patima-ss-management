@@ -333,6 +333,41 @@ export const isSalesUnitAssignable = (
   return targetDate < deactivatedDate;
 };
 
+export const assertGroupInvariants = (unit: CanonicalSalesUnit): void => {
+  // 제약 1: isGroup: true이면 linkedProductIds/linkedOptionCodes/linkedManageCodes는 모두 빈 배열이어야 함
+  if (unit.isGroup) {
+    if (
+      (unit.linkedProductIds && unit.linkedProductIds.length > 0) ||
+      (unit.linkedOptionCodes && unit.linkedOptionCodes.length > 0) ||
+      (unit.linkedManageCodes && unit.linkedManageCodes.length > 0)
+    ) {
+      throw new BadRequestException({
+        success: false,
+        message: "그룹 판매단위는 상품/옵션을 직접 매핑할 수 없습니다.",
+        errors: [{ field: "isGroup", reason: "GROUP_CANNOT_HAVE_LINKED_ITEMS" }],
+      });
+    }
+  }
+
+  // 제약 2: parentSalesUnitId가 설정되면 isGroup이 true가 될 수 없음 (1단계 계층만 허용)
+  if (unit.parentSalesUnitId && unit.isGroup) {
+    throw new BadRequestException({
+      success: false,
+      message: "자식 판매단위는 그룹이 될 수 없습니다.",
+      errors: [{ field: "isGroup", reason: "CHILD_CANNOT_BE_GROUP" }],
+    });
+  }
+
+  // 제약 3: isStoreLevel과 isGroup은 동시 true가 될 수 없음
+  if (unit.isStoreLevel && unit.isGroup) {
+    throw new BadRequestException({
+      success: false,
+      message: "스토어 레벨 판매단위는 그룹이 될 수 없습니다.",
+      errors: [{ field: "isGroup", reason: "STORE_LEVEL_CANNOT_BE_GROUP" }],
+    });
+  }
+};
+
 export const createDisplayName = (standardProductName: string, standardOptionName?: string | null): string =>
   [standardProductName, standardOptionName].filter(Boolean).join(" / ");
 
@@ -408,6 +443,8 @@ export const migrateCanonicalSalesUnit = (
     isActive: raw.isActive,
     deactivatedAt: raw.deactivatedAt ?? null,
     isStoreLevel: raw.isStoreLevel ?? false,
+    parentSalesUnitId: raw.parentSalesUnitId ?? null,
+    isGroup: raw.isGroup ?? false,
     createdAt: raw.createdAt,
     updatedAt: raw.updatedAt,
   };
@@ -485,12 +522,37 @@ export const calculateFee = (
 export const computeProfitStatus = (hasIncomplete: boolean): ProfitStatus =>
   hasIncomplete ? "INCOMPLETE_COST" : "COMPLETE";
 
+const initRow = (
+  date: string,
+  canonicalSalesUnitId: string,
+  displayName: string,
+  isStoreLevel: boolean,
+): DailySalesUnitProfit & { fallbackIncomplete: boolean } => ({
+  date,
+  canonicalSalesUnitId,
+  displayName,
+  isStoreLevel,
+  totalQuantity: 0,
+  totalRevenue: 0,
+  totalProductRevenue: 0,
+  totalDeliveryFeeAmount: 0,
+  totalAdCost: 0,
+  totalUnitCost: 0,
+  totalFeeCost: 0,
+  totalOtherCost: 0,
+  roughProfit: 0,
+  estimatedNetProfit: 0,
+  profitStatus: "COMPLETE" as ProfitStatus,
+  fallbackIncomplete: false,
+});
+
 export const calculateDailyProfitRows = (
   database: DatabaseShape,
   storeId: string,
   dateFrom: string,
   dateTo: string,
   filterSalesUnitId?: string,
+  includeGroupChildren?: boolean,
 ): DailySalesUnitProfit[] => {
   const salesUnitsById = new Map(
     database.canonicalSalesUnits.filter((item) => item.storeId === storeId).map((item) => [item.id, item]),
@@ -506,9 +568,23 @@ export const calculateDailyProfitRows = (
       costSettingsByUnit.set(item.canonicalSalesUnitId, list);
     });
 
-  const rowMap = new Map<string, DailySalesUnitProfit & { fallbackIncomplete: boolean }>();
+  // Step 1: 자식 + 단독 판매단위의 주문 집계
+  const childRowMap = new Map<string, DailySalesUnitProfit & { fallbackIncomplete: boolean }>();
 
   const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
+
+  // filterSalesUnitId가 그룹 ID인 경우 자식들의 ID 세트를 생성
+  const filterGroupChildren = new Set<string>();
+  if (filterSalesUnitId) {
+    const filterUnit = salesUnitsById.get(filterSalesUnitId);
+    if (filterUnit?.isGroup) {
+      // 그룹 ID로 필터링: 그룹의 자식들과 그룹 자체 포함
+      database.canonicalSalesUnits
+        .filter((unit) => unit.storeId === storeId && unit.parentSalesUnitId === filterSalesUnitId)
+        .forEach((unit) => filterGroupChildren.add(unit.id));
+      filterGroupChildren.add(filterSalesUnitId);
+    }
+  }
 
   database.orderItems
     .filter(
@@ -518,10 +594,25 @@ export const calculateDailyProfitRows = (
         item.paymentDate >= dateFrom &&
         item.paymentDate <= dateTo &&
         item.saleStatus === "SALE" &&
-        item.canonicalSalesUnitId &&
-        (!filterSalesUnitId || item.canonicalSalesUnitId === filterSalesUnitId),
+        item.canonicalSalesUnitId,
     )
     .forEach((item) => {
+      // filterSalesUnitId 적용 로직
+      if (filterSalesUnitId) {
+        const filterUnit = salesUnitsById.get(filterSalesUnitId);
+        if (filterUnit?.isGroup) {
+          // 그룹 필터: 자식들 + 그룹 자신만
+          if (!filterGroupChildren.has(item.canonicalSalesUnitId!)) {
+            return;
+          }
+        } else {
+          // 단독 유닛 필터: 정확히 일치하는 ID만
+          if (item.canonicalSalesUnitId !== filterSalesUnitId) {
+            return;
+          }
+        }
+      }
+
       const salesUnit = salesUnitsById.get(item.canonicalSalesUnitId!);
       if (!salesUnit) {
         return;
@@ -530,25 +621,8 @@ export const calculateDailyProfitRows = (
       const costSetting = getCostSettingForDate(costSettingsByUnit.get(item.canonicalSalesUnitId!) ?? [], item.paymentDate);
       const fee = calculateFee(item, costSetting);
       const row =
-        rowMap.get(key) ??
-        {
-          date: item.paymentDate!,
-          canonicalSalesUnitId: item.canonicalSalesUnitId!,
-          displayName: salesUnit.displayName,
-          isStoreLevel: salesUnit.isStoreLevel,
-          totalQuantity: 0,
-          totalRevenue: 0,
-          totalProductRevenue: 0,
-          totalDeliveryFeeAmount: 0,
-          totalAdCost: 0,
-          totalUnitCost: 0,
-          totalFeeCost: 0,
-          totalOtherCost: 0,
-          roughProfit: 0,
-          estimatedNetProfit: 0,
-          profitStatus: "COMPLETE" as ProfitStatus,
-          fallbackIncomplete: false,
-        };
+        childRowMap.get(key) ??
+        initRow(item.paymentDate!, item.canonicalSalesUnitId!, salesUnit.displayName, salesUnit.isStoreLevel);
 
       row.totalQuantity += item.quantity;
       row.totalProductRevenue += item.productPaymentAmount;
@@ -557,9 +631,37 @@ export const calculateDailyProfitRows = (
       row.totalUnitCost += (costSetting?.unitCost ?? 0) * item.quantity;
       row.totalOtherCost += (costSetting?.otherCost ?? 0) * item.quantity;
       row.fallbackIncomplete = row.fallbackIncomplete || !costSetting || fee.incomplete;
-      rowMap.set(key, row);
+      childRowMap.set(key, row);
     });
 
+  // Step 2: 자식 → 부모 롤업 (groupRowMap 생성)
+  const groupRowMap = new Map<string, DailySalesUnitProfit & { fallbackIncomplete: boolean }>();
+  childRowMap.forEach((childRow) => {
+    const unit = salesUnitsById.get(childRow.canonicalSalesUnitId);
+    if (!unit?.parentSalesUnitId) {
+      // 부모가 없는 자식 (단독 유닛)은 처리하지 않음
+      return;
+    }
+    const parentKey = `${childRow.date}:${unit.parentSalesUnitId}`;
+    const parentUnit = salesUnitsById.get(unit.parentSalesUnitId);
+    if (!parentUnit) {
+      return;
+    }
+    const parentRow =
+      groupRowMap.get(parentKey) ??
+      initRow(childRow.date, unit.parentSalesUnitId, parentUnit.displayName, parentUnit.isStoreLevel);
+    parentRow.isGroup = true;
+    parentRow.totalQuantity += childRow.totalQuantity;
+    parentRow.totalProductRevenue += childRow.totalProductRevenue;
+    parentRow.totalDeliveryFeeAmount += childRow.totalDeliveryFeeAmount;
+    parentRow.totalUnitCost += childRow.totalUnitCost;
+    parentRow.totalFeeCost += childRow.totalFeeCost;
+    parentRow.totalOtherCost += childRow.totalOtherCost;
+    parentRow.fallbackIncomplete = parentRow.fallbackIncomplete || childRow.fallbackIncomplete;
+    groupRowMap.set(parentKey, parentRow);
+  });
+
+  // Step 3: 광고비 귀속 (그룹 또는 단독 유닛)
   database.adCampaignDailyCosts
     .filter(
       (item) =>
@@ -567,41 +669,98 @@ export const calculateDailyProfitRows = (
         item.reportDate >= dateFrom &&
         item.reportDate <= dateTo &&
         item.canonicalSalesUnitId &&
-        activeUploadIds.has(item.sourceUploadId) &&
-        (!filterSalesUnitId || item.canonicalSalesUnitId === filterSalesUnitId),
+        activeUploadIds.has(item.sourceUploadId),
     )
     .forEach((item) => {
-      const salesUnit = salesUnitsById.get(item.canonicalSalesUnitId!);
-      if (!salesUnit) {
+      // 원본 candidate 조회
+      const rawUnit = salesUnitsById.get(item.canonicalSalesUnitId!);
+      if (!rawUnit) {
         return;
       }
-      const key = `${item.reportDate}:${item.canonicalSalesUnitId}`;
-      const row =
-        rowMap.get(key) ??
-        {
-          date: item.reportDate,
-          canonicalSalesUnitId: item.canonicalSalesUnitId!,
-          displayName: salesUnit.displayName,
-          isStoreLevel: salesUnit.isStoreLevel,
-          totalQuantity: 0,
-          totalRevenue: 0,
-          totalProductRevenue: 0,
-          totalDeliveryFeeAmount: 0,
-          totalAdCost: 0,
-          totalUnitCost: 0,
-          totalFeeCost: 0,
-          totalOtherCost: 0,
-          roughProfit: 0,
-          estimatedNetProfit: 0,
-          profitStatus: "COMPLETE" as ProfitStatus,
-          fallbackIncomplete: false,
-        };
 
-      row.totalAdCost += item.totalCost;
-      rowMap.set(key, row);
+      // 방어적 부모 승격: 자식 ID면 부모로 승격
+      // 주의: Step 1/2와 동일하게 isActive 체크 없음(비활성 유닛도 처리)
+      // 부모 존재 여부만 확인하므로 null 부모는 자동 방어됨
+      let targetUnitId = item.canonicalSalesUnitId!;
+      let targetUnit = rawUnit;
+      if (rawUnit.parentSalesUnitId) {
+        const parentUnit = salesUnitsById.get(rawUnit.parentSalesUnitId);
+        if (parentUnit) {
+          targetUnitId = parentUnit.id;
+          targetUnit = parentUnit;
+        }
+      }
+
+      // filterSalesUnitId 적용
+      // 중요: 승격된 targetUnitId 기준으로 필터 매칭
+      // 예: 자식 ID 광고 → 부모로 승격 → 그룹 필터 시 filterGroupChildren(그룹+자식들)에 포함 → 통과
+      if (filterSalesUnitId) {
+        const filterUnit = salesUnitsById.get(filterSalesUnitId);
+        if (filterUnit?.isGroup) {
+          if (!filterGroupChildren.has(targetUnitId)) {
+            return;
+          }
+        } else {
+          if (targetUnitId !== filterSalesUnitId) {
+            return;
+          }
+        }
+      }
+
+      const key = `${item.reportDate}:${targetUnitId}`;
+
+      // 광고비는 그룹이면 groupRowMap에, 단독이면 childRowMap에 적재
+      if (targetUnit.isGroup) {
+        const row =
+          groupRowMap.get(key) ??
+          initRow(item.reportDate, targetUnitId, targetUnit.displayName, targetUnit.isStoreLevel);
+        row.isGroup = true;
+        row.totalAdCost += item.totalCost;
+        groupRowMap.set(key, row);
+      } else {
+        const row =
+          childRowMap.get(key) ??
+          initRow(item.reportDate, targetUnitId, targetUnit.displayName, targetUnit.isStoreLevel);
+        row.totalAdCost += item.totalCost;
+        childRowMap.set(key, row);
+      }
     });
 
-  return Array.from(rowMap.values())
+  // Step 4: 최종 결과 구성
+  // - 그룹 행 (groupRowMap의 모든 행)
+  // - 부모 없는 자식 행 (childRowMap 중 부모가 없는 것)
+  // - childRows 첨부 (includeGroupChildren가 true인 경우)
+  const resultMap = new Map<string, DailySalesUnitProfit & { fallbackIncomplete: boolean }>();
+
+  // 그룹 행 추가
+  groupRowMap.forEach((groupRow, groupKey) => {
+    resultMap.set(groupKey, groupRow);
+  });
+
+  // 부모 없는 자식 행 추가
+  childRowMap.forEach((childRow, childKey) => {
+    const unit = salesUnitsById.get(childRow.canonicalSalesUnitId);
+    if (!unit?.parentSalesUnitId) {
+      // 부모가 없으면 최상위 리스트에 포함
+      resultMap.set(childKey, childRow);
+    }
+  });
+
+  // 자식 행을 그룹 행의 childRows에 첨부
+  const groupChildrenMap = new Map<string, (DailySalesUnitProfit & { fallbackIncomplete: boolean })[]>();
+  if (includeGroupChildren) {
+    childRowMap.forEach((childRow, childKey) => {
+      const unit = salesUnitsById.get(childRow.canonicalSalesUnitId);
+      if (unit?.parentSalesUnitId) {
+        const parentKey = `${childRow.date}:${unit.parentSalesUnitId}`;
+        const list = groupChildrenMap.get(parentKey) ?? [];
+        list.push(childRow);
+        groupChildrenMap.set(parentKey, list);
+      }
+    });
+  }
+
+  return Array.from(resultMap.values())
     .map((row) => {
       row.totalRevenue = row.totalProductRevenue;
       row.roughProfit = row.totalRevenue - row.totalAdCost;
@@ -609,6 +768,26 @@ export const calculateDailyProfitRows = (
       row.estimatedNetProfit = row.fallbackIncomplete
         ? null
         : row.totalRevenue - row.totalAdCost - row.totalUnitCost - row.totalFeeCost - row.totalOtherCost;
+
+      // childRows 첨부
+      if (includeGroupChildren && row.isGroup) {
+        const groupKey = `${row.date}:${row.canonicalSalesUnitId}`;
+        const childRows = groupChildrenMap.get(groupKey) ?? [];
+        row.childRows = childRows
+          .map((childRow) => {
+            childRow.totalRevenue = childRow.totalProductRevenue;
+            childRow.roughProfit = childRow.totalRevenue - childRow.totalAdCost;
+            childRow.profitStatus = computeProfitStatus(childRow.fallbackIncomplete);
+            childRow.estimatedNetProfit = childRow.fallbackIncomplete
+              ? null
+              : childRow.totalRevenue - childRow.totalAdCost - childRow.totalUnitCost - childRow.totalFeeCost - childRow.totalOtherCost;
+            return childRow;
+          })
+          .sort((left, right) =>
+            left.displayName.localeCompare(right.displayName, "ko"),
+          );
+      }
+
       return row;
     })
     .sort((left, right) =>
@@ -623,7 +802,10 @@ export const calculateDashboardSummary = (
   storeId: string,
   date: string,
 ): DashboardSummary => {
-  const rows = calculateDailyProfitRows(database, storeId, date, date);
+  // calculateDailyProfitRows는 기본적으로 includeGroupChildren=false이므로
+  // 반환된 rows는 그룹 행 + 부모 없는 단독 유닛만 포함
+  // (부모 있는 자식 행은 제외되어 이중 계산 방지)
+  const rows = calculateDailyProfitRows(database, storeId, date, date, undefined, false);
   const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
   const totalProductRevenue = rows.reduce((total, row) => total + row.totalProductRevenue, 0);
   const totalDeliveryFeeAmount = rows.reduce(

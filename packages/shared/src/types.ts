@@ -89,6 +89,8 @@ export interface CanonicalSalesUnit {
   isActive: boolean;
   deactivatedAt: string | null;
   isStoreLevel: boolean;
+  parentSalesUnitId: string | null;
+  isGroup: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -316,6 +318,9 @@ export interface DailySalesUnitProfit {
   estimatedNetProfit: number | null;
   profitStatus: ProfitStatus;
   isStoreLevel?: boolean;
+  isGroup?: boolean;
+  parentSalesUnitId?: string | null;
+  childRows?: DailySalesUnitProfit[];
 }
 
 export interface DatabaseShape {

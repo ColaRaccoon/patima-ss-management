@@ -8,6 +8,8 @@ import type {
   WeekdayValidationStatus,
 } from "@patima/shared";
 
+export type { DailySalesUnitProfit };
+
 export type DataSource = "live" | "mock";
 
 export interface SourceState {
@@ -102,10 +104,13 @@ export interface SalesUnitListItem {
   matchAliases: string[];
   linkedProductIds: string[];
   linkedOptionCodes: string[];
+  linkedManageCodes: string[];
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;
   isStoreLevel: boolean;
+  parentSalesUnitId: string | null;
+  isGroup: boolean;
 }
 
 export interface AdUploadListItem {

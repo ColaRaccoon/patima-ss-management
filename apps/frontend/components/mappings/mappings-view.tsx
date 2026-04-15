@@ -738,6 +738,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 >
                   <option value="">판매단위 선택</option>
                   {[...data.salesUnits]
+                    .filter((u) => !u.isGroup)
                     .sort((a, b) => {
                       if (a.isStoreLevel === b.isStoreLevel) return 0;
                       return a.isStoreLevel ? -1 : 1;
@@ -976,6 +977,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 >
                   <option value="">판매단위 선택</option>
                   {[...data.salesUnits]
+                    .filter((u) => !u.isGroup)
                     .sort((a, b) => {
                       if (a.isStoreLevel === b.isStoreLevel) return 0;
                       return a.isStoreLevel ? -1 : 1;
@@ -1069,6 +1071,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               <select className="input-shell" value={campaignDraft.canonicalSalesUnitId} onChange={(event) => setCampaignDraft((current) => ({ ...current, canonicalSalesUnitId: event.target.value }))}>
                 <option value="">판매단위 선택</option>
                 {[...data.salesUnits]
+                  .filter((u) => u.isStoreLevel || u.isGroup)
                   .sort((a, b) => {
                     if (a.isStoreLevel === b.isStoreLevel) return 0;
                     return a.isStoreLevel ? -1 : 1;
@@ -1079,6 +1082,11 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                     </option>
                   ))}
               </select>
+              {data.salesUnits.some((u) => u.parentSalesUnitId) && (
+                <p className="mt-1 text-xs text-ink/55">
+                  그룹 자식 판매단위는 광고 매핑 대상이 아닙니다. 자식이 속한 그룹을 선택해주세요.
+                </p>
+              )}
             </label>
 
             <label className="block">

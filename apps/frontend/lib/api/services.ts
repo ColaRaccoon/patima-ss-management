@@ -318,6 +318,7 @@ async function getProfitRows(storeId: string, dateFrom: string, dateTo: string, 
           storeId,
           dateFrom,
           dateTo,
+          includeGroupChildren: "true",
         },
         fallback: mockProfits,
       })
@@ -328,6 +329,7 @@ async function getProfitRows(storeId: string, dateFrom: string, dateTo: string, 
           storeId,
           dateFrom,
           dateTo,
+          includeGroupChildren: "true",
         },
       });
 

@@ -389,6 +389,8 @@ export class MappingSeedService {
       isActive: true,
       deactivatedAt: null,
       isStoreLevel: false,
+      parentSalesUnitId: null,
+      isGroup: false,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };

@@ -10,3 +10,4 @@ apps/backend/uploads
 apps/backend/data/*.json
 !apps/backend/data/.gitkeep
 .claude/
+backups/

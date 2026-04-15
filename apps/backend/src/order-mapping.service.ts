@@ -101,6 +101,14 @@ export class OrderMappingService implements OnModuleInit {
         errors: [{ field: "canonicalSalesUnitId", reason: "INVALID_VALUE" }],
       });
     }
+    // 그룹 판매단위에는 주문을 직접 매핑할 수 없음 (자식 또는 단독 유닛만 가능)
+    if (salesUnit.isGroup) {
+      throw new BadRequestException({
+        success: false,
+        message: "그룹 판매단위에는 주문을 직접 매핑할 수 없습니다.",
+        errors: [{ field: "canonicalSalesUnitId", reason: "CANNOT_MAP_TO_GROUP" }],
+      });
+    }
 
     const targetIds = new Set(dedupedIds);
     const timestamp = nowIso();

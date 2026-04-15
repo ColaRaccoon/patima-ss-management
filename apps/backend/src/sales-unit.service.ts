@@ -4,6 +4,7 @@ import { recalculateAdMappingsForStore } from "./ad-mapping-engine";
 import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import {
+  assertGroupInvariants,
   createId,
   ensureNormalizedLength,
   ensureStoreExists,
@@ -73,6 +74,8 @@ export class SalesUnitService {
       isActive: true,
       deactivatedAt: null,
       isStoreLevel: true,
+      parentSalesUnitId: null,
+      isGroup: false,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
@@ -131,11 +134,14 @@ export class SalesUnitService {
       isActive: true,
       deactivatedAt: null,
       isStoreLevel: false,
+      parentSalesUnitId: null,
+      isGroup: false,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
 
     this.ensureUnique(created);
+    assertGroupInvariants(created);
 
     this.databaseService.write((draft) => {
       ensureStoreExists(draft, payload.storeId);
@@ -167,7 +173,7 @@ export class SalesUnitService {
     if (!existing) {
       throw new NotFoundException({
         success: false,
-        message: "?쒖? ?먮ℓ?⑥쐞瑜?李얠쓣 ???놁뒿?덈떎.",
+        message: "판매단위를 찾을 수 없습니다.",
         errors: [{ field: "salesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
       });
     }
@@ -188,6 +194,7 @@ export class SalesUnitService {
       updatedAt: nowIso(),
     };
     this.ensureUnique(updated, salesUnitId);
+    assertGroupInvariants(updated);
 
     this.databaseService.write((draft) => {
       const target = draft.canonicalSalesUnits.find((item) => item.id === salesUnitId)!;
@@ -215,7 +222,7 @@ export class SalesUnitService {
     if (!existing) {
       throw new NotFoundException({
         success: false,
-        message: "?쒖? ?먮ℓ?⑥쐞瑜?李얠쓣 ???놁뒿?덈떎.",
+        message: "판매단위를 찾을 수 없습니다.",
         errors: [{ field: "salesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
       });
     }
@@ -243,7 +250,7 @@ export class SalesUnitService {
     if (!existing) {
       throw new NotFoundException({
         success: false,
-        message: "?쒖? ?먮ℓ?⑥쐞瑜?李얠쓣 ???놁뒿?덈떎.",
+        message: "판매단위를 찾을 수 없습니다.",
         errors: [{ field: "salesUnitId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
       });
     }
@@ -265,6 +272,382 @@ export class SalesUnitService {
     });
   }
 
+  /**
+   * 판매단위 그룹 생성
+   * isGroup: true 부모를 만들고, 자식들의 parentSalesUnitId를 새 그룹 ID로 설정
+   */
+  createSalesUnitGroup(
+    storeId: string,
+    displayName: string,
+    childSalesUnitIds: string[],
+  ) {
+    this.storeService.ensureWritable(storeId);
+    const snapshot = this.databaseService.getSnapshot();
+
+    // 검증: 자식 ID 배열이 비어있지 않은가
+    if (!childSalesUnitIds || childSalesUnitIds.length === 0) {
+      throw new BadRequestException({
+        success: false,
+        message: "최소 1개 이상의 자식 판매단위를 지정해야 합니다.",
+        errors: [{ field: "childSalesUnitIds", reason: "EMPTY_CHILD_SALES_UNIT_IDS" }],
+      });
+    }
+
+    // 검증: 자식 ID에 중복이 없는가
+    if (new Set(childSalesUnitIds).size !== childSalesUnitIds.length) {
+      throw new BadRequestException({
+        success: false,
+        message: "자식 판매단위 ID에 중복이 있습니다.",
+        errors: [{ field: "childSalesUnitIds", reason: "DUPLICATE_CHILD_SALES_UNIT_IDS" }],
+      });
+    }
+
+    // 검증: 모든 자식이 동일 storeId인가
+    const childUnits = childSalesUnitIds.map((id) => {
+      const unit = snapshot.canonicalSalesUnits.find((u) => u.id === id);
+      if (!unit) {
+        throw new NotFoundException({
+          success: false,
+          message: `자식 판매단위 ${id}를 찾을 수 없습니다.`,
+          errors: [{ field: "childSalesUnitIds", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
+        });
+      }
+      if (unit.storeId !== storeId) {
+        throw new BadRequestException({
+          success: false,
+          message: "모든 자식 판매단위는 동일한 스토어에 속해야 합니다.",
+          errors: [{ field: "childSalesUnitIds", reason: "CROSS_STORE_REFERENCE" }],
+        });
+      }
+      return unit;
+    });
+
+    // 검증: 자식 중 이미 parentSalesUnitId != null인 것이 없는가
+    const alreadyGrouped = childUnits.find((u) => u.parentSalesUnitId);
+    if (alreadyGrouped) {
+      throw new BadRequestException({
+        success: false,
+        message: `자식 판매단위 ${alreadyGrouped.id}는 이미 다른 그룹에 속해있습니다.`,
+        errors: [{ field: "childSalesUnitIds", reason: "ALREADY_GROUPED" }],
+      });
+    }
+
+    // 검증: 자식이 isGroup: true가 아닌가
+    const childGroup = childUnits.find((u) => u.isGroup);
+    if (childGroup) {
+      throw new BadRequestException({
+        success: false,
+        message: `자식 판매단위 ${childGroup.id}는 그룹일 수 없습니다.`,
+        errors: [{ field: "childSalesUnitIds", reason: "CHILD_CANNOT_BE_GROUP" }],
+      });
+    }
+
+    // 검증: 자식이 isStoreLevel: true가 아닌가
+    const childStoreLevel = childUnits.find((u) => u.isStoreLevel);
+    if (childStoreLevel) {
+      throw new BadRequestException({
+        success: false,
+        message: `자식 판매단위 ${childStoreLevel.id}는 스토어 레벨일 수 없습니다.`,
+        errors: [{ field: "childSalesUnitIds", reason: "CHILD_CANNOT_BE_STORE_LEVEL" }],
+      });
+    }
+
+    const groupId = createId();
+    const groupUnit: CanonicalSalesUnit = {
+      id: groupId,
+      storeId,
+      displayName: displayName.trim(),
+      matchAliases: [],
+      normalizedMatchAliases: [],
+      linkedProductIds: [],
+      linkedOptionCodes: [],
+      linkedManageCodes: [],
+      memo: null,
+      isActive: true,
+      deactivatedAt: null,
+      isStoreLevel: false,
+      parentSalesUnitId: null,
+      isGroup: true,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+
+    assertGroupInvariants(groupUnit);
+
+    this.databaseService.write((draft) => {
+      ensureStoreExists(draft, storeId);
+      draft.canonicalSalesUnits.push(groupUnit);
+
+      // 자식들의 parentSalesUnitId 업데이트
+      childSalesUnitIds.forEach((childId) => {
+        const child = draft.canonicalSalesUnits.find((u) => u.id === childId);
+        if (child) {
+          child.parentSalesUnitId = groupId;
+          child.updatedAt = nowIso();
+        }
+      });
+
+      // 광고 매핑 승계: 자식에 연결되어 있던 매핑을 그룹으로 마이그레이션
+      childSalesUnitIds.forEach((childId) => {
+        const childMappings = draft.campaignMappings.filter(
+          (m) => m.storeId === storeId && m.canonicalSalesUnitId === childId && m.isActive,
+        );
+        childMappings.forEach((m) => {
+          m.canonicalSalesUnitId = groupId;
+          m.updatedAt = nowIso();
+        });
+      });
+
+      // 광고 다시 계산
+      recalculateAdMappingsForStore(draft, storeId);
+    });
+
+    this.auditLogService.record({
+      storeId,
+      domain: "SALES_UNIT",
+      action: "SALES_UNIT_GROUP_CREATED",
+      targetId: groupId,
+      actorIdentifier: "LOCALHOST_ADMIN",
+      beforeJson: null,
+      afterJson: groupUnit,
+    });
+
+    return formatApiSuccess(groupUnit);
+  }
+
+  /**
+   * 기존 그룹에 자식 추가
+   */
+  attachChildToGroup(storeId: string, groupId: string, childId: string) {
+    this.storeService.ensureWritable(storeId);
+    const snapshot = this.databaseService.getSnapshot();
+
+    const group = snapshot.canonicalSalesUnits.find((u) => u.id === groupId);
+    if (!group) {
+      throw new NotFoundException({
+        success: false,
+        message: "그룹 판매단위를 찾을 수 없습니다.",
+        errors: [{ field: "groupId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
+      });
+    }
+
+    if (!group.isGroup) {
+      throw new BadRequestException({
+        success: false,
+        message: "대상 판매단위는 그룹이 아닙니다.",
+        errors: [{ field: "groupId", reason: "NOT_A_GROUP" }],
+      });
+    }
+
+    const child = snapshot.canonicalSalesUnits.find((u) => u.id === childId);
+    if (!child) {
+      throw new NotFoundException({
+        success: false,
+        message: "자식 판매단위를 찾을 수 없습니다.",
+        errors: [{ field: "childId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
+      });
+    }
+
+    if (child.storeId !== storeId) {
+      throw new BadRequestException({
+        success: false,
+        message: "자식 판매단위는 동일한 스토어에 속해야 합니다.",
+        errors: [{ field: "childId", reason: "CROSS_STORE_REFERENCE" }],
+      });
+    }
+
+    if (child.parentSalesUnitId) {
+      throw new BadRequestException({
+        success: false,
+        message: "자식 판매단위는 이미 다른 그룹에 속해있습니다.",
+        errors: [{ field: "childId", reason: "ALREADY_GROUPED" }],
+      });
+    }
+
+    if (child.isGroup) {
+      throw new BadRequestException({
+        success: false,
+        message: "자식 판매단위는 그룹일 수 없습니다.",
+        errors: [{ field: "childId", reason: "CHILD_CANNOT_BE_GROUP" }],
+      });
+    }
+
+    if (child.isStoreLevel) {
+      throw new BadRequestException({
+        success: false,
+        message: "자식 판매단위는 스토어 레벨일 수 없습니다.",
+        errors: [{ field: "childId", reason: "CHILD_CANNOT_BE_STORE_LEVEL" }],
+      });
+    }
+
+    const before = { ...child };
+
+    this.databaseService.write((draft) => {
+      const targetChild = draft.canonicalSalesUnits.find((u) => u.id === childId)!;
+      targetChild.parentSalesUnitId = groupId;
+      targetChild.updatedAt = nowIso();
+
+      // 광고 매핑 승계
+      const childMappings = draft.campaignMappings.filter(
+        (m) => m.storeId === storeId && m.canonicalSalesUnitId === childId && m.isActive,
+      );
+      childMappings.forEach((m) => {
+        m.canonicalSalesUnitId = groupId;
+        m.updatedAt = nowIso();
+      });
+
+      recalculateAdMappingsForStore(draft, storeId);
+    });
+
+    this.auditLogService.record({
+      storeId,
+      domain: "SALES_UNIT",
+      action: "SALES_UNIT_GROUP_CHILD_ATTACHED",
+      targetId: groupId,
+      actorIdentifier: "LOCALHOST_ADMIN",
+      beforeJson: before,
+      afterJson: { ...child, parentSalesUnitId: groupId },
+    });
+
+    return formatApiSuccess({ groupId, childId });
+  }
+
+  /**
+   * 자식을 그룹에서 제거
+   */
+  detachChildFromGroup(storeId: string, childId: string) {
+    this.storeService.ensureWritable(storeId);
+    const snapshot = this.databaseService.getSnapshot();
+
+    const child = snapshot.canonicalSalesUnits.find((u) => u.id === childId);
+    if (!child) {
+      throw new NotFoundException({
+        success: false,
+        message: "자식 판매단위를 찾을 수 없습니다.",
+        errors: [{ field: "childId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
+      });
+    }
+
+    if (child.storeId !== storeId) {
+      throw new BadRequestException({
+        success: false,
+        message: "자식 판매단위는 동일한 스토어에 속해야 합니다.",
+        errors: [{ field: "childId", reason: "CROSS_STORE_REFERENCE" }],
+      });
+    }
+
+    if (!child.parentSalesUnitId) {
+      throw new BadRequestException({
+        success: false,
+        message: "자식 판매단위는 그룹에 속해있지 않습니다.",
+        errors: [{ field: "childId", reason: "NOT_IN_GROUP" }],
+      });
+    }
+
+    const before = { ...child };
+    const parentId = child.parentSalesUnitId;
+
+    this.databaseService.write((draft) => {
+      const targetChild = draft.canonicalSalesUnits.find((u) => u.id === childId)!;
+      targetChild.parentSalesUnitId = null;
+      targetChild.updatedAt = nowIso();
+      // 광고 매핑은 건드리지 않음 (그룹에 남음)
+    });
+
+    this.auditLogService.record({
+      storeId,
+      domain: "SALES_UNIT",
+      action: "SALES_UNIT_GROUP_CHILD_DETACHED",
+      targetId: parentId,
+      actorIdentifier: "LOCALHOST_ADMIN",
+      beforeJson: before,
+      afterJson: { ...child, parentSalesUnitId: null },
+    });
+
+    return formatApiSuccess({ childId, parentId });
+  }
+
+  /**
+   * 그룹 해체
+   */
+  dissolveGroup(storeId: string, groupId: string) {
+    this.storeService.ensureWritable(storeId);
+    const snapshot = this.databaseService.getSnapshot();
+
+    const group = snapshot.canonicalSalesUnits.find((u) => u.id === groupId);
+    if (!group) {
+      throw new NotFoundException({
+        success: false,
+        message: "그룹 판매단위를 찾을 수 없습니다.",
+        errors: [{ field: "groupId", reason: "CANONICAL_SALES_UNIT_NOT_FOUND" }],
+      });
+    }
+
+    if (!group.isGroup) {
+      throw new BadRequestException({
+        success: false,
+        message: "대상 판매단위는 그룹이 아닙니다.",
+        errors: [{ field: "groupId", reason: "NOT_A_GROUP" }],
+      });
+    }
+
+    if (group.storeId !== storeId) {
+      throw new BadRequestException({
+        success: false,
+        message: "그룹 판매단위는 동일한 스토어에 속해야 합니다.",
+        errors: [{ field: "groupId", reason: "CROSS_STORE_REFERENCE" }],
+      });
+    }
+
+    this.databaseService.write((draft) => {
+      // 자식들의 parentSalesUnitId 복구
+      draft.canonicalSalesUnits
+        .filter((u) => u.parentSalesUnitId === groupId)
+        .forEach((child) => {
+          child.parentSalesUnitId = null;
+          child.updatedAt = nowIso();
+        });
+
+      // 광고 매핑: 그룹에 연결되어 있던 매핑을 INTENTIONALLY_UNMAPPED로 변환
+      const groupMappings = draft.campaignMappings.filter(
+        (m) => m.storeId === storeId && m.canonicalSalesUnitId === groupId && m.isActive,
+      );
+      groupMappings.forEach((m) => {
+        m.isActive = false;
+        m.deactivatedAt = nowIso();
+        m.updatedAt = nowIso();
+      });
+
+      // 그룹에 연결된 광고 비용을 INTENTIONALLY_UNMAPPED로 표시
+      draft.adCampaignDailyCosts
+        .filter((item) => item.storeId === storeId && item.canonicalSalesUnitId === groupId)
+        .forEach((item) => {
+          item.canonicalSalesUnitId = null;
+          item.mappingReason = "INTENTIONALLY_UNMAPPED";
+          item.reasonNote = "그룹이 해체되어 매핑이 해제되었습니다.";
+          item.updatedAt = nowIso();
+        });
+
+      // 그룹 자체도 deactivate
+      const targetGroup = draft.canonicalSalesUnits.find((u) => u.id === groupId)!;
+      targetGroup.isActive = false;
+      targetGroup.deactivatedAt = nowIso();
+      targetGroup.updatedAt = nowIso();
+    });
+
+    this.auditLogService.record({
+      storeId,
+      domain: "SALES_UNIT",
+      action: "SALES_UNIT_GROUP_DISSOLVED",
+      targetId: groupId,
+      actorIdentifier: "LOCALHOST_ADMIN",
+      beforeJson: group,
+      afterJson: { ...group, isActive: false, deactivatedAt: nowIso() },
+    });
+
+    return formatApiSuccess({ groupId });
+  }
+
   private ensureUnique(target: CanonicalSalesUnit, excludeId?: string) {
     const snapshot = this.databaseService.getSnapshot();
     const duplicatedDisplay = snapshot.canonicalSalesUnits.some(
@@ -276,7 +659,7 @@ export class SalesUnitService {
     if (duplicatedDisplay) {
       throw new BadRequestException({
         success: false,
-        message: "?뺢퇋?붾맂 ?쒖떆紐낆씠 以묐났?⑸땲??",
+        message: "중복된 판매단위명이 있습니다.",
         errors: [{ field: "displayName", reason: "SALES_UNIT_DUPLICATE_DISPLAY_NAME" }],
       });
     }
@@ -292,7 +675,7 @@ export class SalesUnitService {
     if (duplicatedAlias) {
       throw new BadRequestException({
         success: false,
-        message: "以묐났?섎뒗 alias瑜?뺣낫?룄濡???ν븷 ???놁뒿?덈떎.",
+        message: "중복된 알리아스가 있습니다.",
         errors: [{ field: "matchAliases", reason: "SALES_UNIT_DUPLICATE_MATCH_ALIAS" }],
       });
     }
