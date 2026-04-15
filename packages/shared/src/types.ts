@@ -84,13 +84,13 @@ export interface CanonicalSalesUnit {
   normalizedMatchAliases: string[];
   linkedProductIds: string[];
   linkedOptionCodes: string[];
-  linkedManageCodes?: string[];
+  linkedManageCodes: string[];
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;
+  isStoreLevel: boolean;
   createdAt: string;
   updatedAt: string;
-  isStoreLevel?: boolean;
 }
 
 export interface OrderSourceSignature {

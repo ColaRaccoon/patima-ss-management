@@ -59,7 +59,7 @@ export class SalesUnitService {
     }
 
     // 없으면 자동 생성
-    const displayName = `[${store.name}] 전체 광고비`;
+    const displayName = "스토어 전체 광고비";
     const newUnit: CanonicalSalesUnit = {
       id: createId(),
       storeId,

@@ -737,11 +737,16 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   onChange={(event) => setSignatureSalesUnitId(event.target.value)}
                 >
                   <option value="">판매단위 선택</option>
-                  {data.salesUnits.map((salesUnit) => (
-                    <option key={salesUnit.id} value={salesUnit.id}>
-                      {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
-                    </option>
-                  ))}
+                  {[...data.salesUnits]
+                    .sort((a, b) => {
+                      if (a.isStoreLevel === b.isStoreLevel) return 0;
+                      return a.isStoreLevel ? -1 : 1;
+                    })
+                    .map((salesUnit) => (
+                      <option key={salesUnit.id} value={salesUnit.id}>
+                        {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
+                      </option>
+                    ))}
                 </select>
               </label>
 
@@ -970,11 +975,16 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   onChange={(event) => setAdCostSalesUnitId(event.target.value)}
                 >
                   <option value="">판매단위 선택</option>
-                  {data.salesUnits.map((salesUnit) => (
-                    <option key={salesUnit.id} value={salesUnit.id}>
-                      {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
-                    </option>
-                  ))}
+                  {[...data.salesUnits]
+                    .sort((a, b) => {
+                      if (a.isStoreLevel === b.isStoreLevel) return 0;
+                      return a.isStoreLevel ? -1 : 1;
+                    })
+                    .map((salesUnit) => (
+                      <option key={salesUnit.id} value={salesUnit.id}>
+                        {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
+                      </option>
+                    ))}
                 </select>
               </label>
 
@@ -1058,11 +1068,16 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               <span className="mb-2 block text-sm font-medium text-ink">판매단위</span>
               <select className="input-shell" value={campaignDraft.canonicalSalesUnitId} onChange={(event) => setCampaignDraft((current) => ({ ...current, canonicalSalesUnitId: event.target.value }))}>
                 <option value="">판매단위 선택</option>
-                {data.salesUnits.map((salesUnit) => (
-                  <option key={salesUnit.id} value={salesUnit.id}>
-                    {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
-                  </option>
-                ))}
+                {[...data.salesUnits]
+                  .sort((a, b) => {
+                    if (a.isStoreLevel === b.isStoreLevel) return 0;
+                    return a.isStoreLevel ? -1 : 1;
+                  })
+                  .map((salesUnit) => (
+                    <option key={salesUnit.id} value={salesUnit.id}>
+                      {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
+                    </option>
+                  ))}
               </select>
             </label>
 

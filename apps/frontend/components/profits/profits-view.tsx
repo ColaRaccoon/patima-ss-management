@@ -206,100 +206,111 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       ) : null}
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-        <Panel
-          title="일자별 손익 행"
-          description="행을 선택하면 해당 원가 구성과 제외된 합계를 확인할 수 있습니다."
-        >
-          <DataTable
-            caption="일자별 손익 행"
-            columns={[
-              {
-                key: "select",
-                title: "선택",
-                render: (row) => (
-                  <button
-                    className="button-shell button-ghost"
-                    type="button"
-                    onClick={async () => {
-                      const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
-                      if (rowKey === selectedProfitKey && selectedDetail?.date === row.date) {
-                        return;
-                      }
+        <div className="space-y-4">
+          {(() => {
+            const storeLevelRows = data.profits.filter((row) => row.isStoreLevel);
+            const regularRows = data.profits.filter((row) => !row.isStoreLevel);
 
-                      setSelectedProfitKey(rowKey);
-                      setDetailError(null);
-                      setIsLoadingDetail(true);
-                      try {
-                        const detail = await readApiResponse<DailySalesUnitDetail>(
-                          await fetch(
-                            `/api/profits/daily-sales-units/${row.canonicalSalesUnitId}?storeId=${data.primaryStore!.id}&date=${row.date}`,
-                            {
-                              cache: "no-store",
-                            },
-                          ),
-                          "손익 상세를 불러오지 못했습니다.",
-                        );
-                        setSelectedDetail(detail);
-                      } catch (error) {
-                        setDetailError(
-                          error instanceof Error ? error.message : "손익 상세를 불러오지 못했습니다.",
-                        );
-                      } finally {
-                        setIsLoadingDetail(false);
-                      }
-                    }}
-                  >
-                    {`${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey ? "선택됨" : "열기"}
-                  </button>
-                ),
-              },
-              {
-                key: "salesUnit",
-                title: "판매단위",
-                render: (row) => (
-                  <div className={row.isStoreLevel ? "bg-amber-50 rounded px-2 py-1" : ""}>
-                    <p className="font-semibold text-ink">
-                      {row.isStoreLevel ? `[스토어 전체] ${row.displayName}` : row.displayName}
-                    </p>
-                    <p className="mt-1 text-xs text-ink/55">{row.date}</p>
-                  </div>
-                ),
-              },
-              {
-                key: "quantity",
-                title: "수량",
-                render: (row) => (row.isStoreLevel ? "-" : formatNumber(row.totalQuantity)),
-              },
-              {
-                key: "revenue",
-                title: "상품 매출",
-                render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalProductRevenue)),
-              },
-              {
-                key: "adCost",
-                title: "광고비",
-                render: (row) => formatCurrency(row.totalAdCost),
-              },
-              {
-                key: "feeCost",
-                title: "수수료",
-                render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalFeeCost)),
-              },
-              {
-                key: "roughProfit",
-                title: "대략 손익",
-                render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.roughProfit)),
-              },
-              {
-                key: "netProfit",
-                title: "순이익",
-                render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.estimatedNetProfit)),
-              },
-            ]}
-            rows={data.profits}
-            getRowKey={(row) => `${row.canonicalSalesUnitId}-${row.date}`}
-          />
-        </Panel>
+            const renderTable = (rows: typeof data.profits, title: string) => (
+              <Panel title={title} description="행을 선택하면 해당 원가 구성과 제외된 합계를 확인할 수 있습니다.">
+                <DataTable
+                  caption={title}
+                  columns={[
+                    {
+                      key: "select",
+                      title: "선택",
+                      render: (row) => (
+                        <button
+                          className="button-shell button-ghost"
+                          type="button"
+                          onClick={async () => {
+                            const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
+                            if (rowKey === selectedProfitKey && selectedDetail?.date === row.date) {
+                              return;
+                            }
+
+                            setSelectedProfitKey(rowKey);
+                            setDetailError(null);
+                            setIsLoadingDetail(true);
+                            try {
+                              const detail = await readApiResponse<DailySalesUnitDetail>(
+                                await fetch(
+                                  `/api/profits/daily-sales-units/${row.canonicalSalesUnitId}?storeId=${data.primaryStore!.id}&date=${row.date}`,
+                                  {
+                                    cache: "no-store",
+                                  },
+                                ),
+                                "손익 상세를 불러오지 못했습니다.",
+                              );
+                              setSelectedDetail(detail);
+                            } catch (error) {
+                              setDetailError(
+                                error instanceof Error ? error.message : "손익 상세를 불러오지 못했습니다.",
+                              );
+                            } finally {
+                              setIsLoadingDetail(false);
+                            }
+                          }}
+                        >
+                          {`${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey ? "선택됨" : "열기"}
+                        </button>
+                      ),
+                    },
+                    {
+                      key: "salesUnit",
+                      title: "판매단위",
+                      render: (row) => (
+                        <div>
+                          <p className="font-semibold text-ink">{row.displayName}</p>
+                          <p className="mt-1 text-xs text-ink/55">{row.date}</p>
+                        </div>
+                      ),
+                    },
+                    {
+                      key: "quantity",
+                      title: "수량",
+                      render: (row) => (row.isStoreLevel ? "-" : formatNumber(row.totalQuantity)),
+                    },
+                    {
+                      key: "revenue",
+                      title: "상품 매출",
+                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalProductRevenue)),
+                    },
+                    {
+                      key: "adCost",
+                      title: "광고비",
+                      render: (row) => formatCurrency(row.totalAdCost),
+                    },
+                    {
+                      key: "feeCost",
+                      title: "수수료",
+                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalFeeCost)),
+                    },
+                    {
+                      key: "roughProfit",
+                      title: "대략 손익",
+                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.roughProfit)),
+                    },
+                    {
+                      key: "netProfit",
+                      title: "순이익",
+                      render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.estimatedNetProfit)),
+                    },
+                  ]}
+                  rows={rows}
+                  getRowKey={(row) => `${row.canonicalSalesUnitId}-${row.date}`}
+                />
+              </Panel>
+            );
+
+            return (
+              <>
+                {storeLevelRows.length > 0 && renderTable(storeLevelRows, "스토어 전체 광고비")}
+                {regularRows.length > 0 && renderTable(regularRows, "일자별 손익 행")}
+              </>
+            );
+          })()}
+        </div>
 
         <div className="space-y-6">
           <Panel title="제외된 합계">

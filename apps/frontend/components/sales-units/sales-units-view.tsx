@@ -208,7 +208,14 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                 title: "표시명",
                 render: (row) => (
                   <div>
-                    <p className="font-semibold text-ink">{row.displayName}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="font-semibold text-ink">{row.displayName}</p>
+                      {row.isStoreLevel && (
+                        <span className="inline-block rounded-full bg-blue-100 px-2 py-1 text-xs font-semibold text-blue-700">
+                          스토어 전체
+                        </span>
+                      )}
+                    </div>
                     <p className="mt-1 text-xs text-ink/55">
                       {row.matchAliases.length > 0 ? row.matchAliases.join(", ") : "alias 없음"}
                     </p>
@@ -243,7 +250,10 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
                 render: (row) => formatDate(row.deactivatedAt),
               },
             ]}
-            rows={data.salesUnits}
+            rows={[...data.salesUnits].sort((a, b) => {
+              if (a.isStoreLevel === b.isStoreLevel) return 0;
+              return a.isStoreLevel ? -1 : 1;
+            })}
             getRowKey={(row) => row.id}
           />
         </Panel>
@@ -252,124 +262,130 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
           title={isEditing ? "선택한 판매단위 수정" : "새 판매단위 만들기"}
           description="matchAliases는 한 줄에 하나씩 입력하면 자동 매핑 기준으로 사용됩니다."
         >
-          <form
-            className="space-y-4"
-            onSubmit={async (event: FormEvent<HTMLFormElement>) => {
-              event.preventDefault();
-              setErrorMessage(null);
-              setSuccessMessage(null);
+          {selectedSalesUnit?.isStoreLevel ? (
+            <div className="rounded-2xl border border-blue-200 bg-blue-50 px-4 py-4 text-sm leading-6 text-blue-700">
+              이 판매단위는 스토어 전체 광고비 버킷입니다. 카탈로그, 키워드타겟, 인피니티가드(단독) 등 스토어 전체를 대상으로 하는 광고가 자동으로 매핑됩니다. 편집할 수 없습니다.
+            </div>
+          ) : (
+            <form
+              className="space-y-4"
+              onSubmit={async (event: FormEvent<HTMLFormElement>) => {
+                event.preventDefault();
+                setErrorMessage(null);
+                setSuccessMessage(null);
 
-              if (!draft.displayName.trim()) {
-                setErrorMessage("표시 이름은 필수입니다.");
-                return;
-              }
+                if (!draft.displayName.trim()) {
+                  setErrorMessage("표시 이름은 필수입니다.");
+                  return;
+                }
 
-              setIsSubmitting(true);
-              try {
-                const response = await fetch(
-                  isEditing ? `/api/canonical-sales-units/${selectedSalesUnit!.id}` : "/api/canonical-sales-units",
-                  {
-                    method: isEditing ? "PATCH" : "POST",
-                    headers: {
-                      "Content-Type": "application/json",
+                setIsSubmitting(true);
+                try {
+                  const response = await fetch(
+                    isEditing ? `/api/canonical-sales-units/${selectedSalesUnit!.id}` : "/api/canonical-sales-units",
+                    {
+                      method: isEditing ? "PATCH" : "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                      },
+                      body: JSON.stringify({
+                        ...(isEditing ? {} : { storeId: primaryStore.id }),
+                        displayName: draft.displayName.trim(),
+                        matchAliases: parseAliases(draft.matchAliasesText),
+                        memo: draft.memo.trim() || null,
+                      }),
                     },
-                    body: JSON.stringify({
-                      ...(isEditing ? {} : { storeId: primaryStore.id }),
-                      displayName: draft.displayName.trim(),
-                      matchAliases: parseAliases(draft.matchAliasesText),
-                      memo: draft.memo.trim() || null,
-                    }),
-                  },
-                );
+                  );
 
-                const payload = (await response.json().catch(() => null)) as {
-                  message?: string;
-                  data?: { id?: string };
-                } | null;
-                if (!response.ok) {
-                  throw new Error(payload?.message ?? "판매단위 저장에 실패했습니다.");
+                  const payload = (await response.json().catch(() => null)) as {
+                    message?: string;
+                    data?: { id?: string };
+                  } | null;
+                  if (!response.ok) {
+                    throw new Error(payload?.message ?? "판매단위 저장에 실패했습니다.");
+                  }
+
+                  if (!isEditing && typeof payload?.data?.id === "string") {
+                    setPendingCreatedSalesUnitId(payload.data.id);
+                  }
+
+                  await refreshWithMessage(isEditing ? "판매단위를 수정했습니다." : "판매단위를 생성했습니다.");
+                } catch (error) {
+                  setErrorMessage(error instanceof Error ? error.message : "처리 중 오류가 발생했습니다.");
+                } finally {
+                  setIsSubmitting(false);
                 }
+              }}
+            >
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">표시 이름</span>
+                <input
+                  className="input-shell"
+                  placeholder="예: 코벨 다이어트 양말"
+                  value={draft.displayName}
+                  onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))}
+                />
+              </label>
 
-                if (!isEditing && typeof payload?.data?.id === "string") {
-                  setPendingCreatedSalesUnitId(payload.data.id);
-                }
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">matchAliases</span>
+                <textarea
+                  className="input-shell min-h-28"
+                  placeholder={"한 줄에 하나씩 alias를 입력하세요.\n코벨 다이어트 양말\n다이어트 양말\n코벨 다이어트"}
+                  value={draft.matchAliasesText}
+                  onChange={(event) => setDraft((current) => ({ ...current, matchAliasesText: event.target.value }))}
+                />
+              </label>
 
-                await refreshWithMessage(isEditing ? "판매단위를 수정했습니다." : "판매단위를 생성했습니다.");
-              } catch (error) {
-                setErrorMessage(error instanceof Error ? error.message : "처리 중 오류가 발생했습니다.");
-              } finally {
-                setIsSubmitting(false);
-              }
-            }}
-          >
-            <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">표시 이름</span>
-              <input
-                className="input-shell"
-                placeholder="예: 코벨 다이어트 양말"
-                value={draft.displayName}
-                onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))}
-              />
-            </label>
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">메모</span>
+                <textarea
+                  className="input-shell min-h-28"
+                  placeholder="설명 메모"
+                  value={draft.memo}
+                  onChange={(event) => setDraft((current) => ({ ...current, memo: event.target.value }))}
+                />
+              </label>
 
-            <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">matchAliases</span>
-              <textarea
-                className="input-shell min-h-28"
-                placeholder={"한 줄에 하나씩 alias를 입력하세요.\n코벨 다이어트 양말\n다이어트 양말\n코벨 다이어트"}
-                value={draft.matchAliasesText}
-                onChange={(event) => setDraft((current) => ({ ...current, matchAliasesText: event.target.value }))}
-              />
-            </label>
+              {errorMessage ? (
+                <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  {errorMessage}
+                </div>
+              ) : null}
 
-            <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">메모</span>
-              <textarea
-                className="input-shell min-h-28"
-                placeholder="설명 메모"
-                value={draft.memo}
-                onChange={(event) => setDraft((current) => ({ ...current, memo: event.target.value }))}
-              />
-            </label>
+              {successMessage ? (
+                <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+                  {successMessage}
+                </div>
+              ) : null}
 
-            {errorMessage ? (
-              <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                {errorMessage}
+              <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
+                비활성화된 판매단위는 과거 FK를 유지하지만 신규 자동 매핑과 비용 설정 대상에서는 제외됩니다.
               </div>
-            ) : null}
 
-            {successMessage ? (
-              <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-                {successMessage}
+              <div className="flex flex-wrap gap-3">
+                <button className="button-shell button-primary" type="submit" disabled={isBusy}>
+                  {isEditing ? "수정 저장" : "신규 저장"}
+                </button>
+                <button
+                  className="button-shell button-secondary"
+                  type="button"
+                  disabled={isBusy || !selectedSalesUnit || !selectedSalesUnit.isActive}
+                  onClick={() => handleToggle("deactivate")}
+                >
+                  비활성화
+                </button>
+                <button
+                  className="button-shell button-ghost"
+                  type="button"
+                  disabled={isBusy || !selectedSalesUnit || selectedSalesUnit.isActive}
+                  onClick={() => handleToggle("activate")}
+                >
+                  활성화
+                </button>
               </div>
-            ) : null}
-
-            <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-              비활성화된 판매단위는 과거 FK를 유지하지만 신규 자동 매핑과 비용 설정 대상에서는 제외됩니다.
-            </div>
-
-            <div className="flex flex-wrap gap-3">
-              <button className="button-shell button-primary" type="submit" disabled={isBusy}>
-                {isEditing ? "수정 저장" : "신규 저장"}
-              </button>
-              <button
-                className="button-shell button-secondary"
-                type="button"
-                disabled={isBusy || !selectedSalesUnit || !selectedSalesUnit.isActive}
-                onClick={() => handleToggle("deactivate")}
-              >
-                비활성화
-              </button>
-              <button
-                className="button-shell button-ghost"
-                type="button"
-                disabled={isBusy || !selectedSalesUnit || selectedSalesUnit.isActive}
-                onClick={() => handleToggle("activate")}
-              >
-                활성화
-              </button>
-            </div>
-          </form>
+            </form>
+          )}
         </Panel>
       </div>
     </div>

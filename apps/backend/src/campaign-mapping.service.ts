@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from "@nestjs/common";
-import { CampaignSalesUnitMapping } from "@patima/shared";
+import { CampaignSalesUnitMapping, DatabaseShape, normalizeText } from "@patima/shared";
 import { AuditLogService } from "./audit-log.service";
 import {
   normalizeCampaignPattern,
@@ -14,6 +14,7 @@ import {
   paginate,
 } from "./helpers";
 import { OperationService } from "./operation.service";
+import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 
 @Injectable()
@@ -23,6 +24,7 @@ export class CampaignMappingService implements OnModuleInit {
     private readonly storeService: StoreService,
     private readonly operationService: OperationService,
     private readonly auditLogService: AuditLogService,
+    private readonly salesUnitService: SalesUnitService,
   ) {}
 
   onModuleInit(): void {
@@ -32,10 +34,96 @@ export class CampaignMappingService implements OnModuleInit {
 
     const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
     storeIds.forEach((storeId) => {
+      // 먼저 스토어 레벨 판매단위 확인/생성 (write 외부에서 호출)
+      this.salesUnitService.ensureStoreLevelSalesUnit(storeId);
+
       this.databaseService.write((draft) => {
+        this.seedDefaultCampaignMappingsForStore(draft, storeId);
         recalculateAdMappingsForStore(draft, storeId);
       });
     });
+  }
+
+  /**
+   * 스토어당 첫 설정 시 기본 캠페인 매핑 패턴을 시드 데이터로 등록
+   * 이미 존재하는 패턴은 스킵하여 중복 방지 (idempotent)
+   * 스토어별로 필요한 매핑 룰을 DB에 저장하여 사용자가 수정/삭제 가능
+   */
+  private seedDefaultCampaignMappingsForStore(draft: DatabaseShape, storeId: string): void {
+    const snapshot = this.databaseService.getSnapshot();
+    const store = snapshot.stores.find((s) => s.id === storeId);
+    if (!store) return;
+
+    // 기본 패턴 정의: 계획서의 매핑 룰 기반
+    const defaultPatterns = [
+      { keyword: "한줄무릎보호대", displayNamePattern: "한줄 무릎보호대" },
+      { keyword: "두줄무릎보호대", displayNamePattern: "두줄 무릎보호대" },
+      { keyword: "인피니티가드_두줄", displayNamePattern: "두줄 무릎보호대" },
+      { keyword: "런닝양말", displayNamePattern: "러닝양말" },
+      { keyword: "다이어트양말", displayNamePattern: "다이어트양말" },
+      { keyword: "인피니티가드_다이어트양말", displayNamePattern: "다이어트양말" },
+      { keyword: "유쉴드", displayNamePattern: "자외선차단 마스크" },
+      { keyword: "유쉴드마스크", displayNamePattern: "자외선차단 마스크" },
+      { keyword: "카프슬리브", displayNamePattern: "쿨토시" },
+      { keyword: "카탈로그", displayNamePattern: "STORE_LEVEL" },
+      { keyword: "키워드타겟", displayNamePattern: "STORE_LEVEL" },
+      { keyword: "무릎보호대 이외", displayNamePattern: "STORE_LEVEL" },
+    ];
+
+    for (const pattern of defaultPatterns) {
+      const normalized = normalizeCampaignPattern(pattern.keyword);
+      if (!normalized) continue;
+
+      // 같은 정규화 패턴이 이미 존재하는지 확인 (idempotency)
+      const existing = snapshot.campaignMappings.find(
+        (item) =>
+          item.storeId === storeId &&
+          item.normalizedCampaignPattern === normalized &&
+          item.isActive,
+      );
+      if (existing) {
+        continue; // 이미 있으면 스킵
+      }
+
+      // 대상 판매단위 찾기
+      let targetSalesUnitId: string | null = null;
+
+      if (pattern.displayNamePattern === "STORE_LEVEL") {
+        // 스토어 레벨 판매단위 찾기 (ensureStoreLevelSalesUnit 호출로 이미 존재함)
+        const storeLevelUnit = snapshot.canonicalSalesUnits.find(
+          (u) => u.storeId === storeId && u.isStoreLevel === true,
+        );
+        targetSalesUnitId = storeLevelUnit?.id ?? null;
+      } else {
+        // 일반 판매단위 찾기
+        const targetUnit = snapshot.canonicalSalesUnits.find(
+          (u) =>
+            u.storeId === storeId &&
+            u.isActive &&
+            normalizeText(u.displayName) === normalizeText(pattern.displayNamePattern),
+        );
+        targetSalesUnitId = targetUnit?.id ?? null;
+      }
+
+      // 대상 판매단위가 없으면 스킵 (아직 생성되지 않은 판매단위)
+      if (!targetSalesUnitId) {
+        continue;
+      }
+
+      // 새 매핑 패턴 등록
+      draft.campaignMappings.push({
+        id: createId(),
+        storeId,
+        channel: "NAVER_DA",
+        canonicalSalesUnitId: targetSalesUnitId,
+        campaignPattern: pattern.keyword,
+        normalizedCampaignPattern: normalized,
+        isActive: true,
+        deactivatedAt: null,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      });
+    }
   }
 
   list(storeId: string, page?: number, pageSize?: number) {

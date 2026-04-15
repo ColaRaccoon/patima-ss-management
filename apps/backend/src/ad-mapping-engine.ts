@@ -308,7 +308,7 @@ export const recalculateAdMappingsForStore = (database: DatabaseShape, storeId: 
       database.canonicalSalesUnits.push({
         id: createId(),
         storeId,
-        displayName: `[${store.name}] 전체 광고비`,
+        displayName: "스토어 전체 광고비",
         matchAliases: [],
         normalizedMatchAliases: [],
         linkedProductIds: [],

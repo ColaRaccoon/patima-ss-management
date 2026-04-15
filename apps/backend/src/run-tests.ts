@@ -31,9 +31,13 @@ const createSalesUnit = (id: string, displayName: string, matchAliases: string[]
     displayName,
     matchAliases,
     normalizedMatchAliases: matchAliases.map((alias) => alias.replace(/[^\p{L}\p{N}]+/gu, "").toLowerCase()),
+    linkedProductIds: [],
+    linkedOptionCodes: [],
+    linkedManageCodes: [],
     memo: null,
     isActive: true,
     deactivatedAt: null,
+    isStoreLevel: false,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }) as never;

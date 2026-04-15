@@ -109,7 +109,7 @@ export const getActiveSalesUnitsForIdMapping = (
     (item) =>
       item.storeId === storeId &&
       item.isActive &&
-      ((item.linkedOptionCodes ?? []).length > 0 || (item.linkedProductIds ?? []).length > 0),
+      ((item.linkedOptionCodes ?? []).length > 0 || (item.linkedProductIds ?? []).length > 0 || (item.linkedManageCodes ?? []).length > 0),
   );
 
 export const resolveOrderSignatureAutoMapping = (
@@ -202,9 +202,11 @@ export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeI
   );
 
   // 성능 최적화: ID 매핑용 Map 캐시 생성
+  const manageCodeMap = new Map<string, string>();
   const optionCodeMap = new Map<string, string>();
   const productIdMap = new Map<string, string>();
   idMappingSalesUnits.forEach((unit) => {
+    (unit.linkedManageCodes ?? []).forEach((code) => manageCodeMap.set(code, unit.id));
     (unit.linkedOptionCodes ?? []).forEach((code) => optionCodeMap.set(code, unit.id));
     (unit.linkedProductIds ?? []).forEach((id) => productIdMap.set(id, unit.id));
   });
@@ -235,11 +237,9 @@ export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeI
 
         // 우선순위 2: ID 매핑 시도 (optionManageCode → linkedManageCodes)
         if (isBundledItem && item.optionManageCode) {
-          const matched = idMappingSalesUnits.find((u) =>
-            u.linkedManageCodes?.includes(item.optionManageCode!),
-          );
-          if (matched) {
-            resolvedUnitId = matched.id;
+          const resolvedId = manageCodeMap.get(item.optionManageCode);
+          if (resolvedId) {
+            resolvedUnitId = resolvedId;
             mappingMethod = "optionManageCode";
           }
         }

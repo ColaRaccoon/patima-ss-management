@@ -136,9 +136,8 @@ export class MappingSeedService {
             // (파싱된 텍스트값 "블랙"이 아닌 네이버 숫자 코드 "3327191532")
             if (item.optionCode) group.optionCodes.add(item.optionCode);
             // optionManageCode가 있으면 관리코드도 저장
-            const manageCode = (item.rawPayload as any)?.detail?.productOrder?.optionManageCode;
-            if (manageCode && typeof manageCode === 'string' && manageCode.trim()) {
-              group.manageCodes.add(manageCode.trim());
+            if (item.optionManageCode) {
+              group.manageCodes.add(item.optionManageCode);
             }
             group.rawProductNames.add(item.rawProductName);
           });
@@ -215,6 +214,7 @@ export class MappingSeedService {
             displayName: existing.displayName,
             linkedProductIds: existing.linkedProductIds,
             linkedOptionCodes: existing.linkedOptionCodes,
+            linkedManageCodes: existing.linkedManageCodes,
           });
         } else {
           // ID 기반 매핑만 사용 — matchAliases 비워서 텍스트 충돌 방지
@@ -233,6 +233,7 @@ export class MappingSeedService {
             displayName: newUnit.displayName,
             linkedProductIds: newUnit.linkedProductIds,
             linkedOptionCodes: newUnit.linkedOptionCodes,
+            linkedManageCodes: newUnit.linkedManageCodes,
           });
         }
       });
@@ -242,14 +243,14 @@ export class MappingSeedService {
         const displayName = group.category;
         const optionCodes = Array.from(group.optionCodes);
         const manageCodes = Array.from(group.manageCodes);
-        const existing = this.findExistingSalesUnit(draft, storeId, displayName);
+        const existing = this.findExistingSalesUnit(draft, storeId, displayName, manageCodes);
 
         if (existing) {
           const uniqueOptionCodes = Array.from(
             new Set([...existing.linkedOptionCodes, ...optionCodes]),
           );
           const uniqueManageCodes = manageCodes.length > 0
-            ? Array.from(new Set([...(existing.linkedManageCodes ?? []), ...manageCodes]))
+            ? Array.from(new Set([...existing.linkedManageCodes, ...manageCodes]))
             : existing.linkedManageCodes;
           existing.linkedOptionCodes = uniqueOptionCodes;
           if (manageCodes.length > 0) {
@@ -383,16 +384,14 @@ export class MappingSeedService {
       normalizedMatchAliases,
       linkedProductIds,
       linkedOptionCodes,
+      linkedManageCodes: linkedManageCodes || [],
       memo: null,
       isActive: true,
       deactivatedAt: null,
+      isStoreLevel: false,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
-
-    if (linkedManageCodes && linkedManageCodes.length > 0) {
-      unit.linkedManageCodes = linkedManageCodes;
-    }
 
     return unit;
   }
@@ -401,12 +400,25 @@ export class MappingSeedService {
     database: any,
     storeId: string,
     displayName: string,
+    linkedManageCodes?: string[],
   ): CanonicalSalesUnit | null {
     return (
       database.canonicalSalesUnits.find(
-        (unit: CanonicalSalesUnit) =>
-          unit.storeId === storeId &&
-          unit.displayName.toLowerCase() === displayName.toLowerCase(),
+        (unit: CanonicalSalesUnit) => {
+          const storeAndNameMatch =
+            unit.storeId === storeId &&
+            unit.displayName.toLowerCase() === displayName.toLowerCase();
+
+          // Secondary matcher: if linkedManageCodes provided, require overlap with existing
+          if (storeAndNameMatch && linkedManageCodes && linkedManageCodes.length > 0) {
+            const hasOverlap = linkedManageCodes.some((code) =>
+              unit.linkedManageCodes.includes(code),
+            );
+            return hasOverlap;
+          }
+
+          return storeAndNameMatch;
+        },
       ) ?? null
     );
   }

@@ -105,7 +105,7 @@ export interface SalesUnitListItem {
   memo: string | null;
   isActive: boolean;
   deactivatedAt: string | null;
-  isStoreLevel?: boolean;
+  isStoreLevel: boolean;
 }
 
 export interface AdUploadListItem {
