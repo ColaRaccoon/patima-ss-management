@@ -18,6 +18,7 @@ import { NaverCommerceService, createNaverClientSecretSign } from "./naver-comme
 import { OrderMappingService } from "./order-mapping.service";
 import { ProfitService } from "./profit.service";
 import { recalculateOrderMappingsForStore, resolveOrderSignatureAutoMapping } from "./sales-unit-auto-mapper";
+import { isMeaningfulName, extractNameFromOptionInfo, enrichSignatureDisplayName } from "./signature-enrichment";
 
 const run = (name: string, fn: () => void) => {
   fn();
@@ -1290,6 +1291,262 @@ run("AdsService setIntentionalUnmappedMany applies one note to multiple rows", (
     assert.equal(item.reasonNote, "merged into brand spend");
     assert.equal(item.reasonNoteInherited, false);
   });
+});
+
+// ========== Signature Enrichment Tests ==========
+
+run("isMeaningfulName rejects empty/null/whitespace strings", () => {
+  assert.equal(isMeaningfulName(null), false);
+  assert.equal(isMeaningfulName(undefined), false);
+  assert.equal(isMeaningfulName(""), false);
+  assert.equal(isMeaningfulName("   "), false);
+});
+
+run("isMeaningfulName rejects strings with length <= 2", () => {
+  assert.equal(isMeaningfulName("L"), false);
+  assert.equal(isMeaningfulName("XL"), false);
+  assert.equal(isMeaningfulName("M"), false);
+  assert.equal(isMeaningfulName("s"), false);
+  assert.equal(isMeaningfulName("XS"), false);
+});
+
+run("isMeaningfulName rejects size/option patterns (case-insensitive)", () => {
+  assert.equal(isMeaningfulName("xs"), false);
+  assert.equal(isMeaningfulName("XS"), false);
+  assert.equal(isMeaningfulName("s"), false);
+  assert.equal(isMeaningfulName("m"), false);
+  assert.equal(isMeaningfulName("l"), false);
+  assert.equal(isMeaningfulName("xl"), false);
+  assert.equal(isMeaningfulName("xxl"), false);
+  assert.equal(isMeaningfulName("free"), false);
+  assert.equal(isMeaningfulName("one"), false);
+  assert.equal(isMeaningfulName("원사이즈"), false);
+  assert.equal(isMeaningfulName("32"), false);
+  assert.equal(isMeaningfulName("36"), false);
+});
+
+run("isMeaningfulName rejects values contained in context option info", () => {
+  const contextOption = "[함께배송⭐추가할인]러닝깔창: L";
+  assert.equal(isMeaningfulName("L", contextOption), false);
+  assert.equal(isMeaningfulName("l", contextOption), false); // case-insensitive check
+});
+
+run("isMeaningfulName accepts meaningful product names", () => {
+  assert.equal(isMeaningfulName("러닝깔창"), true);
+  assert.equal(isMeaningfulName("베놈 무릎보호대"), true);
+  assert.equal(isMeaningfulName("Running Hat"), true);
+  assert.equal(isMeaningfulName("ABC"), true); // length >= 3
+});
+
+run("extractNameFromOptionInfo parses pattern correctly", () => {
+  assert.equal(
+    extractNameFromOptionInfo("[함께배송⭐추가할인]러닝깔창: L"),
+    "러닝깔창"
+  );
+  assert.equal(
+    extractNameFromOptionInfo("[TAG]상품명: 사이즈"),
+    "상품명"
+  );
+  assert.equal(
+    extractNameFromOptionInfo("무릎보호대: XL"),
+    "무릎보호대"
+  );
+});
+
+run("extractNameFromOptionInfo returns null for non-matching patterns", () => {
+  assert.equal(extractNameFromOptionInfo("no colon here"), null);
+  assert.equal(extractNameFromOptionInfo(""), null);
+  assert.equal(extractNameFromOptionInfo(null as never), null);
+});
+
+run("enrichSignatureDisplayName returns snapshot when meaningful", async () => {
+  const database = createEmptyDatabase();
+  const signature = {
+    id: "sig-1",
+    storeId: "store-1",
+    sourceSignature: "sig",
+    rawProductNameSnapshot: "러닝깔창",
+    rawOptionInfoSnapshot: null,
+    normalizedProductName: "러닝깔창",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED" as const,
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const result = await enrichSignatureDisplayName(database, signature);
+  assert.equal(result.fallbackProductName, "러닝깔창");
+  assert.equal(result.fallbackProductNameSource, "snapshot");
+});
+
+run("enrichSignatureDisplayName falls back to orderItem rawProductName", async () => {
+  const database = createEmptyDatabase();
+  const signature = {
+    id: "sig-1",
+    storeId: "store-1",
+    sourceSignature: "sig",
+    rawProductNameSnapshot: "",
+    rawOptionInfoSnapshot: null,
+    normalizedProductName: "",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED" as const,
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  database.orderItems.push({
+    id: "item-1",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "ext-1",
+    externalProductId: null,
+    optionCode: null,
+    packageNumber: null,
+    rawProductName: "베놈 무릎보호대",
+    rawOptionInfo: null,
+    normalizedProductName: "베놈 무릎보호대",
+    normalizedOptionInfo: "",
+    sourceSignature: "sig",
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: null,
+    deliveryFeeAmount: null,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: null,
+    paymentDate: null,
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+
+  const result = await enrichSignatureDisplayName(database, signature);
+  assert.equal(result.fallbackProductName, "베놈 무릎보호대");
+  assert.equal(result.fallbackProductNameSource, "orderItem");
+});
+
+run("enrichSignatureDisplayName extracts from option info pattern", async () => {
+  const database = createEmptyDatabase();
+  const signature = {
+    id: "sig-1",
+    storeId: "store-1",
+    sourceSignature: "sig",
+    rawProductNameSnapshot: "",
+    rawOptionInfoSnapshot: "[함께배송⭐추가할인]러닝깔창: L",
+    normalizedProductName: "",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED" as const,
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const result = await enrichSignatureDisplayName(database, signature);
+  assert.equal(result.fallbackProductName, "러닝깔창");
+  assert.equal(result.fallbackProductNameSource, "optionInfo");
+});
+
+run("enrichSignatureDisplayName matches product by externalProductId", async () => {
+  const database = createEmptyDatabase();
+  const signature = {
+    id: "sig-1",
+    storeId: "store-1",
+    sourceSignature: "sig",
+    rawProductNameSnapshot: "",
+    rawOptionInfoSnapshot: null,
+    normalizedProductName: "",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED" as const,
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  database.orderItems.push({
+    id: "item-1",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "ext-1",
+    externalProductId: "prod-123",
+    optionCode: null,
+    packageNumber: null,
+    rawProductName: "L",
+    rawOptionInfo: null,
+    normalizedProductName: "l",
+    normalizedOptionInfo: "",
+    sourceSignature: "sig",
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: null,
+    deliveryFeeAmount: null,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: null,
+    paymentDate: null,
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.products.push({
+    id: "p-1",
+    storeId: "store-1",
+    externalProductId: "prod-123",
+    productName: "고급 러닝화",
+    normalizedProductName: "고급 러닝화",
+    status: null,
+    firstSeenAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  const result = await enrichSignatureDisplayName(database, signature);
+  assert.equal(result.fallbackProductName, "고급 러닝화");
+  assert.equal(result.fallbackProductNameSource, "product");
+});
+
+run("enrichSignatureDisplayName returns null when all fallbacks fail", async () => {
+  const database = createEmptyDatabase();
+  const signature = {
+    id: "sig-1",
+    storeId: "store-1",
+    sourceSignature: "sig",
+    rawProductNameSnapshot: "",
+    rawOptionInfoSnapshot: null,
+    normalizedProductName: "",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED" as const,
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const result = await enrichSignatureDisplayName(database, signature);
+  assert.equal(result.fallbackProductName, null);
+  assert.equal(result.fallbackProductNameSource, null);
 });
 
 console.log("All backend checks passed.");

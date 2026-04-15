@@ -12,6 +12,7 @@ import { StatusBadge } from "@/components/shared/status-badge";
 import { readApiResponse } from "@/lib/api/browser";
 import type { OrdersPageData, OrdersPageFilters } from "@/lib/api/types";
 import {
+  buildNaverStoreProductUrl,
   formatCurrency,
   formatDate,
   formatDateRange,
@@ -467,6 +468,44 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                   <p className="mt-1 text-xs text-ink/55">
                     {row.rawProductNameSnapshot} / {formatNullableText(row.rawOptionInfoSnapshot)}
                   </p>
+                  {row.fallbackProductName && (
+                    <p className="mt-2 text-xs text-ink/45">
+                      ↳{" "}
+                      <span>
+                        {row.fallbackProductName}{" "}
+                        <span className="text-ink/35">
+                          (
+                          {row.fallbackProductNameSource === "orderItem"
+                            ? "원본 주문 표기"
+                            : row.fallbackProductNameSource === "optionInfo"
+                            ? "옵션에서 추출"
+                            : row.fallbackProductNameSource === "product"
+                            ? "상품 DB 매칭"
+                            : row.fallbackProductNameSource === "commerceApi"
+                            ? "네이버 커머스 API"
+                            : "상품 정보 없음"}
+                          )
+                        </span>
+                      </span>
+                    </p>
+                  )}
+                  {row.externalProductId && !row.fallbackProductName && row.fallbackProductNameSource === null && (
+                    <p className="mt-2 text-xs text-ink/45">
+                      ↳{" "}
+                      {buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ? (
+                        <a
+                          href={buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ?? ""}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-ink/50 underline hover:text-ink/70"
+                        >
+                          네이버 스토어 열기 ↗
+                        </a>
+                      ) : (
+                        <span className="text-ink/35">(상품 정보 없음)</span>
+                      )}
+                    </p>
+                  )}
                 </div>
               ),
             },

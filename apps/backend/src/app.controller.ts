@@ -132,7 +132,7 @@ export class AppController {
   }
 
   @Get("order-source-signatures")
-  getOrderSourceSignatures(
+  async getOrderSourceSignatures(
     @Query("storeId") storeId: string,
     @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("q") q?: string,

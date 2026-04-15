@@ -82,3 +82,13 @@ export function formatDateRange(from: string, to: string) {
 export function formatNullableText(value: string | null | undefined) {
   return value && value.trim().length > 0 ? value : "-";
 }
+
+export function buildNaverStoreProductUrl(
+  storeSlug: string | null | undefined,
+  externalProductId: string | null | undefined,
+): string | null {
+  if (!storeSlug || !externalProductId) {
+    return null;
+  }
+  return `https://smartstore.naver.com/${storeSlug}/products/${externalProductId}`;
+}

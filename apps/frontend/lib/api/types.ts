@@ -95,6 +95,9 @@ export interface OrderSourceSignatureListItem {
   usageCount: number;
   externalProductId: string | null;
   optionCode: string | null;
+  fallbackProductName: string | null;
+  fallbackProductNameSource: "snapshot" | "orderItem" | "optionInfo" | "product" | "commerceApi" | null;
+  storeSlug: string | null;
 }
 
 export interface SalesUnitListItem {

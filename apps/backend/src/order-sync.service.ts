@@ -17,6 +17,7 @@ import {
 import { NaverCommerceService, SyncedOrderItemInput } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
 import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
+import { enrichSignatureDisplayName, type EnrichmentContext } from "./signature-enrichment";
 
 interface OrderTemplate {
   productName: string;
@@ -345,7 +346,7 @@ export class OrderSyncService implements OnModuleInit {
     );
   }
 
-  listOrderSourceSignatures(query: {
+  async listOrderSourceSignatures(query: {
     storeId: string;
     mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
     q?: string;
@@ -371,7 +372,7 @@ export class OrderSyncService implements OnModuleInit {
         }
       });
 
-    const items = snapshot.orderSourceSignatures
+    const filteredSignatures = snapshot.orderSourceSignatures
       .filter((item) => item.storeId === query.storeId)
       .filter((item) =>
         query.mappingStatus && query.mappingStatus !== "ALL"
@@ -385,9 +386,31 @@ export class OrderSyncService implements OnModuleInit {
             normalizeText(item.sourceSignature).includes(keyword)
           : true,
       )
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .map((item) => {
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+    // Precompute context to avoid N+1 queries during enrichment
+    // Build map of signature ID -> related order items
+    const signatureItemsMap = new Map<string, typeof snapshot.orderItems>();
+    filteredSignatures.forEach((sig) => {
+      const relatedItems = snapshot.orderItems.filter(
+        (item) => item.orderSourceSignatureId === sig.id,
+      );
+      signatureItemsMap.set(sig.id, relatedItems);
+    });
+
+    // Build map of (externalProductId:storeId) -> product info
+    const productsByIdMap = new Map<string, { productName: string | null }>();
+    snapshot.products.forEach((product) => {
+      const key = `${product.externalProductId}:${product.storeId}`;
+      productsByIdMap.set(key, { productName: product.productName });
+    });
+
+    const enrichmentContext = { signatureItemsMap, productsByIdMap };
+
+    const items = await Promise.all(
+      filteredSignatures.map(async (item) => {
         const salesUnit = snapshot.canonicalSalesUnits.find((entry) => entry.id === item.canonicalSalesUnitId);
+        const enriched = await enrichSignatureDisplayName(snapshot, item, enrichmentContext);
         return {
           id: item.id,
           rawProductNameSnapshot: item.rawProductNameSnapshot,
@@ -399,8 +422,12 @@ export class OrderSyncService implements OnModuleInit {
           usageCount: usageMap.get(item.id) ?? 0,
           externalProductId: signatureExternalProductIdMap.get(item.id) ?? null,
           optionCode: signatureOptionCodeMap.get(item.id) ?? null,
+          fallbackProductName: enriched.fallbackProductName,
+          fallbackProductNameSource: enriched.fallbackProductNameSource,
+          storeSlug: null,
         };
-      });
+      })
+    );
 
     return formatApiSuccess(paginate(items, query.page, query.pageSize));
   }
