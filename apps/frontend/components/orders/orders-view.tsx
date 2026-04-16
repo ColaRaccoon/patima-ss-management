@@ -159,14 +159,14 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                 void startOrderSync(
                   {
                     dateFrom: filters.dateFrom,
-                    dateTo: filters.dateTo,
+                    dateTo: filters.dateFrom,
                   },
                   "\uC120\uD0DD \uAE30\uAC04 \uC8FC\uBB38 \uB3D9\uAE30\uD654 \uC2DC\uC791\uC5D0 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4.",
-                  `\uC120\uD0DD \uAE30\uAC04(${filters.dateFrom} ~ ${filters.dateTo}) \uC8FC\uBB38 \uB3D9\uAE30\uD654\uB97C \uC791\uC5C5 \uD050\uC5D0 \uB4F1\uB85D\uD588\uC2B5\uB2C8\uB2E4.`,
+                  `\uC120\uD0DD \uB0A0\uC9DC(${filters.dateFrom}) \uC8FC\uBB38 \uB3D9\uAE30\uD654\uB97C \uC791\uC5C5 \uD050\uC5D0 \uB4F1\uB85D\uD588\uC2B5\uB2C8\uB2E4.`,
                 )
               }
             >
-              {"\uC120\uD0DD \uAE30\uAC04 \uB3D9\uAE30\uD654"}
+              {"\uC120\uD0DD \uB0A0\uC9DC \uB3D9\uAE30\uD654"}
             </button>
             <Link className="button-shell button-primary" href="/operations">
               작업 상세 보기
@@ -180,10 +180,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.25fr)_minmax(320px,0.75fr)]">
         <Panel
           title="조회 필터"
-          description={`현재 조회 범위 ${formatDateRange(
-            data.filters.dateFrom,
-            data.filters.dateTo,
-          )}`}
+          description={`현재 선택 날짜 ${formatDate(filters.dateFrom)}`}
         >
           <form
             className="space-y-4"
@@ -196,25 +193,18 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
           >
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">dateFrom</span>
+                <span className="mb-2 block text-sm font-medium text-ink">조회 날짜</span>
                 <input
                   className="input-shell"
                   type="date"
                   value={filters.dateFrom}
-                  onChange={(event) =>
-                    setFilters((current) => ({ ...current, dateFrom: event.target.value }))
-                  }
-                />
-              </label>
-              <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">dateTo</span>
-                <input
-                  className="input-shell"
-                  type="date"
-                  value={filters.dateTo}
-                  onChange={(event) =>
-                    setFilters((current) => ({ ...current, dateTo: event.target.value }))
-                  }
+                  onChange={(event) => {
+                    setErrorMessage(null);
+                    setSuccessMessage(null);
+                    setFilters((current) => ({ ...current, dateFrom: event.target.value, dateTo: event.target.value }));
+                    const nextFilters = { ...filters, dateFrom: event.target.value, dateTo: event.target.value };
+                    applyFilters(nextFilters);
+                  }}
                 />
               </label>
               <label className="block">
@@ -327,7 +317,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                 onClick={() => {
                   const resetFilters: OrdersPageFilters = {
                     dateFrom: data.filters.dateFrom,
-                    dateTo: data.filters.dateTo,
+                    dateTo: data.filters.dateFrom,
                     productName: "",
                     optionInfo: "",
                     mappingStatus: "ALL",

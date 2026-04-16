@@ -20,7 +20,6 @@ function emptyDraft() {
     feeRate: "",
     otherCost: "",
     effectiveFrom: "",
-    effectiveTo: "",
   };
 }
 
@@ -31,7 +30,6 @@ export function CostsView({ data }: { data: CostsPageData }) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isClosing, setIsClosing] = useState(false);
   const [isDeactivating, setIsDeactivating] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
 
@@ -55,7 +53,6 @@ export function CostsView({ data }: { data: CostsPageData }) {
       feeRate: selectedCostSetting.feeRate == null ? "" : String(selectedCostSetting.feeRate),
       otherCost: String(selectedCostSetting.otherCost),
       effectiveFrom: selectedCostSetting.effectiveFrom,
-      effectiveTo: selectedCostSetting.effectiveTo ?? selectedCostSetting.effectiveFrom,
     });
   }, [data.salesUnits, selectedCostSetting]);
 
@@ -70,7 +67,7 @@ export function CostsView({ data }: { data: CostsPageData }) {
     );
   }
 
-  const isBusy = isSubmitting || isClosing || isDeactivating || isRefreshing;
+  const isBusy = isSubmitting || isDeactivating || isRefreshing;
   const isEditing = Boolean(selectedCostSetting);
 
   const refreshWithMessage = (message: string) => {
@@ -93,7 +90,7 @@ export function CostsView({ data }: { data: CostsPageData }) {
       <PageHeader
         eyebrow="Costs"
         title="원가와 fallback 수수료율 관리"
-        description="비용 row를 생성하고, 적용 전 row는 수정/비활성화, 활성 row는 종료일까지 관리할 수 있습니다."
+        description="비용 row를 생성하고, 적용 전 row는 수정/비활성화할 수 있습니다."
         actions={
           <>
             <Link className="button-shell button-secondary" href="/sales-units">
@@ -124,7 +121,7 @@ export function CostsView({ data }: { data: CostsPageData }) {
       <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
         <Panel
           title={isEditing ? "선택한 비용 row 관리" : "비용 입력"}
-          description="feeRate는 0.035 = 3.5% 형식입니다. 수정은 아직 적용되지 않은 row에서만 가능합니다."
+          description="feeRate는 0.035 = 3.5% 형식입니다. 수정은 아직 적용되지 않은 row에서만 가능합니다. 종료일 설정은 지원하지 않습니다."
         >
           <form
             className="space-y-4"
@@ -210,11 +207,13 @@ export function CostsView({ data }: { data: CostsPageData }) {
                   setDraft((current) => ({ ...current, salesUnitId: event.target.value }))
                 }
               >
-                {data.salesUnits.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.displayName}
-                  </option>
-                ))}
+                {data.salesUnits
+                  .filter((item) => !item.isGroup && !item.isStoreLevel)
+                  .map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.displayName}
+                    </option>
+                  ))}
               </select>
             </label>
 
@@ -273,20 +272,6 @@ export function CostsView({ data }: { data: CostsPageData }) {
               />
             </label>
 
-            {isEditing ? (
-              <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">종료일 effectiveTo</span>
-                <input
-                  className="input-shell"
-                  type="date"
-                  value={draft.effectiveTo}
-                  onChange={(event) =>
-                    setDraft((current) => ({ ...current, effectiveTo: event.target.value }))
-                  }
-                />
-              </label>
-            ) : null}
-
             {errorMessage ? (
               <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
                 {errorMessage}
@@ -300,58 +285,12 @@ export function CostsView({ data }: { data: CostsPageData }) {
             ) : null}
 
             <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-              현재 row의 action flag를 확인해 수정 가능 여부를 판단합니다. 적용된 row는 종료만 가능하고,
-              미적용 row만 수정/비활성화할 수 있습니다.
+              현재 row의 action flag를 확인해 수정 가능 여부를 판단합니다. 미적용 row만 수정/비활성화할 수 있습니다.
             </div>
 
             <div className="flex flex-wrap gap-3">
               <button className="button-shell button-primary" type="submit" disabled={isBusy}>
                 {isEditing ? "수정 저장" : "비용 row 추가"}
-              </button>
-              <button
-                className="button-shell button-secondary"
-                type="button"
-                disabled={isBusy || !selectedCostSetting || !selectedCostSetting.canClose}
-                onClick={async () => {
-                  if (!selectedCostSetting) {
-                    return;
-                  }
-                  setErrorMessage(null);
-                  setSuccessMessage(null);
-                  if (!draft.effectiveTo.trim()) {
-                    setErrorMessage("종료일을 입력해 주세요.");
-                    return;
-                  }
-
-                  setIsClosing(true);
-                  try {
-                    await readApiResponse(
-                      await fetch(
-                        `/api/sales-unit-cost-settings/${selectedCostSetting.id}/close`,
-                        {
-                          method: "POST",
-                          headers: {
-                            "Content-Type": "application/json",
-                          },
-                          body: JSON.stringify({
-                            effectiveTo: draft.effectiveTo,
-                          }),
-                        },
-                      ),
-                      "비용 row 종료에 실패했습니다.",
-                    );
-
-                    refreshWithMessage("비용 row 종료일을 저장했습니다.");
-                  } catch (error) {
-                    setErrorMessage(
-                      error instanceof Error ? error.message : "비용 row 종료 중 오류가 발생했습니다.",
-                    );
-                  } finally {
-                    setIsClosing(false);
-                  }
-                }}
-              >
-                종료일 저장
               </button>
               <button
                 className="button-shell button-ghost"
@@ -424,13 +363,8 @@ export function CostsView({ data }: { data: CostsPageData }) {
               },
               {
                 key: "period",
-                title: "적용 기간",
-                render: (row) => (
-                  <div>
-                    <p>{formatDate(row.effectiveFrom)}</p>
-                    <p className="mt-1 text-xs text-ink/55">{formatDate(row.effectiveTo)}</p>
-                  </div>
-                ),
+                title: "시작일",
+                render: (row) => <p>{formatDate(row.effectiveFrom)}</p>,
               },
               {
                 key: "costs",
@@ -450,8 +384,7 @@ export function CostsView({ data }: { data: CostsPageData }) {
                 render: (row) => (
                   <div className="space-y-1 text-xs text-ink/65">
                     <p>applied {formatNumber(row.appliedOrderItemCount)}</p>
-                    <p>edit {String(row.canEdit)} / close {String(row.canClose)}</p>
-                    <p>deactivate {String(row.canDeactivate)}</p>
+                    <p>edit {String(row.canEdit)} / deactivate {String(row.canDeactivate)}</p>
                     <p>{row.blockingReason ?? "-"}</p>
                   </div>
                 ),

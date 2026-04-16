@@ -233,6 +233,12 @@ export class SalesUnitService {
       target.isActive = false;
       target.deactivatedAt = nowIso();
       target.updatedAt = nowIso();
+      // 비활성 유닛을 가리키는 시그니처 매핑 해제 (stale fallback 방지)
+      draft.orderSourceSignatures
+        .filter((s) => s.canonicalSalesUnitId === salesUnitId)
+        .forEach((s) => {
+          s.canonicalSalesUnitId = null;
+        });
       recalculateOrderMappingsForStore(draft, existing.storeId);
       recalculateAdMappingsForStore(draft, existing.storeId);
     });

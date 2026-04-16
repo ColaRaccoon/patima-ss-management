@@ -268,8 +268,11 @@ export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeI
         if (!resolvedUnitId && signature) {
           const signatureStatus = getSignatureMappingStatus(signature);
           if (signatureStatus === "MAPPED" && signature.canonicalSalesUnitId) {
-            resolvedUnitId = signature.canonicalSalesUnitId;
-            mappingMethod = "text-fallback";
+            const sigUnit = salesUnitsById.get(signature.canonicalSalesUnitId);
+            if (sigUnit?.isActive) {
+              resolvedUnitId = signature.canonicalSalesUnitId;
+              mappingMethod = "text-fallback";
+            }
           }
         }
       }

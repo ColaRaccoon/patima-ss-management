@@ -219,13 +219,17 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const [selectedSignatureIds, setSelectedSignatureIds] = useState<string[]>([]);
   const [selectedMappingId, setSelectedMappingId] = useState<string | null>(data.campaignMappings[0]?.id ?? null);
   const [selectedAdCostIds, setSelectedAdCostIds] = useState<string[]>([]);
-  const [signatureSalesUnitId, setSignatureSalesUnitId] = useState(data.salesUnits[0]?.id ?? "");
+  const [signatureSalesUnitId, setSignatureSalesUnitId] = useState(
+    data.salesUnits.find((u) => u.isActive && !u.isGroup && !u.isStoreLevel)?.id ?? "",
+  );
   const [signatureDraft, setSignatureDraft] = useState(emptySignatureDraft());
   const [campaignDraft, setCampaignDraft] = useState(
     emptyCampaignDraft(data.campaignMappings[0]?.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? ""),
   );
   const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(data.salesUnits[0]?.id ?? "");
   const [hideZeroCostAdRows, setHideZeroCostAdRows] = useState(true);
+  const [showOnlyUnmapped, setShowOnlyUnmapped] = useState(false);
+  const [hideZeroOrderSignatures, setHideZeroOrderSignatures] = useState(true);
   const [intentionalReason, setIntentionalReason] = useState("");
   const [orderSearch, setOrderSearch] = useState("");
   const [adSearch, setAdSearch] = useState("");
@@ -241,6 +245,9 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const [isRefreshing, startRefresh] = useTransition();
   const orderDragRef = useRef<PointerSelectionState>({ active: false, nextChecked: false, pointerId: null });
   const adDragRef = useRef<PointerSelectionState>({ active: false, nextChecked: false, pointerId: null });
+  const orderScrollRef = useRef<HTMLDivElement>(null);
+  const adScrollRef = useRef<HTMLDivElement>(null);
+  const scrollPositions = useRef<Map<string, number>>(new Map());
 
   const selectedMapping = data.campaignMappings.find((mapping) => mapping.id === selectedMappingId) ?? null;
   const visibleAdCostsBase = hideZeroCostAdRows ? data.adCosts.filter((item) => item.totalCost !== 0) : data.adCosts;
@@ -250,9 +257,13 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const conflictAdCostCount = data.adCosts.filter((item) => item.mappingStatus === "CONFLICT").length;
   const selectedSignatureSet = new Set(selectedSignatureIds);
   const selectedAdCostSet = new Set(selectedAdCostIds);
-  const filteredSignatures = data.signatures.filter((item) =>
-    matchesQuery([item.sourceSignature, item.rawProductNameSnapshot, item.rawOptionInfoSnapshot, item.canonicalDisplayName], orderSearch),
-  );
+  const filteredSignatures = data.signatures
+    .filter((item) => {
+      const matchesSearch = matchesQuery([item.sourceSignature, item.rawProductNameSnapshot, item.rawOptionInfoSnapshot, item.canonicalDisplayName], orderSearch);
+      const matchesUnmapped = !showOnlyUnmapped || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
+      const matchesUsageCount = !hideZeroOrderSignatures || item.usageCount !== 0;
+      return matchesSearch && matchesUnmapped && matchesUsageCount;
+    });
   const filteredAdCosts = visibleAdCostsBase.filter((item) =>
     matchesQuery([item.campaignName, item.canonicalDisplayName, item.mappingReason, item.reasonNote, item.reportDate], adSearch),
   );
@@ -260,6 +271,12 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const selectedAdCostRows = data.adCosts.filter((item) => selectedAdCostSet.has(item.id));
   const visibleSelectedSignatureCount = filteredSignatures.filter((item) => selectedSignatureSet.has(item.id)).length;
   const visibleSelectedAdCostCount = filteredAdCosts.filter((item) => selectedAdCostSet.has(item.id)).length;
+  const hiddenSignaturesCount = data.signatures.filter((item) => {
+    const matchesSearch = matchesQuery([item.sourceSignature, item.rawProductNameSnapshot, item.rawOptionInfoSnapshot, item.canonicalDisplayName], orderSearch);
+    const matchesUnmapped = !showOnlyUnmapped || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
+    const matchesUsageCount = !hideZeroOrderSignatures || item.usageCount !== 0;
+    return !(matchesSearch && matchesUnmapped && matchesUsageCount);
+  }).length;
 
   useEffect(() => {
     const stopSelection = () => {
@@ -352,12 +369,43 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   const primaryStoreId = data.primaryStore.id;
 
+  const saveScrollPositions = () => {
+    if (orderScrollRef.current) {
+      scrollPositions.current.set("order", orderScrollRef.current.scrollTop);
+    }
+    if (adScrollRef.current) {
+      scrollPositions.current.set("ad", adScrollRef.current.scrollTop);
+    }
+  };
+
+  const restoreScrollPositions = () => {
+    if (orderScrollRef.current) {
+      const pos = scrollPositions.current.get("order");
+      if (pos !== undefined) {
+        orderScrollRef.current.scrollTop = pos;
+      }
+    }
+    if (adScrollRef.current) {
+      const pos = scrollPositions.current.get("ad");
+      if (pos !== undefined) {
+        adScrollRef.current.scrollTop = pos;
+      }
+    }
+  };
+
   const refreshWithMessage = (target: "order" | "campaign" | "ad-cost", message: string) => {
+    saveScrollPositions();
     if (target === "order") setOrderSuccess(message);
     else if (target === "campaign") setCampaignSuccess(message);
     else setAdCostSuccess(message);
     startRefresh(() => router.refresh());
   };
+
+  useEffect(() => {
+    if (!isRefreshing) {
+      restoreScrollPositions();
+    }
+  }, [isRefreshing]);
 
   const updateOrderSelection = (ids: string[], checked: boolean) =>
     setSelectedSignatureIds((current) => applySelectionChange(current, ids, checked));
@@ -641,6 +689,16 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                   선택 해제
                 </button>
               </div>
+              <div className="flex flex-wrap gap-3">
+                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
+                  <input checked={showOnlyUnmapped} onChange={(event) => setShowOnlyUnmapped(event.target.checked)} type="checkbox" />
+                  미매핑/충돌만 보기
+                </label>
+                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
+                  <input checked={hideZeroOrderSignatures} onChange={(event) => setHideZeroOrderSignatures(event.target.checked)} type="checkbox" />
+                  주문 0건 숨기기
+                </label>
+              </div>
             </div>
 
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink/50">
@@ -649,9 +707,12 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               {selectedSignatureRows.length > visibleSelectedSignatureCount ? (
                 <span>검색으로 숨겨진 선택 {formatNumber(selectedSignatureRows.length - visibleSelectedSignatureCount)}건</span>
               ) : null}
+              {hiddenSignaturesCount > 0 ? (
+                <span>필터로 숨겨진 {formatNumber(hiddenSignaturesCount)}건</span>
+              ) : null}
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="min-h-0 flex-1 overflow-y-auto pr-1" ref={orderScrollRef}>
               <SelectionTable
                 caption="Order signatures"
                 rows={filteredSignatures}
@@ -811,14 +872,11 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 >
                   <option value="">판매단위 선택</option>
                   {[...data.salesUnits]
-                    .filter((u) => !u.isGroup)
-                    .sort((a, b) => {
-                      if (a.isStoreLevel === b.isStoreLevel) return 0;
-                      return a.isStoreLevel ? -1 : 1;
-                    })
+                    .filter((u) => !u.isGroup && !u.isStoreLevel && u.isActive)
+                    .sort((a, b) => a.displayName.localeCompare(b.displayName, "ko"))
                     .map((salesUnit) => (
                       <option key={salesUnit.id} value={salesUnit.id}>
-                        {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
+                        {salesUnit.displayName}
                       </option>
                     ))}
                 </select>
@@ -967,7 +1025,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               </label>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="min-h-0 flex-1 overflow-y-auto pr-1" ref={adScrollRef}>
               <SelectionTable
                 caption="Ad cost rows"
                 rows={filteredAdCosts}
@@ -1050,7 +1108,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 >
                   <option value="">판매단위 선택</option>
                   {[...data.salesUnits]
-                    .filter((u) => !u.isGroup)
+                    .filter((u) => !u.isGroup && u.isActive)
                     .sort((a, b) => {
                       if (a.isStoreLevel === b.isStoreLevel) return 0;
                       return a.isStoreLevel ? -1 : 1;
