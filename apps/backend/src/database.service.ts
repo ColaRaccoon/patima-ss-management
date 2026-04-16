@@ -66,12 +66,16 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return this.storageMode;
   }
 
+  /**
+   * Returns the live snapshot reference. **MUST NOT be mutated by callers.**
+   * Use `write(mutator)` for any change.
+   */
   getSnapshot(): DatabaseShape {
-    return this.cloneSnapshot(this.database);
+    return this.database;
   }
 
   write<T>(mutator: (draft: DatabaseShape) => T): T {
-    const draft = this.getSnapshot();
+    const draft = this.cloneSnapshot(this.database);
     const result = mutator(draft);
     this.database = draft;
 

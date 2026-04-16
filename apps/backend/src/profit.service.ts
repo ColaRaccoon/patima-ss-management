@@ -222,50 +222,65 @@ export class ProfitService {
   getUnmappedSummary(storeId: string, dateFrom: string, dateTo: string) {
     const snapshot = this.databaseService.getSnapshot();
     const activeUploadIds = getActiveConfirmedUploadIds(snapshot, storeId);
-    const unmappedOrderItems = snapshot.orderItems.filter(
-      (item) =>
-        item.storeId === storeId &&
-        item.paymentDate &&
-        item.paymentDate >= dateFrom &&
-        item.paymentDate <= dateTo &&
-        item.saleStatus === "SALE" &&
-        getOrderItemMappingStatus(snapshot, item) === "UNMAPPED",
-    );
-    const conflictOrderItems = snapshot.orderItems.filter(
-      (item) =>
-        item.storeId === storeId &&
-        item.paymentDate &&
-        item.paymentDate >= dateFrom &&
-        item.paymentDate <= dateTo &&
-        item.saleStatus === "SALE" &&
-        getOrderItemMappingStatus(snapshot, item) === "CONFLICT",
-    );
-    const adRows = snapshot.adCampaignDailyCosts.filter(
-      (item) =>
-        item.storeId === storeId &&
-        item.reportDate >= dateFrom &&
-        item.reportDate <= dateTo &&
-        activeUploadIds.has(item.sourceUploadId),
-    );
+
+    // Single pass for order items
+    let unmappedOrderItemCount = 0;
+    let unmappedOrderRevenue = 0;
+    let conflictOrderItemCount = 0;
+    let conflictOrderRevenue = 0;
+
+    for (const item of snapshot.orderItems) {
+      if (item.storeId !== storeId) continue;
+      if (!item.paymentDate || item.paymentDate < dateFrom || item.paymentDate > dateTo) continue;
+      if (item.saleStatus !== "SALE") continue;
+
+      const status = getOrderItemMappingStatus(snapshot, item);
+      if (status === "UNMAPPED") {
+        unmappedOrderItemCount++;
+        unmappedOrderRevenue += item.productPaymentAmount;
+      } else if (status === "CONFLICT") {
+        conflictOrderItemCount++;
+        conflictOrderRevenue += item.productPaymentAmount;
+      }
+    }
+
+    // Single pass for ad campaigns
+    let unmappedCampaignCount = 0;
+    let unmappedAdCost = 0;
+    let conflictCampaignCount = 0;
+    let conflictAdCost = 0;
+    let intentionalUnmappedCampaignCount = 0;
+    let intentionalUnmappedAdCost = 0;
+
+    for (const item of snapshot.adCampaignDailyCosts) {
+      if (item.storeId !== storeId) continue;
+      if (item.reportDate < dateFrom || item.reportDate > dateTo) continue;
+      if (!activeUploadIds.has(item.sourceUploadId)) continue;
+
+      const status = getAdMappingStatus(item);
+      if (status === "UNMAPPED") {
+        unmappedCampaignCount++;
+        unmappedAdCost += item.totalCost;
+      } else if (status === "CONFLICT") {
+        conflictCampaignCount++;
+        conflictAdCost += item.totalCost;
+      } else if (item.mappingReason === "INTENTIONALLY_UNMAPPED") {
+        intentionalUnmappedCampaignCount++;
+        intentionalUnmappedAdCost += item.totalCost;
+      }
+    }
 
     return formatApiSuccess({
-      unmappedOrderItemCount: unmappedOrderItems.length,
-      unmappedOrderRevenue: unmappedOrderItems.reduce((total, item) => total + item.productPaymentAmount, 0),
-      conflictOrderItemCount: conflictOrderItems.length,
-      conflictOrderRevenue: conflictOrderItems.reduce((total, item) => total + item.productPaymentAmount, 0),
-      unmappedCampaignCount: adRows.filter((item) => getAdMappingStatus(item) === "UNMAPPED").length,
-      unmappedAdCost: adRows
-        .filter((item) => getAdMappingStatus(item) === "UNMAPPED")
-        .reduce((total, item) => total + item.totalCost, 0),
-      conflictCampaignCount: adRows.filter((item) => getAdMappingStatus(item) === "CONFLICT").length,
-      conflictAdCost: adRows
-        .filter((item) => getAdMappingStatus(item) === "CONFLICT")
-        .reduce((total, item) => total + item.totalCost, 0),
-      intentionalUnmappedCampaignCount: adRows.filter((item) => item.mappingReason === "INTENTIONALLY_UNMAPPED")
-        .length,
-      intentionalUnmappedAdCost: adRows
-        .filter((item) => item.mappingReason === "INTENTIONALLY_UNMAPPED")
-        .reduce((total, item) => total + item.totalCost, 0),
+      unmappedOrderItemCount,
+      unmappedOrderRevenue,
+      conflictOrderItemCount,
+      conflictOrderRevenue,
+      unmappedCampaignCount,
+      unmappedAdCost,
+      conflictCampaignCount,
+      conflictAdCost,
+      intentionalUnmappedCampaignCount,
+      intentionalUnmappedAdCost,
     });
   }
 }

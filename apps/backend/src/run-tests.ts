@@ -8,6 +8,7 @@ import {
   calculateDailyProfitRows,
   calculateFee,
   createEmptyDatabase,
+  getSignatureIndex,
   getWeekdayNameKo,
   repairMojibakeText,
   saleStatusFromNaverOrderState,
@@ -1547,6 +1548,122 @@ run("enrichSignatureDisplayName returns null when all fallbacks fail", async () 
   const result = await enrichSignatureDisplayName(database, signature);
   assert.equal(result.fallbackProductName, null);
   assert.equal(result.fallbackProductNameSource, null);
+});
+
+run("getSignatureIndex caches index by database reference", () => {
+  const database = createEmptyDatabase();
+  database.orderSourceSignatures = [
+    {
+      id: "sig-1",
+      storeId: "store-1",
+      sourceSignature: "sig1",
+      rawProductNameSnapshot: "Product 1",
+      rawOptionInfoSnapshot: "Option 1",
+      normalizedProductName: "product 1",
+      normalizedOptionInfo: "option 1",
+      canonicalSalesUnitId: "unit-1",
+      mappingStatus: "MAPPED" as const,
+      confirmedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    {
+      id: "sig-2",
+      storeId: "store-1",
+      sourceSignature: "sig2",
+      rawProductNameSnapshot: "Product 2",
+      rawOptionInfoSnapshot: null,
+      normalizedProductName: "product 2",
+      normalizedOptionInfo: "",
+      canonicalSalesUnitId: null,
+      mappingStatus: "UNMAPPED",
+      confirmedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  ];
+
+  // First call builds the index
+  const index1 = getSignatureIndex(database);
+  assert.equal(index1.size, 2);
+  assert.equal(index1.get("sig-1")?.sourceSignature, "sig1");
+  assert.equal(index1.get("sig-2")?.sourceSignature, "sig2");
+
+  // Second call with same reference should return cached index (same object)
+  const index2 = getSignatureIndex(database);
+  assert.strictEqual(index1, index2, "Cache should return same Map instance");
+
+  // Third call still returns cached
+  const index3 = getSignatureIndex(database);
+  assert.strictEqual(index1, index3);
+});
+
+run("getSignatureIndex cache invalidates on database reference change", () => {
+  const database1 = createEmptyDatabase();
+  database1.orderSourceSignatures = [
+    {
+      id: "sig-1",
+      storeId: "store-1",
+      sourceSignature: "sig1",
+      rawProductNameSnapshot: "Product 1",
+      rawOptionInfoSnapshot: "Option 1",
+      normalizedProductName: "product 1",
+      normalizedOptionInfo: "option 1",
+      canonicalSalesUnitId: "unit-1",
+      mappingStatus: "MAPPED" as const,
+      confirmedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  ];
+
+  const index1 = getSignatureIndex(database1);
+  assert.equal(index1.size, 1);
+
+  // Create a new database reference with different signatures
+  const database2 = createEmptyDatabase();
+  database2.orderSourceSignatures = [
+    {
+      id: "sig-a",
+      storeId: "store-1",
+      sourceSignature: "siga",
+      rawProductNameSnapshot: "Product A",
+      rawOptionInfoSnapshot: null,
+      normalizedProductName: "product a",
+      normalizedOptionInfo: "",
+      canonicalSalesUnitId: null,
+      mappingStatus: "UNMAPPED",
+      confirmedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    {
+      id: "sig-b",
+      storeId: "store-1",
+      sourceSignature: "sigb",
+      rawProductNameSnapshot: "Product B",
+      rawOptionInfoSnapshot: null,
+      normalizedProductName: "product b",
+      normalizedOptionInfo: "",
+      canonicalSalesUnitId: null,
+      mappingStatus: "UNMAPPED",
+      confirmedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  ];
+
+  // New database reference should build new index
+  const index2 = getSignatureIndex(database2);
+  assert.equal(index2.size, 2);
+  assert.notStrictEqual(index1, index2, "Different database references should have different caches");
+  assert.equal(index2.get("sig-a")?.sourceSignature, "siga");
+  assert.equal(index2.get("sig-b")?.sourceSignature, "sigb");
+
+  // Original database should still have cached original index
+  const index1Again = getSignatureIndex(database1);
+  assert.strictEqual(index1, index1Again);
+  assert.equal(index1Again.size, 1);
 });
 
 console.log("All backend checks passed.");

@@ -44,6 +44,25 @@ export const createEmptyDatabase = (): DatabaseShape => ({
 
 export const createId = () => uuid();
 
+/**
+ * WeakMap cache for signature index (id → signature).
+ * Automatically invalidated when database reference changes.
+ */
+const signatureIndexCache = new WeakMap<DatabaseShape, Map<string, OrderSourceSignature>>();
+
+/**
+ * Returns an O(1) index of signatures by id.
+ * Cache is keyed by database reference and auto-invalidated on write.
+ */
+export const getSignatureIndex = (database: DatabaseShape): Map<string, OrderSourceSignature> => {
+  let idx = signatureIndexCache.get(database);
+  if (!idx) {
+    idx = new Map(database.orderSourceSignatures.map((s) => [s.id, s]));
+    signatureIndexCache.set(database, idx);
+  }
+  return idx;
+};
+
 const HANGUL_REGEX = /[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/;
 const LATIN1_MOJIBAKE_HINT_REGEX = /[À-ÿ]/;
 
@@ -459,7 +478,7 @@ export const getOrderItemMappingStatus = (
   item: Pick<OrderItem, "canonicalSalesUnitId" | "orderSourceSignatureId">,
 ): MappingStatus => {
   if (item.orderSourceSignatureId) {
-    const signature = database.orderSourceSignatures.find((entry) => entry.id === item.orderSourceSignatureId);
+    const signature = getSignatureIndex(database).get(item.orderSourceSignatureId);
     if (signature) {
       return getSignatureMappingStatus(signature);
     }
@@ -807,71 +826,102 @@ export const calculateDashboardSummary = (
   // (부모 있는 자식 행은 제외되어 이중 계산 방지)
   const rows = calculateDailyProfitRows(database, storeId, date, date, undefined, false);
   const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
-  const totalProductRevenue = rows.reduce((total, row) => total + row.totalProductRevenue, 0);
-  const totalDeliveryFeeAmount = rows.reduce(
-    (total, row) => total + row.totalDeliveryFeeAmount,
-    0,
-  );
-  const eligibleOrders = database.orderItems.filter(
-    (item) => item.storeId === storeId && item.paymentDate === date,
-  );
-  const eligibleAds = database.adCampaignDailyCosts.filter(
-    (item) =>
-      item.storeId === storeId && item.reportDate === date && activeUploadIds.has(item.sourceUploadId),
-  );
 
-  const excludedUnmappedOrderRevenue = eligibleOrders
-    .filter((item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "UNMAPPED")
-    .reduce((total, item) => total + item.productPaymentAmount, 0);
-  const excludedConflictOrderRevenue = eligibleOrders
-    .filter((item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "CONFLICT")
-    .reduce((total, item) => total + item.productPaymentAmount, 0);
-  const excludedNonSaleOrderRevenue = eligibleOrders
-    .filter((item) => item.saleStatus !== "SALE")
-    .reduce((total, item) => total + item.productPaymentAmount, 0);
-  const excludedUnmappedAdCost = eligibleAds
-    .filter((item) => item.mappingReason === "NO_RULE")
-    .reduce((total, item) => total + item.totalCost, 0);
-  const excludedConflictAdCost = eligibleAds
-    .filter((item) => item.mappingReason === "MULTIPLE_RULES")
-    .reduce((total, item) => total + item.totalCost, 0);
-  const excludedIntentionalUnmappedAdCost = eligibleAds
-    .filter((item) => item.mappingReason === "INTENTIONALLY_UNMAPPED")
-    .reduce((total, item) => total + item.totalCost, 0);
-  const incompleteRows = rows.filter((row) => row.profitStatus === "INCOMPLETE_COST");
+  // Single pass: rows summary
+  let totalProductRevenue = 0;
+  let totalDeliveryFeeAmount = 0;
+  let totalAdCost = 0;
+  let roughProfit = 0;
+  let estimatedNetProfit = 0;
+  let incompleteRowCount = 0;
+
+  for (const row of rows) {
+    totalProductRevenue += row.totalProductRevenue;
+    totalDeliveryFeeAmount += row.totalDeliveryFeeAmount;
+    totalAdCost += row.totalAdCost;
+    roughProfit += row.roughProfit;
+    if (row.profitStatus === "INCOMPLETE_COST") {
+      incompleteRowCount++;
+    } else if (row.estimatedNetProfit !== null) {
+      estimatedNetProfit += row.estimatedNetProfit;
+    }
+  }
+
+  // Single pass: eligible orders
+  let unmappedOrderItemCount = 0;
+  let conflictOrderItemCount = 0;
+  let excludedUnmappedOrderRevenue = 0;
+  let excludedConflictOrderRevenue = 0;
+  let excludedNonSaleOrderRevenue = 0;
+
+  for (const item of database.orderItems) {
+    if (item.storeId !== storeId || item.paymentDate !== date) continue;
+
+    if (item.saleStatus === "SALE") {
+      const status = getOrderItemMappingStatus(database, item);
+      if (status === "UNMAPPED") {
+        unmappedOrderItemCount++;
+        excludedUnmappedOrderRevenue += item.productPaymentAmount;
+      } else if (status === "CONFLICT") {
+        conflictOrderItemCount++;
+        excludedConflictOrderRevenue += item.productPaymentAmount;
+      }
+    } else {
+      excludedNonSaleOrderRevenue += item.productPaymentAmount;
+    }
+  }
+
+  // Single pass: eligible ads
+  let unmappedCampaignCount = 0;
+  let conflictCampaignCount = 0;
+  let intentionalUnmappedCampaignCount = 0;
+  let excludedUnmappedAdCost = 0;
+  let excludedConflictAdCost = 0;
+  let excludedIntentionalUnmappedAdCost = 0;
+
+  for (const item of database.adCampaignDailyCosts) {
+    if (item.storeId !== storeId || item.reportDate !== date || !activeUploadIds.has(item.sourceUploadId))
+      continue;
+
+    const status = getAdMappingStatus(item);
+    if (status === "UNMAPPED") {
+      unmappedCampaignCount++;
+      excludedUnmappedAdCost += item.totalCost;
+    } else if (status === "CONFLICT") {
+      conflictCampaignCount++;
+      excludedConflictAdCost += item.totalCost;
+    }
+
+    if (item.mappingReason === "INTENTIONALLY_UNMAPPED") {
+      intentionalUnmappedCampaignCount++;
+      excludedIntentionalUnmappedAdCost += item.totalCost;
+    }
+  }
+
+  const profitStatus = incompleteRowCount > 0 ? "INCOMPLETE_COST" : "COMPLETE";
+  const finalEstimatedNetProfit = incompleteRowCount > 0 ? null : estimatedNetProfit;
 
   return {
     date,
     totalRevenue: totalProductRevenue,
     totalProductRevenue,
     totalDeliveryFeeAmount,
-    totalAdCost: rows.reduce((total, row) => total + row.totalAdCost, 0),
-    roughProfit: rows.reduce((total, row) => total + row.roughProfit, 0),
-    estimatedNetProfit:
-      incompleteRows.length > 0
-        ? null
-        : rows.reduce((total, row) => total + (row.estimatedNetProfit ?? 0), 0),
-    profitStatus: incompleteRows.length > 0 ? "INCOMPLETE_COST" : "COMPLETE",
+    totalAdCost,
+    roughProfit,
+    estimatedNetProfit: finalEstimatedNetProfit,
+    profitStatus,
     salesUnitCount: rows.length,
-    incompleteCostSalesUnitCount: incompleteRows.length,
-    unmappedOrderItemCount: eligibleOrders.filter(
-      (item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "UNMAPPED",
-    ).length,
-    conflictOrderItemCount: eligibleOrders.filter(
-      (item) => item.saleStatus === "SALE" && getOrderItemMappingStatus(database, item) === "CONFLICT",
-    ).length,
-    unmappedCampaignCount: eligibleAds.filter((item) => item.mappingReason === "NO_RULE").length,
-    conflictCampaignCount: eligibleAds.filter((item) => item.mappingReason === "MULTIPLE_RULES").length,
-    intentionalUnmappedCampaignCount: eligibleAds.filter(
-      (item) => item.mappingReason === "INTENTIONALLY_UNMAPPED",
-    ).length,
-    excludedOrderRevenue:
-      excludedUnmappedOrderRevenue + excludedConflictOrderRevenue + excludedNonSaleOrderRevenue,
+    incompleteCostSalesUnitCount: incompleteRowCount,
+    unmappedOrderItemCount,
+    conflictOrderItemCount,
+    unmappedCampaignCount,
+    conflictCampaignCount,
+    intentionalUnmappedCampaignCount,
+    excludedOrderRevenue: excludedUnmappedOrderRevenue + excludedConflictOrderRevenue + excludedNonSaleOrderRevenue,
     excludedUnmappedOrderRevenue,
     excludedConflictOrderRevenue,
     excludedNonSaleOrderRevenue,
-    excludedAdCost:
-      excludedUnmappedAdCost + excludedConflictAdCost + excludedIntentionalUnmappedAdCost,
+    excludedAdCost: excludedUnmappedAdCost + excludedConflictAdCost + excludedIntentionalUnmappedAdCost,
     excludedUnmappedAdCost,
     excludedConflictAdCost,
     excludedIntentionalUnmappedAdCost,
