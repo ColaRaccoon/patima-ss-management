@@ -9,6 +9,8 @@ import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 const NAVER_API_BASE_URL = "https://api.commerce.naver.com/external";
 const TOKEN_RENEWAL_BUFFER_MS = 60_000;
 const MAX_CHANGED_ORDER_PAGES = 50;
+const MAX_CONDITIONAL_ORDER_PAGES = 100;
+const CONDITIONAL_ORDER_PAGE_SIZE = 100;
 const DETAIL_BATCH_SIZE = 300;
 
 export interface ResolvedCommerceCredential {
@@ -102,13 +104,20 @@ const toDateString = (value: string | null): string | null => {
 const buildOrderRangeStart = (dateFrom: string) => `${dateFrom}T00:00:00.000+09:00`;
 const buildOrderRangeEnd = (dateTo: string) => `${dateTo}T23:59:59.999+09:00`;
 
+const kstDateFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Seoul",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
 const enumerateDateRange = (dateFrom: string, dateTo: string) => {
   const dates: string[] = [];
   const cursor = new Date(`${dateFrom}T00:00:00+09:00`);
   const end = new Date(`${dateTo}T00:00:00+09:00`);
 
   while (cursor.getTime() <= end.getTime()) {
-    dates.push(cursor.toISOString().slice(0, 10));
+    dates.push(kstDateFormatter.format(cursor));
     cursor.setDate(cursor.getDate() + 1);
   }
 
@@ -270,42 +279,28 @@ export class NaverCommerceService {
       throw new BadRequestException("NAVER_CREDENTIALS_NOT_CONFIGURED");
     }
 
-    const changedEntries: JsonRecord[] = [];
     const targetDates = enumerateDateRange(dateFrom, dateTo);
 
+    // 결제일 기준 조회 (GET /v1/pay-order/seller/product-orders, rangeType=PAYED_DATETIME)
+    const productOrderIds: string[] = [];
     for (const targetDate of targetDates) {
-      const changedOrders = await this.fetchChangedOrders(
+      const ids = await this.fetchProductOrderIdsByPaymentDate(
         resolved.store,
         resolved.credential,
         targetDate,
-        targetDate,
       );
-      changedEntries.push(...changedOrders.entries);
+      productOrderIds.push(...ids);
     }
 
-    const productOrderIds = uniqueStrings(
-      changedEntries.map((entry) => pickString(entry.productOrderId)),
-    );
-    if (productOrderIds.length === 0) {
+    const uniqueIds = uniqueStrings(productOrderIds);
+    if (uniqueIds.length === 0) {
       return [];
     }
 
-    const details = await this.fetchOrderDetails(resolved.store, resolved.credential, productOrderIds);
-    const changedOrderByProductOrderId = new Map<string, JsonRecord>();
-    changedEntries.forEach((entry) => {
-      const productOrderId = pickString(entry.productOrderId);
-      if (productOrderId) {
-        changedOrderByProductOrderId.set(productOrderId, entry);
-      }
-    });
+    const details = await this.fetchOrderDetails(resolved.store, resolved.credential, uniqueIds);
 
     return details
-      .map((detail) =>
-        this.normalizeOrderDetail(
-          detail,
-          changedOrderByProductOrderId.get(this.extractProductOrderId(detail) ?? ""),
-        ),
-      )
+      .map((detail) => this.normalizeOrderDetail(detail, undefined))
       .filter((item): item is SyncedOrderItemInput => !!item);
   }
 
@@ -381,6 +376,54 @@ export class NaverCommerceService {
     }
 
     return { entries };
+  }
+
+  private async fetchProductOrderIdsByPaymentDate(
+    store: Store,
+    credential: ResolvedCommerceCredential,
+    targetDate: string,
+  ): Promise<string[]> {
+    const from = buildOrderRangeStart(targetDate);
+    const to = buildOrderRangeEnd(targetDate);
+    const ids: string[] = [];
+
+    for (let page = 1; page <= MAX_CONDITIONAL_ORDER_PAGES; page += 1) {
+      const response = await this.requestSellerJson(
+        "/v1/pay-order/seller/product-orders",
+        store,
+        credential,
+        {
+          query: {
+            from,
+            to,
+            rangeType: "PAYED_DATETIME",
+            pageSize: String(CONDITIONAL_ORDER_PAGE_SIZE),
+            page: String(page),
+          },
+        },
+      );
+
+      const entries = this.extractConditionalOrderEntries(response);
+      entries.forEach((entry) => {
+        const id = pickString(entry.productOrderId);
+        if (id) {
+          ids.push(id);
+        }
+      });
+
+      // 반환된 항목 수가 pageSize보다 적으면 마지막 페이지
+      if (entries.length < CONDITIONAL_ORDER_PAGE_SIZE) {
+        break;
+      }
+    }
+
+    return ids;
+  }
+
+  private extractConditionalOrderEntries(payload: unknown): JsonRecord[] {
+    return this.extractMatchingArrayEntries(payload, (entry) =>
+      pickString(entry.productOrderId) !== null,
+    );
   }
 
   private async fetchOrderDetails(

@@ -1,3 +1,5 @@
+"use client";
+
 import Link from "next/link";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
@@ -14,10 +16,10 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
   if (!data.primaryStore) {
     return (
       <EmptyState
-        title="A primary store is required."
-        description="Create or activate a store before the dashboard can summarize orders, ads, and profit data."
+        title="대표 스토어가 필요합니다."
+        description="대시보드에서 주문, 광고, 손익 데이터를 집계하려면 먼저 스토어를 생성하고 활성화해야 합니다."
         actionHref="/settings/stores"
-        actionLabel="Open store settings"
+        actionLabel="스토어 설정 열기"
       />
     );
   }
@@ -27,16 +29,17 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Dashboard"
-        title={`${data.primaryStore.name} summary`}
-        description="Daily profit, excluded totals, and recent operations in one place. Delivery fees stay separate from product revenue until the shipping rule is finalized."
+        eyebrow="대시보드"
+        eyebrowLang="ko"
+        title={`${data.primaryStore.name} 요약`}
+        description="일자별 손익, 제외 금액, 최근 작업을 한 화면에서 확인합니다. 배송료는 배송료 규칙이 최종화될 때까지 상품 매출과 별도로 표시됩니다."
         actions={
           <>
             <Link className="button-shell button-secondary" href="/profits">
-              Open profits
+              손익 분석 보기
             </Link>
             <Link className="button-shell button-primary" href="/mappings">
-              Review mappings
+              매핑 검토
             </Link>
           </>
         }
@@ -44,45 +47,44 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
 
       <SourceBanner sources={data.sources} />
 
-      <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-900">
-        <p className="font-semibold">Delivery fees are shown separately from profit totals.</p>
+      <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-950">
+        <p className="font-semibold">배송료는 순이익 합계와 별도로 표시됩니다.</p>
         <p className="mt-1">
-          Product revenue, rough profit, and estimated net profit currently exclude delivery fees until the shipping
-          rule and any shipping-cost/subsidy handling are finalized.
+          상품 매출, 조정 손익, 순손익은 현재 배송료 규칙과 배송비/보조금 처리가 확정될 때까지 배송료를 제외합니다.
         </p>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <StatCard
-          label={`Product revenue on ${formatDate(data.selectedDate)}`}
+          label={`${formatDate(data.selectedDate)} 상품 매출`}
           value={formatCurrency(data.summary.totalProductRevenue)}
-          hint={`Sales units ${formatNumber(data.summary.salesUnitCount)}`}
+          hint={`판매단위 ${formatNumber(data.summary.salesUnitCount)}개`}
         />
         <StatCard
-          label="Delivery fee reference"
+          label="배송료 참고"
           value={formatCurrency(data.summary.totalDeliveryFeeAmount)}
-          hint="Reference only for now."
+          hint="현재는 참고용입니다."
           tone="muted"
         />
         <StatCard
-          label="Ad cost"
+          label="광고비"
           value={formatCurrency(data.summary.totalAdCost)}
-          hint={`Excluded ${formatCurrency(data.summary.excludedAdCost)}`}
+          hint={`제외됨 ${formatCurrency(data.summary.excludedAdCost)}`}
           tone="accent"
         />
         <StatCard
-          label="Rough profit"
+          label="조정 손익"
           value={formatCurrency(data.summary.roughProfit)}
-          hint="Product revenue - ad cost"
+          hint="상품 매출 - 광고비"
           tone={data.summary.roughProfit >= 0 ? "success" : "warning"}
         />
         <StatCard
-          label="Estimated net profit"
+          label="순손익(예상)"
           value={formatCurrency(data.summary.estimatedNetProfit)}
           hint={
             data.summary.profitStatus === "INCOMPLETE_COST"
-              ? "Some cost settings are incomplete."
-              : "All tracked cost layers applied."
+              ? "일부 원가 설정이 완료되지 않았습니다."
+              : "모든 추적된 원가 항목이 적용되었습니다."
           }
           tone={toneForProfitStatus(data.summary.profitStatus)}
         />
@@ -90,12 +92,12 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
 
       {hasConflict ? (
         <div className="rounded-2xl border border-red-300/40 bg-red-100/70 px-4 py-4 text-sm leading-6 text-red-800">
-          <p className="font-semibold">Conflict mappings are excluded from totals.</p>
+          <p className="font-semibold">충돌 매핑은 합계에서 제외됩니다.</p>
           <p className="mt-1">
-            Orders {formatNumber(data.summary.conflictOrderItemCount)} / Ads {formatNumber(data.summary.conflictCampaignCount)}
+            주문 {formatNumber(data.summary.conflictOrderItemCount)}건 / 광고 {formatNumber(data.summary.conflictCampaignCount)}건
           </p>
           <p>
-            Excluded product revenue {formatCurrency(data.summary.excludedConflictOrderRevenue)} / Excluded ad cost {formatCurrency(data.summary.excludedConflictAdCost)}
+            제외된 상품 매출 {formatCurrency(data.summary.excludedConflictOrderRevenue)} / 제외된 광고비 {formatCurrency(data.summary.excludedConflictAdCost)}
           </p>
         </div>
       ) : null}

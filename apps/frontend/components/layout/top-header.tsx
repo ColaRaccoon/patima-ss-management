@@ -69,8 +69,8 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
       <div className="mx-auto flex max-w-7xl flex-col gap-4 px-4 py-4 sm:px-6 lg:px-8">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div className="min-w-0">
-            <p className="text-xs uppercase tracking-[0.28em] text-ink/45">
-              SmartStore Profit Console
+            <p className="text-xs uppercase tracking-wider text-ink/65">
+              스마트스토어 손익 관리
             </p>
             <div className="mt-1 flex flex-wrap items-center gap-3">
               <h2 className="text-2xl font-semibold tracking-tight text-ink">
@@ -79,10 +79,10 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
               <StatusBadge
                 tone={shellData.storeSource === "live" ? "success" : "warning"}
               >
-                {shellData.storeSource === "live" ? "Live Store" : "Mock Store"}
+                {shellData.storeSource === "live" ? "라이브 스토어" : "테스트 스토어"}
               </StatusBadge>
             </div>
-            <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/65">
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/70">
               {meta.description}
             </p>
           </div>
@@ -101,7 +101,7 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
 
         <div className="grid gap-3 rounded-[28px] border border-ink/10 bg-white/55 px-4 py-4 sm:grid-cols-3">
           <div className="rounded-2xl bg-white/70 px-4 py-3">
-            <div className="flex items-center gap-2 text-xs uppercase tracking-[0.22em] text-ink/45">
+            <div className="flex items-center gap-2 text-xs tracking-tight text-ink/65">
               <CalendarRange className="h-3.5 w-3.5" />
               현재 기준일
             </div>
@@ -111,7 +111,7 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
           </div>
 
           <div className="rounded-2xl bg-white/70 px-4 py-3">
-            <div className="flex items-center gap-2 text-xs uppercase tracking-[0.22em] text-ink/45">
+            <div className="flex items-center gap-2 text-xs tracking-tight text-ink/65">
               <Clock3 className="h-3.5 w-3.5" />
               고정 스토어
             </div>
@@ -126,7 +126,7 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
           </div>
 
           <div className="rounded-2xl bg-white/70 px-4 py-3">
-            <div className="flex items-center gap-2 text-xs uppercase tracking-[0.22em] text-ink/45">
+            <div className="flex items-center gap-2 text-xs tracking-tight text-ink/65">
               <RefreshCw className="h-3.5 w-3.5" />
               최근 주문 동기화
             </div>

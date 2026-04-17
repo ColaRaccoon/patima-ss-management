@@ -2,6 +2,7 @@ import { cn } from "@/lib/cn";
 
 interface PageHeaderProps {
   eyebrow?: string;
+  eyebrowLang?: "ko" | "en"; // NEW: 한글/영문 구분
   title: string;
   description: string;
   actions?: React.ReactNode;
@@ -10,6 +11,7 @@ interface PageHeaderProps {
 
 export function PageHeader({
   eyebrow = "Workspace",
+  eyebrowLang = "en",
   title,
   description,
   actions,
@@ -24,13 +26,16 @@ export function PageHeader({
     >
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div>
-          <p className="text-xs uppercase tracking-[0.28em] text-ink/45">
+          <p className={cn(
+            "text-xs tracking-tight text-ink/65",
+            eyebrowLang === "en" && "uppercase tracking-wider"
+          )}>
             {eyebrow}
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight text-ink">
             {title}
           </h1>
-          <p className="mt-3 max-w-3xl text-sm leading-6 text-ink/62">
+          <p className="mt-3 max-w-3xl text-sm leading-6 text-ink/70">
             {description}
           </p>
         </div>

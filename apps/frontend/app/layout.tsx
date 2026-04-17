@@ -13,6 +13,28 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ko">
+      <head>
+        {/* Pretendard Variable Google Fonts 로드 */}
+        <link
+          rel="preconnect"
+          href="https://fonts.googleapis.com"
+        />
+        <link
+          rel="preconnect"
+          href="https://fonts.gstatic.com"
+          crossOrigin="anonymous"
+        />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600;700&display=swap"
+          rel="stylesheet"
+        />
+        <style>{`
+          :root {
+            --font-sans: 'Pretendard Variable', 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+            --font-mono: 'JetBrains Mono', 'D2Coding', monospace;
+          }
+        `}</style>
+      </head>
       <body className="app-shell-noise">{children}</body>
     </html>
   );

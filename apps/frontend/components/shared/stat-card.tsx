@@ -29,9 +29,16 @@ export function StatCard({
         toneClassMap[tone],
       )}
     >
-      <p className="text-xs uppercase tracking-[0.22em] text-ink/45">{label}</p>
-      <p className="mt-3 text-2xl font-semibold tracking-tight text-ink">{value}</p>
-      {hint ? <p className="mt-2 text-sm leading-6 text-ink/58">{hint}</p> : null}
+      <p className={cn(
+        "text-xs tracking-tight text-ink/70",
+        /^[A-Z\s]+$/.test(label ?? "") && "uppercase tracking-wider"
+      )}>
+        {label}
+      </p>
+      <p className="mt-3 font-mono text-2xl font-semibold tracking-tight text-ink" style={{ fontVariantNumeric: "tabular-nums" }}>
+        {value}
+      </p>
+      {hint ? <p className="mt-2 text-sm leading-6 text-ink/65">{hint}</p> : null}
     </div>
   );
 }

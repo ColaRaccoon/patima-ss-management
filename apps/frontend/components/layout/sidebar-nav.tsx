@@ -39,8 +39,8 @@ export function SidebarNav() {
             <FolderSync className="h-6 w-6" />
           </div>
           <div>
-            <p className="text-xs uppercase tracking-[0.28em] text-white/55">
-              Internal Console
+            <p className="text-xs uppercase tracking-wider text-white/55">
+              내부 관리 콘솔
             </p>
             <h1 className="mt-1 text-lg font-semibold">Patima Naver SS</h1>
           </div>
@@ -70,7 +70,7 @@ export function SidebarNav() {
         </nav>
 
         <div className="mt-auto rounded-3xl border border-white/10 bg-white/5 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-white/45">
+          <p className="text-xs uppercase tracking-wider text-white/45">
             MVP Principle
           </p>
           <p className="mt-3 text-sm leading-6 text-white/72">

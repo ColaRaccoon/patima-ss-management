@@ -183,12 +183,14 @@ export const ensureKstDateRange = (
   return { dateFrom, dateTo, rangeMode: "MANUAL" };
 };
 
-export const formatDate = (date: Date): string => {
-  const year = date.getUTCFullYear();
-  const month = `${date.getUTCMonth() + 1}`.padStart(2, "0");
-  const day = `${date.getUTCDate()}`.padStart(2, "0");
-  return `${year}-${month}-${day}`;
-};
+const kstDateFmt = new Intl.DateTimeFormat("en-CA", {
+  timeZone: KST_TIMEZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+export const formatDate = (date: Date): string => kstDateFmt.format(date);
 
 export const paginate = <T>(
   items: T[],

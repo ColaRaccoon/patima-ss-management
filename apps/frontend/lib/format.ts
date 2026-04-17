@@ -35,6 +35,20 @@ export function formatCurrency(value: number | null | undefined) {
   return currencyFormatter.format(value);
 }
 
+export function formatCurrencyWithSign(
+  value: number | null | undefined,
+  options?: { showPlus?: boolean }
+): { text: string; isNegative: boolean } {
+  if (value == null) {
+    return { text: "미산정", isNegative: false };
+  }
+  const isNegative = value < 0;
+  const absValue = Math.abs(value);
+  const formatted = currencyFormatter.format(absValue);
+  const signed = isNegative ? `-${formatted}` : (options?.showPlus ? `+${formatted}` : formatted);
+  return { text: signed, isNegative };
+}
+
 export function formatNumber(value: number | null | undefined) {
   if (value == null) {
     return "-";

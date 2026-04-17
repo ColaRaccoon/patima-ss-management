@@ -13,7 +13,7 @@ const toneClassMap: Record<StatusTone, string> = {
   success: "border-sage/25 bg-sage/15 text-sage",
   warning: "border-amber-300/35 bg-amber-100/80 text-amber-800",
   danger: "border-red-300/35 bg-red-100/80 text-red-700",
-  muted: "border-ink/8 bg-ink/6 text-ink/68",
+  muted: "border-ink/8 bg-ink/6 text-ink/70",
   accent: "border-coral/20 bg-coral/10 text-coral",
 };
 

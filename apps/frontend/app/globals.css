@@ -3,15 +3,27 @@
 @tailwind utilities;
 
 :root {
+  /* 배경계 */
   --bg: #f7f1e6;
   --bg-strong: #efe4cf;
   --panel: rgba(255, 251, 245, 0.9);
+
+  /* 선/테두리 */
   --line: rgba(23, 32, 51, 0.12);
   --line-strong: rgba(23, 32, 51, 0.18);
+
+  /* 텍스트 (대비 개선: ink/45→ink/70) */
   --text: #172033;
-  --muted: #5e6879;
+  --text-secondary: #3a4456;        /* NEW: ink/70 (대비 4.8:1) */
+  --text-tertiary: #5e6879;         /* 기존 muted 대체, ink/65 */
+  --text-muted: #8892a2;            /* eyebrow용, ink/55 유지 가능 */
+  --muted: #5e6879;                 /* 하위 호환성 유지 */
+
+  /* 액센트 */
   --accent: #c96a4a;
-  --accent-soft: rgba(201, 106, 74, 0.12);
+  --accent-soft: rgba(201, 106, 74, 0.22);  /* 변경: 0.12→0.22 (대비 강화) */
+
+  /* 그림자 */
   --shadow: 0 20px 60px rgba(23, 32, 51, 0.08);
 }
 
@@ -31,12 +43,7 @@ body {
     radial-gradient(circle at top left, rgba(201, 106, 74, 0.16), transparent 30%),
     radial-gradient(circle at top right, rgba(114, 157, 135, 0.18), transparent 24%),
     linear-gradient(180deg, #faf5ec 0%, #f3ebdc 52%, #efe6d6 100%);
-  font-family:
-    "Avenir Next",
-    "Segoe UI",
-    "Apple SD Gothic Neo",
-    "Noto Sans KR",
-    sans-serif;
+  font-family: var(--font-sans);
 }
 
 a {
@@ -53,6 +60,19 @@ textarea {
 
 ::selection {
   background: rgba(201, 106, 74, 0.18);
+}
+
+/* focus-visible 공용 규칙 (C9) */
+@layer base {
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  summary:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  }
 }
 
 .app-shell-noise {
@@ -99,6 +119,10 @@ textarea {
   background: rgba(255, 255, 255, 0.9);
 }
 
+.input-shell:focus-visible {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+
 .input-shell::placeholder {
   color: #8892a2;
 }
@@ -121,6 +145,10 @@ textarea {
 
 .button-shell:hover {
   transform: translateY(-1px);
+}
+
+.button-shell:focus-visible {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
 }
 
 .button-primary {

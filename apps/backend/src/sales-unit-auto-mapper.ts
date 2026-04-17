@@ -98,7 +98,7 @@ export const getActiveSalesUnitsForAutoMapping = (
   storeId: string,
 ): CanonicalSalesUnit[] =>
   database.canonicalSalesUnits.filter(
-    (item) => item.storeId === storeId && item.isActive && (item.normalizedMatchAliases ?? []).length > 0,
+    (item) => item.storeId === storeId && item.isActive && !item.isGroup && (item.normalizedMatchAliases ?? []).length > 0,
   );
 
 export const getActiveSalesUnitsForIdMapping = (

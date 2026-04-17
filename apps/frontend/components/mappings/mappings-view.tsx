@@ -1108,14 +1108,18 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 >
                   <option value="">판매단위 선택</option>
                   {[...data.salesUnits]
-                    .filter((u) => !u.isGroup && u.isActive)
+                    .filter((u) => u.isActive && (u.isStoreLevel || u.isGroup || !u.parentSalesUnitId))
                     .sort((a, b) => {
-                      if (a.isStoreLevel === b.isStoreLevel) return 0;
-                      return a.isStoreLevel ? -1 : 1;
+                      if (a.isStoreLevel !== b.isStoreLevel) return a.isStoreLevel ? -1 : 1;
+                      return a.displayName.localeCompare(b.displayName, "ko");
                     })
                     .map((salesUnit) => (
                       <option key={salesUnit.id} value={salesUnit.id}>
-                        {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
+                        {salesUnit.isStoreLevel
+                          ? `[스토어 전체] ${salesUnit.displayName}`
+                          : salesUnit.isGroup
+                            ? `[그룹] ${salesUnit.displayName}`
+                            : salesUnit.displayName}
                       </option>
                     ))}
                 </select>

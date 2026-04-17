@@ -514,7 +514,12 @@ export class OrderSyncService implements OnModuleInit {
     const items: SyncedOrderItemInput[] = [];
 
     for (let cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
-      const isoDate = cursor.toISOString().slice(0, 10);
+      const isoDate = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Seoul",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(cursor);
       ORDER_TEMPLATES.forEach((template, index) => {
         const externalOrderId = `${isoDate.replace(/-/g, "")}${String(index + 1).padStart(4, "0")}`;
         const externalProductOrderId = `${externalOrderId}-ITEM`;

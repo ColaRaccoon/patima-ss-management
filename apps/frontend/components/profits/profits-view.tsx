@@ -35,6 +35,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
   const [expandedGroups, setExpandedGroups] = useState<ExpandedGroups>({});
+  const [excludedSummaryExpanded, setExcludedSummaryExpanded] = useState(false);
 
   useEffect(() => {
     setSelectedDate(data.dateTo);
@@ -119,56 +120,55 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
     return null;
   })();
 
+  // Prepare date filter form for PageHeader actions
+  const dateFilterForm = (
+    <form
+      className="flex flex-wrap items-end gap-3"
+      onSubmit={(event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        applyDateFilter(selectedDate);
+      }}
+    >
+      <label className="block w-40">
+        <span className="mb-2 block text-sm font-medium text-ink">날짜</span>
+        <input
+          className="input-shell"
+          type="date"
+          required
+          value={selectedDate}
+          onChange={(event) => setSelectedDate(event.target.value)}
+        />
+      </label>
+      <button
+        className="button-shell button-primary"
+        type="submit"
+        disabled={isRefreshing}
+      >
+        {isRefreshing ? "새로고침 중..." : "새로고침"}
+      </button>
+    </form>
+  );
+
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="손익"
         title="판매단위 손익 분석"
         description={`기간 ${formatDateRange(data.dateFrom, data.dateTo)}. 충돌 및 미매핑 행은 제외되며, 배송비 규칙이 확정되기 전까지 배송비는 상품 매출과 분리되어 관리됩니다.`}
+        actions={
+          <div className="space-y-3">
+            {dateFilterForm}
+            {dateAvailabilityNotice ? (
+              <div className="rounded-2xl border border-amber-300/40 bg-amber-100/70 px-4 py-3 text-sm leading-6 text-amber-900">
+                <p className="font-semibold">{dateAvailabilityNotice.title}</p>
+                <p className="mt-1">{dateAvailabilityNotice.description}</p>
+              </div>
+            ) : null}
+          </div>
+        }
       />
 
       <SourceBanner sources={data.sources} />
-
-      <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-900">
-        <p className="font-semibold">현재 배송비는 별도로 관리됩니다.</p>
-        <p className="mt-1">
-          배송 규칙과 배송비/보조금 처리가 확정되기 전까지 상품 매출, 대략 손익, 예상 순이익에서 배송비는 제외됩니다.
-        </p>
-      </div>
-
-      {dateAvailabilityNotice ? (
-        <div className="rounded-2xl border border-amber-300/40 bg-amber-100/70 px-4 py-4 text-sm leading-6 text-amber-900">
-          <p className="font-semibold">{dateAvailabilityNotice.title}</p>
-          <p className="mt-1">{dateAvailabilityNotice.description}</p>
-        </div>
-      ) : null}
-
-      <Panel
-        title="날짜 필터"
-        description={`현재 날짜 ${formatDate(data.dateTo)}. 선택한 날짜를 기준으로 표와 요약 카드가 다시 계산됩니다.`}
-      >
-        <form
-          className="flex flex-wrap items-end gap-3"
-          onSubmit={(event: FormEvent<HTMLFormElement>) => {
-            event.preventDefault();
-            applyDateFilter(selectedDate);
-          }}
-        >
-          <label className="block min-w-56">
-            <span className="mb-2 block text-sm font-medium text-ink">날짜</span>
-            <input
-              className="input-shell"
-              type="date"
-              required
-              value={selectedDate}
-              onChange={(event) => setSelectedDate(event.target.value)}
-            />
-          </label>
-          <button className="button-shell button-primary" type="submit" disabled={isRefreshing}>
-            새로고침
-          </button>
-        </form>
-      </Panel>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <StatCard
@@ -199,22 +199,58 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           }
           tone={toneForProfitStatus(data.summary.profitStatus)}
         />
+        {hasConflict ? (
+          <StatCard
+            label="충돌 매핑"
+            value={`주문 ${formatCurrency(data.unmappedSummary.conflictOrderRevenue)} / 광고비 ${formatCurrency(data.unmappedSummary.conflictAdCost)}`}
+            hint="손익 합계에서 제외됨"
+            tone="danger"
+          />
+        ) : null}
       </div>
 
-      {hasConflict ? (
-        <div className="rounded-2xl border border-red-300/40 bg-red-100/70 px-4 py-4 text-sm leading-6 text-red-800">
-          <p className="font-semibold">충돌 매핑은 손익 합계에서 제외됩니다.</p>
-          <p className="mt-1">
-            주문 상품 매출 {formatCurrency(data.unmappedSummary.conflictOrderRevenue)} / 광고비 {formatCurrency(data.unmappedSummary.conflictAdCost)}
-          </p>
-        </div>
-      ) : null}
-
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-        <div className="space-y-4">
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.3fr)_minmax(340px,0.7fr)]">
+        <div className="relative space-y-4">
+          {isRefreshing && (
+            <div className="absolute inset-0 z-50 flex items-center justify-center rounded-[30px] bg-white/40">
+              <p className="text-sm font-medium text-ink">데이터를 새로고침 중입니다...</p>
+            </div>
+          )}
           {(() => {
             const storeLevelRows = data.profits.filter((row) => row.isStoreLevel);
             const groupAndRegularRows = data.profits.filter((row) => !row.isStoreLevel && !row.parentSalesUnitId);
+
+            const handleRowClick = async (row: DailySalesUnitProfit & { _isChild?: boolean; _parentId?: string }) => {
+              // 자식 행은 선택하지 않음
+              if (row._isChild) return;
+
+              const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
+              if (rowKey === selectedProfitKey && selectedDetail?.date === row.date) {
+                return;
+              }
+
+              setSelectedProfitKey(rowKey);
+              setDetailError(null);
+              setIsLoadingDetail(true);
+              try {
+                const detail = await readApiResponse<DailySalesUnitDetail>(
+                  await fetch(
+                    `/api/profits/daily-sales-units/${row.canonicalSalesUnitId}?storeId=${data.primaryStore!.id}&date=${row.date}`,
+                    {
+                      cache: "no-store",
+                    },
+                  ),
+                  "손익 상세를 불러오지 못했습니다.",
+                );
+                setSelectedDetail(detail);
+              } catch (error) {
+                setDetailError(
+                  error instanceof Error ? error.message : "손익 상세를 불러오지 못했습니다.",
+                );
+              } finally {
+                setIsLoadingDetail(false);
+              }
+            };
 
             const renderExpandableTable = (rows: typeof data.profits, title: string) => {
               // 확장 가능한 구조로 변환: 그룹 행 + 그룹에 속한 자식들
@@ -236,76 +272,34 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                     caption={title}
                     columns={[
                       {
-                        key: "expand",
-                        title: "",
-                        render: (row) => {
-                          if (!row.isGroup || !row.childRows?.length) return null;
-                          const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
-                          return (
-                            <button
-                              className="button-shell button-ghost p-1 text-xs"
-                              type="button"
-                              onClick={() =>
-                                setExpandedGroups((current) => ({
-                                  ...current,
-                                  [rowKey]: !current[rowKey],
-                                }))
-                              }
-                            >
-                              {expandedGroups[rowKey] ? "▼" : "▸"}
-                            </button>
-                          );
-                        },
-                      },
-                      {
-                        key: "select",
-                        title: "선택",
-                        render: (row) => (
-                          <button
-                            className="button-shell button-ghost"
-                            type="button"
-                            onClick={async () => {
-                              const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
-                              if (rowKey === selectedProfitKey && selectedDetail?.date === row.date) {
-                                return;
-                              }
-
-                              setSelectedProfitKey(rowKey);
-                              setDetailError(null);
-                              setIsLoadingDetail(true);
-                              try {
-                                const detail = await readApiResponse<DailySalesUnitDetail>(
-                                  await fetch(
-                                    `/api/profits/daily-sales-units/${row.canonicalSalesUnitId}?storeId=${data.primaryStore!.id}&date=${row.date}`,
-                                    {
-                                      cache: "no-store",
-                                    },
-                                  ),
-                                  "손익 상세를 불러오지 못했습니다.",
-                                );
-                                setSelectedDetail(detail);
-                              } catch (error) {
-                                setDetailError(
-                                  error instanceof Error ? error.message : "손익 상세를 불러오지 못했습니다.",
-                                );
-                              } finally {
-                                setIsLoadingDetail(false);
-                              }
-                            }}
-                          >
-                            {`${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey ? "선택됨" : "열기"}
-                          </button>
-                        ),
-                      },
-                      {
                         key: "salesUnit",
                         title: "판매단위",
                         render: (row) => {
                           const hasSingleItem = row.displayName.includes("단품");
                           const hasBundle = row.displayName.includes("1+1");
+                          const isExpandable = row.isGroup && row.childRows?.length;
+                          const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
+                          const isGroupExpanded = expandedGroups[rowKey];
+
                           return (
                             <div className={row._isChild ? "ml-6 text-xs" : ""}>
                               <div className="flex items-center gap-2">
+                                {isExpandable && (
+                                  <button
+                                    className="button-shell button-ghost p-1 text-xs shrink-0"
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setExpandedGroups((current) => ({
+                                        ...current,
+                                        [rowKey]: !current[rowKey],
+                                      }));
+                                    }}
+                                  >
+                                    {isGroupExpanded ? "▼" : "▸"}
+                                  </button>
+                                )}
+                                {!isExpandable && <span className="w-8" />}
                                 {row._isChild && <span className="text-amber-600">└</span>}
                                 <p className={row._isChild ? "text-xs font-normal" : "font-semibold text-ink"}>{row.displayName}</p>
                                 {row.isGroup && <span className="inline-block rounded-full bg-purple-100 px-1.5 py-0.5 text-xs font-semibold text-purple-700">그룹</span>}
@@ -320,36 +314,56 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                       {
                         key: "quantity",
                         title: "수량",
+                        className: "text-right",
                         render: (row) => (row.isStoreLevel || row.isGroup || row._isChild ? formatNumber(row.totalQuantity) : formatNumber(row.totalQuantity)),
                       },
                       {
                         key: "revenue",
                         title: "상품 매출",
+                        className: "text-right",
                         render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalProductRevenue)),
                       },
                       {
                         key: "adCost",
                         title: "광고비",
+                        className: "text-right",
                         render: (row) => (row._isChild ? "-" : formatCurrency(row.totalAdCost)),
                       },
                       {
                         key: "feeCost",
                         title: "수수료",
+                        className: "text-right",
                         render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalFeeCost)),
+                      },
+                      {
+                        key: "unitCost",
+                        title: "원가",
+                        className: "text-right",
+                        render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalUnitCost)),
+                      },
+                      {
+                        key: "otherCost",
+                        title: "기타비용",
+                        className: "text-right",
+                        render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalOtherCost)),
                       },
                       {
                         key: "roughProfit",
                         title: "대략 손익",
+                        className: "text-right",
                         render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.roughProfit)),
                       },
                       {
                         key: "netProfit",
                         title: "순이익",
+                        className: "text-right",
                         render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.estimatedNetProfit)),
                       },
                     ]}
                     rows={expandableRows}
-                    getRowKey={(row) => `${row.canonicalSalesUnitId}-${row.date}-${row._parentId ? row._parentId : ''}`}
+                    getRowKey={(row) => `${row.canonicalSalesUnitId}-${row.date}${row._isChild ? '-child-' + row._parentId : ''}`}
+                    selectedRowKey={selectedProfitKey}
+                    onRowClick={handleRowClick}
                   />
                 </Panel>
               );
@@ -364,40 +378,57 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           })()}
         </div>
 
-        <div className="space-y-6">
-          <Panel title="제외된 합계">
-            <div className="grid gap-3">
-              <StatCard
-                label="미매핑 주문 상품 매출"
-                value={formatCurrency(data.unmappedSummary.unmappedOrderRevenue)}
-                hint={`${formatNumber(data.unmappedSummary.unmappedOrderItemCount)}건`}
-                tone="warning"
-              />
-              <StatCard
-                label="충돌 주문 상품 매출"
-                value={formatCurrency(data.unmappedSummary.conflictOrderRevenue)}
-                hint={`${formatNumber(data.unmappedSummary.conflictOrderItemCount)}건`}
-                tone="danger"
-              />
-              <StatCard
-                label="미매핑 광고비"
-                value={formatCurrency(data.unmappedSummary.unmappedAdCost)}
-                hint={`${formatNumber(data.unmappedSummary.unmappedCampaignCount)}개 캠페인`}
-                tone="warning"
-              />
-              <StatCard
-                label="충돌 광고비"
-                value={formatCurrency(data.unmappedSummary.conflictAdCost)}
-                hint={`${formatNumber(data.unmappedSummary.conflictCampaignCount)}개 캠페인`}
-                tone="danger"
-              />
-              <StatCard
-                label="의도적 미매핑 광고비"
-                value={formatCurrency(data.unmappedSummary.intentionalUnmappedAdCost)}
-                hint={`${formatNumber(data.unmappedSummary.intentionalUnmappedCampaignCount)}개 캠페인`}
-                tone="muted"
-              />
-            </div>
+        <div className="xl:sticky xl:top-6 space-y-6">
+          <Panel
+            title="제외된 합계"
+            aside={
+              <button
+                className="button-shell button-ghost text-xs"
+                type="button"
+                onClick={() => setExcludedSummaryExpanded(!excludedSummaryExpanded)}
+              >
+                {excludedSummaryExpanded ? "축소" : "펼치기"}
+              </button>
+            }
+          >
+            {excludedSummaryExpanded ? (
+              <div className="grid gap-3">
+                <StatCard
+                  label="미매핑 주문 상품 매출"
+                  value={formatCurrency(data.unmappedSummary.unmappedOrderRevenue)}
+                  hint={`${formatNumber(data.unmappedSummary.unmappedOrderItemCount)}건`}
+                  tone="warning"
+                />
+                <StatCard
+                  label="충돌 주문 상품 매출"
+                  value={formatCurrency(data.unmappedSummary.conflictOrderRevenue)}
+                  hint={`${formatNumber(data.unmappedSummary.conflictOrderItemCount)}건`}
+                  tone="danger"
+                />
+                <StatCard
+                  label="미매핑 광고비"
+                  value={formatCurrency(data.unmappedSummary.unmappedAdCost)}
+                  hint={`${formatNumber(data.unmappedSummary.unmappedCampaignCount)}개 캠페인`}
+                  tone="warning"
+                />
+                <StatCard
+                  label="충돌 광고비"
+                  value={formatCurrency(data.unmappedSummary.conflictAdCost)}
+                  hint={`${formatNumber(data.unmappedSummary.conflictCampaignCount)}개 캠페인`}
+                  tone="danger"
+                />
+                <StatCard
+                  label="의도적 미매핑 광고비"
+                  value={formatCurrency(data.unmappedSummary.intentionalUnmappedAdCost)}
+                  hint={`${formatNumber(data.unmappedSummary.intentionalUnmappedCampaignCount)}개 캠페인`}
+                  tone="muted"
+                />
+              </div>
+            ) : (
+              <div className="flex items-center justify-center rounded-lg bg-ink/3 py-8">
+                <p className="text-xs text-ink/50">펼쳐서 상세 항목을 확인하세요</p>
+              </div>
+            )}
           </Panel>
 
           <Panel title="상세 미리보기">
@@ -407,9 +438,13 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
               </div>
             ) : null}
 
-            {selectedDetail ? (
-              <div className="space-y-3 text-sm leading-6 text-ink/65">
-                <div className="flex items-center justify-between gap-3">
+            {isLoadingDetail ? (
+              <div className="flex items-center justify-center py-12">
+                <p className="text-sm text-ink/60">상세를 불러오는 중...</p>
+              </div>
+            ) : selectedDetail ? (
+              <div className="space-y-6">
+                <div className="flex items-center justify-between gap-3 pb-4 border-b border-ink/8">
                   <p className="font-semibold text-ink">{selectedDetail.displayName}</p>
                   <StatusBadge tone={toneForProfitStatus(selectedDetail.summary.profitStatus)}>
                     {selectedDetail.summary.profitStatus === "COMPLETE"
@@ -419,22 +454,87 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                         : selectedDetail.summary.profitStatus}
                   </StatusBadge>
                 </div>
-                <p>
-                  주문 {formatNumber(selectedDetail.orderItems.length)}건 / 광고 {formatNumber(selectedDetail.adCampaigns.length)}건
-                </p>
-                <p>총 수량 {formatNumber(selectedDetail.summary.totalQuantity)}</p>
-                <p>상품 매출 {formatCurrency(selectedDetail.summary.totalProductRevenue)}</p>
-                <p>계산된 수수료 {formatCurrency(selectedDetail.costBreakdown.computedFeeCost)}</p>
-                <p>폴백 수수료 분담 {formatCurrency(selectedDetail.costBreakdown.fallbackFeeCostPortion)}</p>
-                <p>배송비 참고값은 스토어·날짜 요약 단계에서만 표시됩니다.</p>
-                <p>제외된 주문 상품 매출 {formatCurrency(selectedDetail.excludedSummary.excludedOrderRevenue)}</p>
-                <p>제외된 충돌 주문 상품 매출 {formatCurrency(selectedDetail.excludedSummary.excludedConflictOrderRevenue)}</p>
-                <p>제외된 광고비 {formatCurrency(selectedDetail.excludedSummary.excludedAdCost)}</p>
-                <p>제외된 충돌 광고비 {formatCurrency(selectedDetail.excludedSummary.excludedConflictAdCost)}</p>
-                {isLoadingDetail ? <p>상세를 불러오는 중...</p> : null}
+
+                {/* Group 1: 거래 요약 */}
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider text-ink/45 font-semibold mb-3">거래 요약</h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <p className="text-xs text-ink/55">주문 건수</p>
+                      <p className="mt-1 text-sm font-semibold text-ink">{formatNumber(selectedDetail.orderItems?.length ?? 0)}건</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-ink/55">광고 캠페인</p>
+                      <p className="mt-1 text-sm font-semibold text-ink">{formatNumber(selectedDetail.adCampaigns?.length ?? 0)}개</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border-b border-ink/8" />
+
+                {/* Group 2: 주요 수치 */}
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider text-ink/45 font-semibold mb-3">주요 수치</h3>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-ink/55">총 수량</p>
+                      <p className="text-sm font-semibold text-ink">{formatNumber(selectedDetail.summary.totalQuantity)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-ink/55">상품 매출</p>
+                      <p className="text-sm font-semibold text-ink">{formatCurrency(selectedDetail.summary.totalProductRevenue)}</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border-b border-ink/8" />
+
+                {/* Group 3: 수수료 내역 */}
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider text-ink/45 font-semibold mb-3">수수료 내역</h3>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-ink/55">계산된 수수료</p>
+                      <p className="text-sm font-semibold text-ink">{formatCurrency(selectedDetail.costBreakdown.computedFeeCost)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-ink/55">폴백 수수료 분담</p>
+                      <p className="text-sm font-semibold text-ink">{formatCurrency(selectedDetail.costBreakdown.fallbackFeeCostPortion)}</p>
+                    </div>
+                    <p className="text-xs text-ink/50 mt-2">배송비 참고값은 스토어·날짜 요약 단계에서만 표시됩니다.</p>
+                  </div>
+                </div>
+
+                <div className="border-b border-ink/8" />
+
+                {/* Group 4: 제외된 항목 */}
+                <div className="rounded-lg bg-amber-100/40 p-3">
+                  <h3 className="text-xs uppercase tracking-wider text-amber-900/60 font-semibold mb-3">제외된 항목</h3>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex items-center justify-between">
+                      <p className="text-amber-900/70">제외된 주문 상품 매출</p>
+                      <p className="font-semibold text-amber-900">{formatCurrency(selectedDetail.excludedSummary.excludedOrderRevenue)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-amber-900/70">제외된 충돌 주문 상품 매출</p>
+                      <p className="font-semibold text-amber-900">{formatCurrency(selectedDetail.excludedSummary.excludedConflictOrderRevenue)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-amber-900/70">제외된 광고비</p>
+                      <p className="font-semibold text-amber-900">{formatCurrency(selectedDetail.excludedSummary.excludedAdCost)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-amber-900/70">제외된 충돌 광고비</p>
+                      <p className="font-semibold text-amber-900">{formatCurrency(selectedDetail.excludedSummary.excludedConflictAdCost)}</p>
+                    </div>
+                  </div>
+                </div>
               </div>
             ) : (
-              <p className="text-sm text-ink/60">선택된 상세가 없습니다.</p>
+              <div className="text-center py-8">
+                <p className="text-sm font-medium text-ink">선택된 행이 없습니다</p>
+                <p className="mt-2 text-xs text-ink/55">왼쪽 표에서 행을 클릭하여 상세 정보를 확인하세요.</p>
+              </div>
             )}
           </Panel>
         </div>

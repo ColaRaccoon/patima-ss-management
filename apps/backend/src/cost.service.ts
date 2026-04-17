@@ -280,6 +280,11 @@ export class CostService {
   private minusOneDay(dateString: string) {
     const date = new Date(`${dateString}T00:00:00+09:00`);
     date.setDate(date.getDate() - 1);
-    return date.toISOString().slice(0, 10);
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(date);
   }
 }
