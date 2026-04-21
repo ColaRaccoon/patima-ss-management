@@ -1,5 +1,5 @@
 import { Injectable, OnApplicationBootstrap } from "@nestjs/common";
-import { CommerceCredential, Store } from "@patima/shared";
+import { CommerceCredential, DEFAULT_DELIVERY_UNIT_COST, Store } from "@patima/shared";
 import { CryptoService } from "./crypto.service";
 import { DatabaseService } from "./database.service";
 import { createId, nowIso } from "./helpers";
@@ -43,6 +43,7 @@ export class EnvironmentBootstrapService implements OnApplicationBootstrap {
           lastOrderSyncStatus: "NEVER",
           credentialConnectionStatus: "NOT_TESTED",
           lastCredentialTestAt: null,
+          deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
           createdAt: now,
           updatedAt: now,
         } satisfies Store;

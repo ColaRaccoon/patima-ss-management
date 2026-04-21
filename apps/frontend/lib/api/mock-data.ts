@@ -2,6 +2,7 @@ import type {
   DashboardSummary,
   DailySalesUnitProfit,
 } from "@patima/shared";
+import { DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import type {
   AdPreviewRowItem,
   AdPreviewSummary,
@@ -38,6 +39,7 @@ export const mockStores: StoreListItem[] = [
     credentialConnectionStatus: "SUCCEEDED",
     lastCredentialTestAt: "2026-04-01T10:00:00+09:00",
     memo: "대표 시연용 스토어",
+    deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
   },
 ];
 
@@ -236,6 +238,13 @@ export const mockDashboardSummary: DashboardSummary = {
   excludedUnmappedAdCost: 60000,
   excludedConflictAdCost: 18000,
   excludedIntentionalUnmappedAdCost: 23200,
+  totalVatAmount: 153820,
+  totalVatAdjustedRevenue: 1384380,
+  uniquePackageCount: 3,
+  deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
+  estimatedDeliveryBaseCost: 10500,
+  customerPaidDeliveryFee: 12000,
+  storeBorneDeliveryCost: 0,
 };
 
 export const mockProfits: DailySalesUnitProfit[] = [
@@ -254,6 +263,8 @@ export const mockProfits: DailySalesUnitProfit[] = [
     roughProfit: 108068,
     estimatedNetProfit: 25245.5,
     profitStatus: "COMPLETE",
+    vatAmount: 22350,
+    vatAdjustedRevenue: 201150,
   },
   {
     date: MOCK_SELECTED_DATE,
@@ -270,6 +281,8 @@ export const mockProfits: DailySalesUnitProfit[] = [
     roughProfit: 145400,
     estimatedNetProfit: 21000,
     profitStatus: "COMPLETE",
+    vatAmount: 28490,
+    vatAdjustedRevenue: 256410,
   },
   {
     date: MOCK_SELECTED_DATE,
@@ -286,6 +299,8 @@ export const mockProfits: DailySalesUnitProfit[] = [
     roughProfit: 94600,
     estimatedNetProfit: null,
     profitStatus: "INCOMPLETE_COST",
+    vatAmount: 11900,
+    vatAdjustedRevenue: 107100,
   },
 ];
 

@@ -1,4 +1,5 @@
 import type { DashboardSummary, DailySalesUnitProfit, SaleStatus } from "@patima/shared";
+import { DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import { fetchApi, withQuery } from "@/lib/api/client";
 import {
   mockAdCosts,
@@ -225,10 +226,21 @@ function createMockDailySalesUnitDetail(
     summary: row,
     orderItems: [],
     adCampaigns: [],
-    deliveryFeeSummary: {
-      totalDeliveryFeeAmount: row.totalDeliveryFeeAmount,
-      includedInProductRevenue: false,
-      includedInEstimatedNetProfit: false,
+    revenueBreakdown: {
+      productRevenueOriginal: row.totalProductRevenue,
+      vatRate: 0.1,
+      vatAmount: row.vatAmount,
+      vatAdjustedRevenue: row.vatAdjustedRevenue,
+      appliedInEstimatedNetProfit: true,
+    },
+    deliveryContext: {
+      uniquePackageCount: 0,
+      deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
+      estimatedDeliveryBaseCost: 0,
+      customerPaidDeliveryFee: row.totalDeliveryFeeAmount,
+      storeBorneDeliveryCost: 0,
+      includedInThisSalesUnitNetProfit: false,
+      note: "스토어 공통 비용으로 대시보드에서만 순이익에 반영됩니다",
     },
     costBreakdown: {
       costSettingStatus: mockProfitDetailPreview.profitStatus,

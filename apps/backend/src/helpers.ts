@@ -5,6 +5,7 @@ import {
   DailySalesUnitProfit,
   DashboardSummary,
   DatabaseShape,
+  DEFAULT_DELIVERY_UNIT_COST,
   MappingStatus,
   OrderItem,
   OrderSourceSignature,
@@ -13,6 +14,7 @@ import {
   SaleStatus,
   SalesUnitCostSetting,
   Store,
+  VAT_RATE,
   normalizeMatchAlias,
   normalizeText,
 } from "@patima/shared";
@@ -543,6 +545,37 @@ export const calculateFee = (
 export const computeProfitStatus = (hasIncomplete: boolean): ProfitStatus =>
   hasIncomplete ? "INCOMPLETE_COST" : "COMPLETE";
 
+// VAT utilities
+export const calculateVatAmount = (productRevenue: number): number =>
+  Math.round(productRevenue * VAT_RATE);
+
+export const calculateVatAdjustedRevenue = (productRevenue: number): number =>
+  productRevenue - calculateVatAmount(productRevenue);
+
+// Delivery package utilities
+export const resolvePackageKey = (item: OrderItem): string => {
+  const trimmed = item.packageNumber?.trim() ?? "";
+  return trimmed || item.orderId;
+};
+
+export const calculateEstimatedDeliveryBaseCost = (
+  uniquePackageCount: number,
+  deliveryUnitCost: number,
+): number => uniquePackageCount * deliveryUnitCost;
+
+export const calculateStoreBorneDeliveryCost = (
+  estimated: number,
+  customerPaid: number,
+): number => Math.max(0, estimated - customerPaid);
+
+export interface StoreDeliverySummary {
+  uniquePackageCount: number;
+  deliveryUnitCost: number;
+  estimatedDeliveryBaseCost: number;
+  customerPaidDeliveryFee: number;
+  storeBorneDeliveryCost: number;
+}
+
 const initRow = (
   date: string,
   canonicalSalesUnitId: string,
@@ -564,8 +597,27 @@ const initRow = (
   roughProfit: 0,
   estimatedNetProfit: 0,
   profitStatus: "COMPLETE" as ProfitStatus,
+  vatAmount: 0,
+  vatAdjustedRevenue: 0,
   fallbackIncomplete: false,
 });
+
+const finalizeRow = (
+  row: DailySalesUnitProfit & { fallbackIncomplete: boolean },
+): void => {
+  row.vatAmount = calculateVatAmount(row.totalProductRevenue);
+  row.vatAdjustedRevenue = row.totalProductRevenue - row.vatAmount;
+  row.totalRevenue = row.totalProductRevenue;
+  row.roughProfit = row.totalProductRevenue - row.totalAdCost;
+  row.profitStatus = computeProfitStatus(row.fallbackIncomplete);
+  row.estimatedNetProfit = row.fallbackIncomplete
+    ? null
+    : row.vatAdjustedRevenue -
+      row.totalAdCost -
+      row.totalUnitCost -
+      row.totalFeeCost -
+      row.totalOtherCost;
+};
 
 export const calculateDailyProfitRows = (
   database: DatabaseShape,
@@ -783,12 +835,7 @@ export const calculateDailyProfitRows = (
 
   return Array.from(resultMap.values())
     .map((row) => {
-      row.totalRevenue = row.totalProductRevenue;
-      row.roughProfit = row.totalRevenue - row.totalAdCost;
-      row.profitStatus = computeProfitStatus(row.fallbackIncomplete);
-      row.estimatedNetProfit = row.fallbackIncomplete
-        ? null
-        : row.totalRevenue - row.totalAdCost - row.totalUnitCost - row.totalFeeCost - row.totalOtherCost;
+      finalizeRow(row);
 
       // childRows 첨부
       if (includeGroupChildren && row.isGroup) {
@@ -796,12 +843,7 @@ export const calculateDailyProfitRows = (
         const childRows = groupChildrenMap.get(groupKey) ?? [];
         row.childRows = childRows
           .map((childRow) => {
-            childRow.totalRevenue = childRow.totalProductRevenue;
-            childRow.roughProfit = childRow.totalRevenue - childRow.totalAdCost;
-            childRow.profitStatus = computeProfitStatus(childRow.fallbackIncomplete);
-            childRow.estimatedNetProfit = childRow.fallbackIncomplete
-              ? null
-              : childRow.totalRevenue - childRow.totalAdCost - childRow.totalUnitCost - childRow.totalFeeCost - childRow.totalOtherCost;
+            finalizeRow(childRow);
             return childRow;
           })
           .sort((left, right) =>
@@ -818,6 +860,51 @@ export const calculateDailyProfitRows = (
     );
 };
 
+export const calculateStoreDeliverySummary = (
+  database: DatabaseShape,
+  storeId: string,
+  dateFrom: string,
+  dateTo: string,
+): StoreDeliverySummary => {
+  const store = database.stores.find((s) => s.id === storeId);
+  const deliveryUnitCost = store?.deliveryUnitCost ?? DEFAULT_DELIVERY_UNIT_COST;
+
+  const packageSet = new Set<string>();
+  let customerPaidDeliveryFee = 0;
+
+  database.orderItems
+    .filter((item) =>
+      item.storeId === storeId &&
+      item.paymentDate &&
+      item.paymentDate >= dateFrom &&
+      item.paymentDate <= dateTo &&
+      item.saleStatus === "SALE" &&
+      item.canonicalSalesUnitId, // 매핑된 것만 포함
+    )
+    .forEach((item) => {
+      packageSet.add(resolvePackageKey(item));
+      customerPaidDeliveryFee += item.deliveryFeeAmount ?? 0;
+    });
+
+  const uniquePackageCount = packageSet.size;
+  const estimatedDeliveryBaseCost = calculateEstimatedDeliveryBaseCost(
+    uniquePackageCount,
+    deliveryUnitCost,
+  );
+  const storeBorneDeliveryCost = calculateStoreBorneDeliveryCost(
+    estimatedDeliveryBaseCost,
+    customerPaidDeliveryFee,
+  );
+
+  return {
+    uniquePackageCount,
+    deliveryUnitCost,
+    estimatedDeliveryBaseCost,
+    customerPaidDeliveryFee,
+    storeBorneDeliveryCost,
+  };
+};
+
 export const calculateDashboardSummary = (
   database: DatabaseShape,
   storeId: string,
@@ -828,13 +915,16 @@ export const calculateDashboardSummary = (
   // (부모 있는 자식 행은 제외되어 이중 계산 방지)
   const rows = calculateDailyProfitRows(database, storeId, date, date, undefined, false);
   const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
+  const deliverySummary = calculateStoreDeliverySummary(database, storeId, date, date);
 
   // Single pass: rows summary
   let totalProductRevenue = 0;
   let totalDeliveryFeeAmount = 0;
   let totalAdCost = 0;
   let roughProfit = 0;
-  let estimatedNetProfit = 0;
+  let totalVatAmount = 0;
+  let totalVatAdjustedRevenue = 0;
+  let sumRowEstimatedNetProfit = 0;
   let incompleteRowCount = 0;
 
   for (const row of rows) {
@@ -842,12 +932,22 @@ export const calculateDashboardSummary = (
     totalDeliveryFeeAmount += row.totalDeliveryFeeAmount;
     totalAdCost += row.totalAdCost;
     roughProfit += row.roughProfit;
+    totalVatAmount += row.vatAmount;
+    totalVatAdjustedRevenue += row.vatAdjustedRevenue;
     if (row.profitStatus === "INCOMPLETE_COST") {
       incompleteRowCount++;
     } else if (row.estimatedNetProfit !== null) {
-      estimatedNetProfit += row.estimatedNetProfit;
+      sumRowEstimatedNetProfit += row.estimatedNetProfit;
     }
   }
+
+  // 최종 순이익 = 판매단위 순이익 합 − 스토어 부담 배송비
+  const finalEstimatedNetProfit = incompleteRowCount > 0
+    ? null
+    : sumRowEstimatedNetProfit - deliverySummary.storeBorneDeliveryCost;
+
+  // 기존 estimatedNetProfit 임시 저장 (추후 복구)
+  const estimatedNetProfit = finalEstimatedNetProfit;
 
   // Single pass: eligible orders
   let unmappedOrderItemCount = 0;
@@ -901,7 +1001,6 @@ export const calculateDashboardSummary = (
   }
 
   const profitStatus = incompleteRowCount > 0 ? "INCOMPLETE_COST" : "COMPLETE";
-  const finalEstimatedNetProfit = incompleteRowCount > 0 ? null : estimatedNetProfit;
 
   return {
     date,
@@ -910,7 +1009,7 @@ export const calculateDashboardSummary = (
     totalDeliveryFeeAmount,
     totalAdCost,
     roughProfit,
-    estimatedNetProfit: finalEstimatedNetProfit,
+    estimatedNetProfit,
     profitStatus,
     salesUnitCount: rows.length,
     incompleteCostSalesUnitCount: incompleteRowCount,
@@ -927,6 +1026,13 @@ export const calculateDashboardSummary = (
     excludedUnmappedAdCost,
     excludedConflictAdCost,
     excludedIntentionalUnmappedAdCost,
+    totalVatAmount,
+    totalVatAdjustedRevenue,
+    uniquePackageCount: deliverySummary.uniquePackageCount,
+    deliveryUnitCost: deliverySummary.deliveryUnitCost,
+    estimatedDeliveryBaseCost: deliverySummary.estimatedDeliveryBaseCost,
+    customerPaidDeliveryFee: deliverySummary.customerPaidDeliveryFee,
+    storeBorneDeliveryCost: deliverySummary.storeBorneDeliveryCost,
   };
 };
 

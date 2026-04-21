@@ -48,35 +48,29 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
       <SourceBanner sources={data.sources} />
 
       <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-950">
-        <p className="font-semibold">배송료는 순이익 합계와 별도로 표시됩니다.</p>
+        <p className="font-semibold">순손익 = 판매단위별 순손익 합 − 스토어 부담 배송비</p>
         <p className="mt-1">
-          상품 매출, 조정 손익, 순손익은 현재 배송료 규칙과 배송비/보조금 처리가 확정될 때까지 배송료를 제외합니다.
+          각 판매단위의 순손익은 VAT 차감 매출 기준으로 계산되며, 스토어 부담 배송비는 대시보드 레벨에서만 차감됩니다.
         </p>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label={`${formatDate(data.selectedDate)} 상품 매출`}
           value={formatCurrency(data.summary.totalProductRevenue)}
           hint={`판매단위 ${formatNumber(data.summary.salesUnitCount)}개`}
         />
         <StatCard
-          label="배송료 참고"
-          value={formatCurrency(data.summary.totalDeliveryFeeAmount)}
-          hint="현재는 참고용입니다."
-          tone="muted"
+          label="VAT 차감 매출"
+          value={formatCurrency(data.summary.totalVatAdjustedRevenue)}
+          hint={`VAT ${formatCurrency(data.summary.totalVatAmount)} 차감`}
+          tone="info"
         />
         <StatCard
           label="광고비"
           value={formatCurrency(data.summary.totalAdCost)}
           hint={`제외됨 ${formatCurrency(data.summary.excludedAdCost)}`}
           tone="accent"
-        />
-        <StatCard
-          label="조정 손익"
-          value={formatCurrency(data.summary.roughProfit)}
-          hint="상품 매출 - 광고비"
-          tone={data.summary.roughProfit >= 0 ? "success" : "warning"}
         />
         <StatCard
           label="순손익(예상)"
@@ -87,6 +81,27 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
               : "모든 추적된 원가 항목이 적용되었습니다."
           }
           tone={toneForProfitStatus(data.summary.profitStatus)}
+        />
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <StatCard
+          label="추정 배송 원가"
+          value={formatCurrency(data.summary.estimatedDeliveryBaseCost)}
+          hint={`묶음 ${formatNumber(data.summary.uniquePackageCount)}건 × 단가 ${formatCurrency(data.summary.deliveryUnitCost)}`}
+          tone="muted"
+        />
+        <StatCard
+          label="스토어 부담 배송비"
+          value={formatCurrency(data.summary.storeBorneDeliveryCost)}
+          hint={`고객 부담 ${formatCurrency(data.summary.customerPaidDeliveryFee)} 차감 후`}
+          tone="muted"
+        />
+        <StatCard
+          label="조정 손익"
+          value={formatCurrency(data.summary.roughProfit)}
+          hint="상품 매출(원본) - 광고비"
+          tone={data.summary.roughProfit >= 0 ? "success" : "warning"}
         />
       </div>
 

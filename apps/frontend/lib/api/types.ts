@@ -1,6 +1,8 @@
 import type {
   DashboardSummary,
   DailySalesUnitProfit,
+  DailySalesUnitDetailRevenueBreakdown,
+  DailySalesUnitDetailDeliveryContext,
   OperationStatus,
   OperationType,
   ProfitStatus,
@@ -8,7 +10,7 @@ import type {
   WeekdayValidationStatus,
 } from "@patima/shared";
 
-export type { DailySalesUnitProfit };
+export type { DailySalesUnitProfit, DailySalesUnitDetailRevenueBreakdown, DailySalesUnitDetailDeliveryContext };
 
 export type DataSource = "live" | "mock";
 
@@ -301,11 +303,8 @@ export interface DailySalesUnitDetail {
     reportDate: string;
     totalCost: number;
   }>;
-  deliveryFeeSummary: {
-    totalDeliveryFeeAmount: number;
-    includedInProductRevenue: boolean;
-    includedInEstimatedNetProfit: boolean;
-  };
+  revenueBreakdown: DailySalesUnitDetailRevenueBreakdown;
+  deliveryContext: DailySalesUnitDetailDeliveryContext;
   costBreakdown: {
     costSettingStatus: ProfitStatus;
     unitCostPerQuantity: number;

@@ -1,9 +1,12 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
+import { VAT_RATE } from "@patima/shared";
 import { DatabaseService } from "./database.service";
 import {
   calculateDashboardSummary,
   calculateDailyProfitRows,
   calculateFee,
+  calculateStoreDeliverySummary,
+  calculateVatAmount,
   formatApiSuccess,
   getActiveConfirmedUploadIds,
   getAdMappingStatus,
@@ -113,6 +116,8 @@ export class ProfitService {
         roughProfit: 0,
         estimatedNetProfit: 0,
         profitStatus: "COMPLETE" as const,
+        vatAmount: 0,
+        vatAdjustedRevenue: 0,
       };
 
     const costSettings = snapshot.salesUnitCostSettings.filter(
@@ -156,6 +161,7 @@ export class ProfitService {
     }, 0);
     const activeCostSetting = getCostSettingForDate(costSettings, date);
     const excludedSummary = calculateDashboardSummary(snapshot, storeId, date);
+    const deliverySummary = calculateStoreDeliverySummary(snapshot, storeId, date, date);
 
     return formatApiSuccess({
       date,
@@ -177,10 +183,21 @@ export class ProfitService {
         reportDate: item.reportDate,
         totalCost: item.totalCost,
       })),
-      deliveryFeeSummary: {
-        totalDeliveryFeeAmount: summary.totalDeliveryFeeAmount,
-        includedInProductRevenue: false,
-        includedInEstimatedNetProfit: false,
+      revenueBreakdown: {
+        productRevenueOriginal: summary.totalProductRevenue,
+        vatRate: VAT_RATE,
+        vatAmount: calculateVatAmount(summary.totalProductRevenue),
+        vatAdjustedRevenue: summary.vatAdjustedRevenue,
+        appliedInEstimatedNetProfit: true,
+      },
+      deliveryContext: {
+        uniquePackageCount: deliverySummary.uniquePackageCount,
+        deliveryUnitCost: deliverySummary.deliveryUnitCost,
+        estimatedDeliveryBaseCost: deliverySummary.estimatedDeliveryBaseCost,
+        customerPaidDeliveryFee: deliverySummary.customerPaidDeliveryFee,
+        storeBorneDeliveryCost: deliverySummary.storeBorneDeliveryCost,
+        includedInThisSalesUnitNetProfit: false,
+        note: "스토어 공통 비용으로 대시보드에서만 순이익에 반영됩니다",
       },
       costBreakdown: {
         costSettingStatus: summary.profitStatus,

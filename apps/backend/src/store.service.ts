@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
-import { Store, normalizeText } from "@patima/shared";
+import { DEFAULT_DELIVERY_UNIT_COST, Store, normalizeText } from "@patima/shared";
 import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import { ensureStoreExists, createId, formatApiSuccess, nowIso } from "./helpers";
@@ -11,6 +11,7 @@ interface StorePayload {
   channelNo: string;
   memo?: string | null;
   platformType?: "NAVER_SMARTSTORE";
+  deliveryUnitCost?: number;
 }
 
 @Injectable()
@@ -64,6 +65,7 @@ export class StoreService {
       lastOrderSyncStatus: "NEVER",
       credentialConnectionStatus: "NOT_TESTED",
       lastCredentialTestAt: null,
+      deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
@@ -95,6 +97,18 @@ export class StoreService {
   update(storeId: string, payload: StorePayload) {
     this.ensureWritable(storeId);
     const previous = ensureStoreExists(this.databaseService.getSnapshot(), storeId);
+
+    // deliveryUnitCost 검증
+    if (payload.deliveryUnitCost !== undefined) {
+      if (!Number.isInteger(payload.deliveryUnitCost) || payload.deliveryUnitCost < 0) {
+        throw new BadRequestException({
+          success: false,
+          message: "배송 단가는 0 이상의 정수여야 합니다.",
+          errors: [{ field: "deliveryUnitCost", reason: "INVALID_VALUE" }],
+        });
+      }
+    }
+
     const duplicated = this.databaseService
       .getSnapshot()
       .stores.some(
@@ -120,6 +134,9 @@ export class StoreService {
       store.sellerAccountId = payload.sellerAccountId;
       store.channelNo = payload.channelNo;
       store.memo = payload.memo ?? null;
+      if (payload.deliveryUnitCost !== undefined) {
+        store.deliveryUnitCost = payload.deliveryUnitCost;
+      }
       store.updatedAt = nowIso();
       updated = { ...store };
     });
@@ -141,6 +158,7 @@ export class StoreService {
       channelNo: updated.channelNo,
       isPrimary: updated.isPrimary,
       memo: updated.memo,
+      deliveryUnitCost: updated.deliveryUnitCost,
     });
   }
 

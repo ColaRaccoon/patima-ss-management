@@ -1,3 +1,7 @@
+// Constants for profit calculation
+export const VAT_RATE = 0.1;
+export const DEFAULT_DELIVERY_UNIT_COST = 3500;
+
 export type OperationStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 export type OperationType =
   | "ORDER_SYNC"
@@ -46,6 +50,7 @@ export interface Store {
   lastOrderSyncStatus: "SUCCEEDED" | "FAILED" | "NEVER";
   credentialConnectionStatus: "SUCCEEDED" | "FAILED" | "NOT_TESTED";
   lastCredentialTestAt: string | null;
+  deliveryUnitCost: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -299,6 +304,15 @@ export interface DashboardSummary {
   excludedUnmappedAdCost: number;
   excludedConflictAdCost: number;
   excludedIntentionalUnmappedAdCost: number;
+  // VAT (부가세) fields
+  totalVatAmount: number;
+  totalVatAdjustedRevenue: number;
+  // Delivery (배송비) fields
+  uniquePackageCount: number;
+  deliveryUnitCost: number;
+  estimatedDeliveryBaseCost: number;
+  customerPaidDeliveryFee: number;
+  storeBorneDeliveryCost: number;
 }
 
 export interface DailySalesUnitProfit {
@@ -317,10 +331,31 @@ export interface DailySalesUnitProfit {
   roughProfit: number;
   estimatedNetProfit: number | null;
   profitStatus: ProfitStatus;
+  // VAT (부가세) fields
+  vatAmount: number;
+  vatAdjustedRevenue: number;
   isStoreLevel?: boolean;
   isGroup?: boolean;
   parentSalesUnitId?: string | null;
   childRows?: DailySalesUnitProfit[];
+}
+
+export interface DailySalesUnitDetailRevenueBreakdown {
+  productRevenueOriginal: number;
+  vatRate: number;
+  vatAmount: number;
+  vatAdjustedRevenue: number;
+  appliedInEstimatedNetProfit: true;
+}
+
+export interface DailySalesUnitDetailDeliveryContext {
+  uniquePackageCount: number;
+  deliveryUnitCost: number;
+  estimatedDeliveryBaseCost: number;
+  customerPaidDeliveryFee: number;
+  storeBorneDeliveryCost: number;
+  includedInThisSalesUnitNetProfit: false;
+  note: string;
 }
 
 export interface DatabaseShape {

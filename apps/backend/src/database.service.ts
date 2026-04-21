@@ -1,5 +1,5 @@
 import { Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
-import { DatabaseShape } from "@patima/shared";
+import { DatabaseShape, DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { Pool, PoolClient } from "pg";
@@ -172,6 +172,15 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
   private normalizeSnapshot(snapshot: DatabaseShape): DatabaseShape {
     const normalized = this.cloneSnapshot(snapshot);
+
+    // 스토어 deliveryUnitCost 기본값 보정 (마이그레이션)
+    normalized.stores = normalized.stores.map((store) => ({
+      ...store,
+      deliveryUnitCost:
+        typeof store.deliveryUnitCost === "number" && store.deliveryUnitCost >= 0
+          ? store.deliveryUnitCost
+          : DEFAULT_DELIVERY_UNIT_COST,
+    }));
 
     normalized.canonicalSalesUnits = normalized.canonicalSalesUnits.map((item) =>
       migrateCanonicalSalesUnit(item as never),

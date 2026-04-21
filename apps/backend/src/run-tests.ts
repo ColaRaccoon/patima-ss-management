@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createSourceSignature, normalizeText } from "@patima/shared";
+import { createSourceSignature, normalizeText, DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import * as XLSX from "xlsx";
 import { evaluateAdMapping, getAdMappingOverride } from "./ad-mapping-engine";
 import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
@@ -7,10 +7,14 @@ import {
   calculateDashboardSummary,
   calculateDailyProfitRows,
   calculateFee,
+  calculateStoreDeliverySummary,
+  calculateVatAmount,
+  calculateVatAdjustedRevenue,
   createEmptyDatabase,
   getSignatureIndex,
   getWeekdayNameKo,
   repairMojibakeText,
+  resolvePackageKey,
   saleStatusFromNaverOrderState,
   saleStatusFromRawStatus,
 } from "./helpers";
@@ -343,6 +347,113 @@ run("calculateFee falls back to feeRate only when both API fees are null", () =>
   assert.equal(result.totalFeeCost, 350);
   assert.equal(result.usedFallback, true);
   assert.equal(result.incomplete, false);
+});
+
+run("calculateVatAmount rounds to nearest won", () => {
+  assert.equal(calculateVatAmount(10000), 1000);
+  assert.equal(calculateVatAmount(9994), 999);
+  assert.equal(calculateVatAmount(9995), 1000);
+});
+
+run("calculateVatAdjustedRevenue subtracts VAT amount from revenue", () => {
+  assert.equal(calculateVatAdjustedRevenue(10000), 9000);
+  assert.equal(calculateVatAdjustedRevenue(9994), 8995);
+});
+
+run("resolvePackageKey falls back to orderId when packageNumber is empty or null", () => {
+  assert.equal(resolvePackageKey({ packageNumber: "PKG-001", orderId: "ORD-001" } as never), "PKG-001");
+  assert.equal(resolvePackageKey({ packageNumber: "  ", orderId: "ORD-001" } as never), "ORD-001");
+  assert.equal(resolvePackageKey({ packageNumber: null, orderId: "ORD-001" } as never), "ORD-001");
+});
+
+run("calculateStoreDeliverySummary counts unique packages and computes store-borne cost", () => {
+  const database = createEmptyDatabase();
+  database.stores.push({
+    id: "store-1",
+    deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
+  } as never);
+  database.orderItems.push(
+    {
+      id: "item-1",
+      storeId: "store-1",
+      packageNumber: "PKG-001",
+      orderId: "ORD-001",
+      paymentDate: "2026-04-02",
+      saleStatus: "SALE",
+      canonicalSalesUnitId: "sales-1",
+      deliveryFeeAmount: 3000,
+    } as never,
+    {
+      id: "item-2",
+      storeId: "store-1",
+      packageNumber: "PKG-001",
+      orderId: "ORD-001",
+      paymentDate: "2026-04-02",
+      saleStatus: "SALE",
+      canonicalSalesUnitId: "sales-1",
+      deliveryFeeAmount: 0,
+    } as never,
+    {
+      id: "item-3",
+      storeId: "store-1",
+      packageNumber: "PKG-002",
+      orderId: "ORD-002",
+      paymentDate: "2026-04-02",
+      saleStatus: "SALE",
+      canonicalSalesUnitId: "sales-1",
+      deliveryFeeAmount: 2000,
+    } as never,
+    {
+      id: "item-4",
+      storeId: "store-1",
+      packageNumber: null,
+      orderId: "ORD-003",
+      paymentDate: "2026-04-02",
+      saleStatus: "CANCELED",
+      canonicalSalesUnitId: "sales-1",
+      deliveryFeeAmount: 5000,
+    } as never,
+    {
+      id: "item-5",
+      storeId: "store-1",
+      packageNumber: null,
+      orderId: "ORD-004",
+      paymentDate: "2026-04-02",
+      saleStatus: "SALE",
+      canonicalSalesUnitId: null,
+      deliveryFeeAmount: 2000,
+    } as never,
+  );
+
+  const summary = calculateStoreDeliverySummary(database, "store-1", "2026-04-02", "2026-04-02");
+  assert.equal(summary.uniquePackageCount, 2);
+  assert.equal(summary.deliveryUnitCost, 3500);
+  assert.equal(summary.estimatedDeliveryBaseCost, 7000);
+  assert.equal(summary.customerPaidDeliveryFee, 5000);
+  assert.equal(summary.storeBorneDeliveryCost, 2000);
+});
+
+run("calculateStoreDeliverySummary clamps negative delivery cost to 0", () => {
+  const database = createEmptyDatabase();
+  database.stores.push({
+    id: "store-1",
+    deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
+  } as never);
+  database.orderItems.push({
+    id: "item-1",
+    storeId: "store-1",
+    packageNumber: "PKG-001",
+    orderId: "ORD-001",
+    paymentDate: "2026-04-02",
+    saleStatus: "SALE",
+    canonicalSalesUnitId: "sales-1",
+    deliveryFeeAmount: 10000,
+  } as never);
+
+  const summary = calculateStoreDeliverySummary(database, "store-1", "2026-04-02", "2026-04-02");
+  assert.equal(summary.estimatedDeliveryBaseCost, 3500);
+  assert.equal(summary.customerPaidDeliveryFee, 10000);
+  assert.equal(summary.storeBorneDeliveryCost, 0);
 });
 
 run("getAdMappingOverride returns manual mapped rows as overrides", () => {
@@ -797,12 +908,19 @@ run("profit rows keep delivery fee separate from product revenue and net profit"
   assert.equal(rows[0].totalProductRevenue, 100);
   assert.equal(rows[0].totalDeliveryFeeAmount, 20);
   assert.equal(rows[0].roughProfit, 100);
-  assert.equal(rows[0].estimatedNetProfit, 75);
+  assert.equal(rows[0].vatAmount, 10);
+  assert.equal(rows[0].vatAdjustedRevenue, 90);
+  assert.equal(rows[0].estimatedNetProfit, 65);
   assert.equal(summary.totalRevenue, 100);
   assert.equal(summary.totalProductRevenue, 100);
   assert.equal(summary.totalDeliveryFeeAmount, 20);
   assert.equal(summary.roughProfit, 100);
-  assert.equal(summary.estimatedNetProfit, 75);
+  assert.equal(summary.totalVatAmount, 10);
+  assert.equal(summary.totalVatAdjustedRevenue, 90);
+  assert.equal(summary.estimatedNetProfit, -3415);
+  assert.equal(summary.uniquePackageCount, 1);
+  assert.equal(summary.deliveryUnitCost, 3500);
+  assert.equal(summary.storeBorneDeliveryCost, 3480);
 });
 
 run("AdsService confirms two same-date uploads and sums ad cost across active confirmed uploads", () => {
@@ -929,7 +1047,9 @@ run("ProfitService detail and summary include only active confirmed uploads", ()
 
   assert.equal(summary.totalAdCost, 20);
   assert.equal(detail.data.summary.totalAdCost, 20);
-  assert.equal(detail.data.deliveryFeeSummary.totalDeliveryFeeAmount, 0);
+  assert.equal(detail.data.deliveryContext.uniquePackageCount, 0);
+  assert.equal(detail.data.deliveryContext.customerPaidDeliveryFee, 0);
+  assert.equal(detail.data.deliveryContext.includedInThisSalesUnitNetProfit, false);
   assert.equal(detail.data.adCampaigns.length, 1);
   assert.equal(detail.data.adCampaigns[0].adCostId, "ad-upload-active-cmp-1001");
 });
@@ -996,13 +1116,18 @@ run("ProfitService keeps delivery fee references separate from product revenue a
   assert.equal(summary.totalProductRevenue, 100);
   assert.equal(summary.totalDeliveryFeeAmount, 30);
   assert.equal(summary.roughProfit, 100);
-  assert.equal(summary.estimatedNetProfit, 100);
+  assert.equal(summary.totalVatAmount, 10);
+  assert.equal(summary.totalVatAdjustedRevenue, 90);
+  assert.equal(summary.estimatedNetProfit, -3380);
   assert.equal(detail.data.summary.totalRevenue, 100);
   assert.equal(detail.data.summary.totalProductRevenue, 100);
   assert.equal(detail.data.summary.totalDeliveryFeeAmount, 30);
-  assert.equal(detail.data.deliveryFeeSummary.totalDeliveryFeeAmount, 30);
-  assert.equal(detail.data.deliveryFeeSummary.includedInProductRevenue, false);
-  assert.equal(detail.data.deliveryFeeSummary.includedInEstimatedNetProfit, false);
+  assert.equal(detail.data.revenueBreakdown.productRevenueOriginal, 100);
+  assert.equal(detail.data.revenueBreakdown.vatAmount, 10);
+  assert.equal(detail.data.revenueBreakdown.vatAdjustedRevenue, 90);
+  assert.equal(detail.data.deliveryContext.uniquePackageCount, 1);
+  assert.equal(detail.data.deliveryContext.storeBorneDeliveryCost, 3470);
+  assert.equal(detail.data.deliveryContext.includedInThisSalesUnitNetProfit, false);
 });
 
 run("ProfitService latest activity date prefers latest overlap even over later eligible orders and ads", () => {

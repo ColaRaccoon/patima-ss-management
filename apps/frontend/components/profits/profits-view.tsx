@@ -170,17 +170,24 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
 
       <SourceBanner sources={data.sources} />
 
+      <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-950">
+        <p className="font-semibold">선택한 날짜({formatDate(data.dateTo)}) 기준 배송비 계산 내역</p>
+        <p className="mt-1">
+          순손익은 VAT 차감 매출 기준 판매단위 순손익 합에서 스토어 부담 배송비를 차감하여 산출됩니다. 개별 판매단위에는 배송비가 배분되지 않습니다.
+        </p>
+      </div>
+
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <StatCard
           label="상품 매출"
           value={formatCurrency(data.summary.totalProductRevenue)}
-          hint="배송비 참고값은 별도로 표시됩니다."
+          hint={`VAT ${formatCurrency(data.summary.totalVatAmount)} 차감`}
         />
         <StatCard
-          label="배송비 참고"
-          value={formatCurrency(data.summary.totalDeliveryFeeAmount)}
-          hint="현재는 참고용으로만 사용됩니다."
-          tone="muted"
+          label="VAT 차감 매출"
+          value={formatCurrency(data.summary.totalVatAdjustedRevenue)}
+          hint="VAT 10% 공제 후"
+          tone="info"
         />
         <StatCard label="광고비" value={formatCurrency(data.summary.totalAdCost)} tone="accent" />
         <StatCard
@@ -195,7 +202,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           hint={
             data.summary.profitStatus === "INCOMPLETE_COST"
               ? "일부 원가 정보가 누락되었습니다."
-              : undefined
+              : "스토어 부담 배송비 차감 완료"
           }
           tone={toneForProfitStatus(data.summary.profitStatus)}
         />
@@ -207,6 +214,27 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
             tone="danger"
           />
         ) : null}
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <StatCard
+          label="추정 배송 원가"
+          value={formatCurrency(data.summary.estimatedDeliveryBaseCost)}
+          hint={`묶음 ${formatNumber(data.summary.uniquePackageCount)}건 × 단가 ${formatCurrency(data.summary.deliveryUnitCost)}`}
+          tone="muted"
+        />
+        <StatCard
+          label="스토어 부담 배송비"
+          value={formatCurrency(data.summary.storeBorneDeliveryCost)}
+          hint={`고객 부담 ${formatCurrency(data.summary.customerPaidDeliveryFee)} 차감 후`}
+          tone="muted"
+        />
+        <StatCard
+          label="고객 부담 배송비"
+          value={formatCurrency(data.summary.customerPaidDeliveryFee)}
+          hint="주문 deliveryFeeAmount 합"
+          tone="muted"
+        />
       </div>
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.3fr)_minmax(340px,0.7fr)]">
@@ -322,6 +350,12 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                         title: "상품 매출",
                         className: "text-right",
                         render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.totalProductRevenue)),
+                      },
+                      {
+                        key: "vat",
+                        title: "VAT",
+                        className: "text-right",
+                        render: (row) => (row.isStoreLevel ? "-" : formatCurrency(row.vatAmount)),
                       },
                       {
                         key: "adCost",
@@ -501,7 +535,60 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                       <p className="text-sm text-ink/55">폴백 수수료 분담</p>
                       <p className="text-sm font-semibold text-ink">{formatCurrency(selectedDetail.costBreakdown.fallbackFeeCostPortion)}</p>
                     </div>
-                    <p className="text-xs text-ink/50 mt-2">배송비 참고값은 스토어·날짜 요약 단계에서만 표시됩니다.</p>
+                  </div>
+                </div>
+
+                <div className="border-b border-ink/8" />
+
+                {/* Group 3.5: VAT 구성 */}
+                <div>
+                  <h3 className="text-xs uppercase tracking-wider text-ink/45 font-semibold mb-3">VAT 구성</h3>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-ink/55">상품 매출(원본)</p>
+                      <p className="text-sm font-semibold text-ink">{formatCurrency(selectedDetail.revenueBreakdown.productRevenueOriginal)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-ink/55">VAT ({Math.round(selectedDetail.revenueBreakdown.vatRate * 100)}%)</p>
+                      <p className="text-sm font-semibold text-ink">-{formatCurrency(selectedDetail.revenueBreakdown.vatAmount)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-ink/55">VAT 차감 매출</p>
+                      <p className="text-sm font-semibold text-ink">{formatCurrency(selectedDetail.revenueBreakdown.vatAdjustedRevenue)}</p>
+                    </div>
+                    <p className="text-xs text-ink/50 mt-2">VAT 차감 매출이 이 판매단위 순손익 계산의 기준입니다.</p>
+                  </div>
+                </div>
+
+                <div className="border-b border-ink/8" />
+
+                {/* Group 3.6: 배송비 컨텍스트 (스토어·날짜 단위) */}
+                <div className="rounded-lg bg-sky-100/40 p-3">
+                  <h3 className="text-xs uppercase tracking-wider text-sky-900/60 font-semibold mb-3">
+                    배송비 컨텍스트 ({formatDate(selectedDetail.date)} 스토어 전체)
+                  </h3>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sky-900/70">유니크 묶음 수</p>
+                      <p className="font-semibold text-sky-900">{formatNumber(selectedDetail.deliveryContext.uniquePackageCount)}건</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sky-900/70">배송 단가</p>
+                      <p className="font-semibold text-sky-900">{formatCurrency(selectedDetail.deliveryContext.deliveryUnitCost)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sky-900/70">추정 배송 원가</p>
+                      <p className="font-semibold text-sky-900">{formatCurrency(selectedDetail.deliveryContext.estimatedDeliveryBaseCost)}</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-sky-900/70">고객 부담 배송비</p>
+                      <p className="font-semibold text-sky-900">-{formatCurrency(selectedDetail.deliveryContext.customerPaidDeliveryFee)}</p>
+                    </div>
+                    <div className="flex items-center justify-between border-t border-sky-900/10 pt-2">
+                      <p className="text-sky-900/70 font-semibold">스토어 부담 배송비</p>
+                      <p className="font-semibold text-sky-900">{formatCurrency(selectedDetail.deliveryContext.storeBorneDeliveryCost)}</p>
+                    </div>
+                    <p className="text-xs text-sky-900/60 mt-2">{selectedDetail.deliveryContext.note}</p>
                   </div>
                 </div>
 

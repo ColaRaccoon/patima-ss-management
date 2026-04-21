@@ -4,7 +4,7 @@ interface StatCardProps {
   label: string;
   value: string;
   hint?: string;
-  tone?: "default" | "accent" | "success" | "warning" | "danger" | "muted";
+  tone?: "default" | "accent" | "success" | "warning" | "danger" | "muted" | "info";
 }
 
 const toneClassMap: Record<NonNullable<StatCardProps["tone"]>, string> = {
@@ -14,6 +14,7 @@ const toneClassMap: Record<NonNullable<StatCardProps["tone"]>, string> = {
   warning: "bg-amber-100/75",
   danger: "bg-red-100/75",
   muted: "bg-ink/5",
+  info: "bg-sky-100/70",
 };
 
 export function StatCard({

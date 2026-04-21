@@ -57,7 +57,7 @@ export class AppController {
   }
 
   @Patch("stores/:storeId")
-  updateStore(@Param("storeId") storeId: string, @Body() body: { name: string; sellerAccountId: string; channelNo: string; memo?: string | null }) {
+  updateStore(@Param("storeId") storeId: string, @Body() body: { name: string; sellerAccountId: string; channelNo: string; memo?: string | null; deliveryUnitCost?: number }) {
     return this.storeService.update(storeId, body);
   }
 

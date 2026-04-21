@@ -9,6 +9,7 @@ import { PageHeader } from "@/components/shared/page-header";
 import { Panel } from "@/components/shared/panel";
 import { SourceBanner } from "@/components/shared/source-banner";
 import { StatusBadge } from "@/components/shared/status-badge";
+import { DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import { readApiResponse } from "@/lib/api/browser";
 import type {
   CredentialSummary,
@@ -25,6 +26,7 @@ function createStoreDraft(store?: StoreListItem | null) {
     sellerAccountId: store?.sellerAccountId ?? "",
     channelNo: store?.channelNo ?? "",
     memo: store?.memo ?? "",
+    deliveryUnitCost: store?.deliveryUnitCost ?? DEFAULT_DELIVERY_UNIT_COST,
   };
 }
 
@@ -381,6 +383,7 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
                         sellerAccountId: storeDraft.sellerAccountId.trim(),
                         channelNo: storeDraft.channelNo.trim(),
                         memo: storeDraft.memo.trim() || null,
+                        deliveryUnitCost: storeDraft.deliveryUnitCost,
                       }),
                     }),
                     "스토어 정보 저장에 실패했습니다.",
@@ -442,6 +445,26 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
                       setStoreDraft((current) => ({ ...current, memo: event.target.value }))
                     }
                   />
+                </label>
+                <label className="block">
+                  <span className="mb-2 block text-sm font-medium text-ink">배송 단가(원)</span>
+                  <input
+                    className="input-shell"
+                    type="number"
+                    min="0"
+                    step="100"
+                    placeholder={String(DEFAULT_DELIVERY_UNIT_COST)}
+                    value={storeDraft.deliveryUnitCost}
+                    onChange={(event) =>
+                      setStoreDraft((current) => ({
+                        ...current,
+                        deliveryUnitCost: parseInt(event.target.value, 10) || DEFAULT_DELIVERY_UNIT_COST,
+                      }))
+                    }
+                  />
+                  <p className="mt-1 text-xs text-ink/55">
+                    배송 단가를 설정하면 대시보드의 스토어 부담 배송비가 자동으로 계산됩니다.
+                  </p>
                 </label>
               </div>
 
