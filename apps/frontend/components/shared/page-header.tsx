@@ -4,7 +4,7 @@ interface PageHeaderProps {
   eyebrow?: string;
   eyebrowLang?: "ko" | "en"; // NEW: 한글/영문 구분
   title: string;
-  description: string;
+  description?: string;
   actions?: React.ReactNode;
   className?: string;
 }
@@ -35,9 +35,7 @@ export function PageHeader({
           <h1 className="mt-2 text-3xl font-semibold tracking-tight text-ink">
             {title}
           </h1>
-          <p className="mt-3 max-w-3xl text-sm leading-6 text-ink/70">
-            {description}
-          </p>
+          {description ? (<p className="mt-3 max-w-3xl text-sm leading-6 text-ink/70">{description}</p>) : null}
         </div>
         {actions ? <div className="flex flex-wrap gap-3">{actions}</div> : null}
       </div>

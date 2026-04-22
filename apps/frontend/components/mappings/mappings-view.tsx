@@ -228,7 +228,8 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   );
   const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(data.salesUnits[0]?.id ?? "");
   const [hideZeroCostAdRows, setHideZeroCostAdRows] = useState(true);
-  const [showOnlyUnmapped, setShowOnlyUnmapped] = useState(false);
+  const [showOnlyUnmappedOrders, setShowOnlyUnmappedOrders] = useState(false);
+  const [showOnlyUnmappedAds, setShowOnlyUnmappedAds] = useState(false);
   const [hideZeroOrderSignatures, setHideZeroOrderSignatures] = useState(true);
   const [intentionalReason, setIntentionalReason] = useState("");
   const [orderSearch, setOrderSearch] = useState("");
@@ -260,22 +261,29 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const filteredSignatures = data.signatures
     .filter((item) => {
       const matchesSearch = matchesQuery([item.sourceSignature, item.rawProductNameSnapshot, item.rawOptionInfoSnapshot, item.canonicalDisplayName], orderSearch);
-      const matchesUnmapped = !showOnlyUnmapped || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
+      const matchesUnmapped = !showOnlyUnmappedOrders || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
       const matchesUsageCount = !hideZeroOrderSignatures || item.usageCount !== 0;
       return matchesSearch && matchesUnmapped && matchesUsageCount;
     });
-  const filteredAdCosts = visibleAdCostsBase.filter((item) =>
-    matchesQuery([item.campaignName, item.canonicalDisplayName, item.mappingReason, item.reasonNote, item.reportDate], adSearch),
-  );
+  const filteredAdCosts = visibleAdCostsBase.filter((item) => {
+    const matchesSearch = matchesQuery([item.campaignName, item.canonicalDisplayName, item.mappingReason, item.reasonNote, item.reportDate], adSearch);
+    const matchesUnmapped = !showOnlyUnmappedAds || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
+    return matchesSearch && matchesUnmapped;
+  });
   const selectedSignatureRows = data.signatures.filter((item) => selectedSignatureSet.has(item.id));
   const selectedAdCostRows = data.adCosts.filter((item) => selectedAdCostSet.has(item.id));
   const visibleSelectedSignatureCount = filteredSignatures.filter((item) => selectedSignatureSet.has(item.id)).length;
   const visibleSelectedAdCostCount = filteredAdCosts.filter((item) => selectedAdCostSet.has(item.id)).length;
   const hiddenSignaturesCount = data.signatures.filter((item) => {
     const matchesSearch = matchesQuery([item.sourceSignature, item.rawProductNameSnapshot, item.rawOptionInfoSnapshot, item.canonicalDisplayName], orderSearch);
-    const matchesUnmapped = !showOnlyUnmapped || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
+    const matchesUnmapped = !showOnlyUnmappedOrders || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
     const matchesUsageCount = !hideZeroOrderSignatures || item.usageCount !== 0;
     return !(matchesSearch && matchesUnmapped && matchesUsageCount);
+  }).length;
+  const hiddenAdCostsCount = visibleAdCostsBase.filter((item) => {
+    const matchesSearch = matchesQuery([item.campaignName, item.canonicalDisplayName, item.mappingReason, item.reasonNote, item.reportDate], adSearch);
+    const matchesUnmapped = !showOnlyUnmappedAds || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
+    return !(matchesSearch && matchesUnmapped);
   }).length;
 
   useEffect(() => {
@@ -691,7 +699,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               </div>
               <div className="flex flex-wrap gap-3">
                 <label className="inline-flex items-center gap-2 text-xs text-ink/60">
-                  <input checked={showOnlyUnmapped} onChange={(event) => setShowOnlyUnmapped(event.target.checked)} type="checkbox" />
+                  <input checked={showOnlyUnmappedOrders} onChange={(event) => setShowOnlyUnmappedOrders(event.target.checked)} type="checkbox" />
                   미매핑/충돌만 보기
                 </label>
                 <label className="inline-flex items-center gap-2 text-xs text-ink/60">
@@ -1016,13 +1024,22 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
                 <span>조회 {formatNumber(filteredAdCosts.length)}건</span>
                 <span>선택 {formatNumber(selectedAdCostRows.length)}건</span>
                 {selectedAdCostRows.length > visibleSelectedAdCostCount ? (
-                  <span>필터로 숨겨진 선택 {formatNumber(selectedAdCostRows.length - visibleSelectedAdCostCount)}건</span>
+                  <span>검색으로 숨겨진 선택 {formatNumber(selectedAdCostRows.length - visibleSelectedAdCostCount)}건</span>
+                ) : null}
+                {hiddenAdCostsCount > 0 ? (
+                  <span>필터로 숨겨진 {formatNumber(hiddenAdCostsCount)}건</span>
                 ) : null}
               </div>
-              <label className="inline-flex items-center gap-2 text-xs text-ink/60">
-                <input checked={hideZeroCostAdRows} onChange={(event) => setHideZeroCostAdRows(event.target.checked)} type="checkbox" />
-                0원 항목 숨기기{hiddenZeroCostCount > 0 ? ` (${formatNumber(hiddenZeroCostCount)}건)` : ""}
-              </label>
+              <div className="flex flex-wrap gap-3">
+                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
+                  <input checked={showOnlyUnmappedAds} onChange={(event) => setShowOnlyUnmappedAds(event.target.checked)} type="checkbox" />
+                  미매핑/충돌만 보기
+                </label>
+                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
+                  <input checked={hideZeroCostAdRows} onChange={(event) => setHideZeroCostAdRows(event.target.checked)} type="checkbox" />
+                  0원 항목 숨기기{hiddenZeroCostCount > 0 ? ` (${formatNumber(hiddenZeroCostCount)}건)` : ""}
+                </label>
+              </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-y-auto pr-1" ref={adScrollRef}>

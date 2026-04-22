@@ -11,7 +11,7 @@ import { StatCard } from "@/components/shared/stat-card";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { readApiResponse } from "@/lib/api/browser";
 import type { DailySalesUnitDetail, DailySalesUnitProfit, ProfitsPageData } from "@/lib/api/types";
-import { formatCurrency, formatDate, formatDateRange, formatNumber } from "@/lib/format";
+import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
 
 interface ExpandedGroups {
@@ -36,6 +36,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const [isRefreshing, startRefresh] = useTransition();
   const [expandedGroups, setExpandedGroups] = useState<ExpandedGroups>({});
   const [excludedSummaryExpanded, setExcludedSummaryExpanded] = useState(false);
+  const [manualFakePurchaseAmount, setManualFakePurchaseAmount] = useState("");
 
   useEffect(() => {
     setSelectedDate(data.dateTo);
@@ -139,6 +140,16 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           onChange={(event) => setSelectedDate(event.target.value)}
         />
       </label>
+      <label className="block w-40">
+        <span className="mb-2 block text-sm font-medium text-ink">가구매 금액</span>
+        <input
+          className="input-shell"
+          type="number"
+          placeholder="0"
+          value={manualFakePurchaseAmount}
+          onChange={(event) => setManualFakePurchaseAmount(event.target.value)}
+        />
+      </label>
       <button
         className="button-shell button-primary"
         type="submit"
@@ -154,7 +165,6 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       <PageHeader
         eyebrow="손익"
         title="판매단위 손익 분석"
-        description={`기간 ${formatDateRange(data.dateFrom, data.dateTo)}. 충돌 및 미매핑 행은 제외되며, 배송비 규칙이 확정되기 전까지 배송비는 상품 매출과 분리되어 관리됩니다.`}
         actions={
           <div className="space-y-3">
             {dateFilterForm}
@@ -196,16 +206,27 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           hint="상품 매출 - 광고비"
           tone={data.summary.roughProfit >= 0 ? "success" : "danger"}
         />
-        <StatCard
-          label="예상 순이익"
-          value={formatCurrency(data.summary.estimatedNetProfit)}
-          hint={
-            data.summary.profitStatus === "INCOMPLETE_COST"
+        {(() => {
+          const fakePurchaseStr = manualFakePurchaseAmount.trim();
+          const hasFakePurchase = fakePurchaseStr !== "" && !isNaN(Number(fakePurchaseStr)) && Number(fakePurchaseStr) !== 0;
+          const displayProfit = hasFakePurchase
+            ? data.summary.estimatedNetProfit - Number(fakePurchaseStr)
+            : data.summary.estimatedNetProfit;
+          const hintText = hasFakePurchase
+            ? "가구매 데이터 제외 완료"
+            : data.summary.profitStatus === "INCOMPLETE_COST"
               ? "일부 원가 정보가 누락되었습니다."
-              : "스토어 부담 배송비 차감 완료"
-          }
-          tone={toneForProfitStatus(data.summary.profitStatus)}
-        />
+              : "스토어 부담 배송비 차감 완료";
+
+          return (
+            <StatCard
+              label="예상 순이익"
+              value={formatCurrency(displayProfit)}
+              hint={hintText}
+              tone={toneForProfitStatus(data.summary.profitStatus)}
+            />
+          );
+        })()}
         {hasConflict ? (
           <StatCard
             label="충돌 매핑"
