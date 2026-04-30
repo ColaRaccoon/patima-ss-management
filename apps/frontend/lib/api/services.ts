@@ -831,61 +831,15 @@ export async function getAdUploadsPageData(): Promise<AdUploadsPageData> {
     };
   }
 
-  const salesUnitResponse = await getSalesUnits(primaryStore.id, USE_AD_UPLOADS_MOCK_FALLBACK);
   const uploadsResponse = await getAdUploads(primaryStore.id, USE_AD_UPLOADS_MOCK_FALLBACK);
-  const previewUploads = uploadsResponse.data.filter((upload) => upload.uploadStatus === "PREVIEW_PARSED");
-  const previewRowsResponses = await Promise.all(
-    previewUploads.map((upload) =>
-      getPreviewRows(upload.uploadId, salesUnitResponse.data, USE_AD_UPLOADS_MOCK_FALLBACK),
-    ),
-  );
-  const previews: AdPreviewDetail[] = previewUploads.map((previewUpload, index) => {
-    const rows = previewRowsResponses[index]?.data ?? [];
-    const activeConfirmedUploadCount = uploadsResponse.data.filter(
-      (upload) =>
-        upload.reportDate === previewUpload.reportDate &&
-        upload.isActive &&
-        upload.uploadStatus === "CONFIRMED",
-    ).length;
-
-    return {
-      uploadId: previewUpload.uploadId,
-      originalFileName: previewUpload.originalFileName ?? null,
-      createdAt: previewUpload.createdAt ?? null,
-      reportDate: previewUpload.reportDate,
-      detectedWeekday: previewUpload.detectedWeekday ?? "-",
-      weekdayValidationStatus: previewUpload.weekdayValidationStatus,
-      activeConfirmedUploadCount,
-      rowCount: rows.length,
-      previewExpiresAt: previewUpload.previewExpiresAt ?? new Date(Date.now() + 7 * 86_400_000).toISOString(),
-      previewState:
-        previewUpload.previewExpiresAt && previewUpload.previewExpiresAt < new Date().toISOString()
-          ? "EXPIRED"
-          : "VALID",
-      ruleSnapshotHash: previewUpload.ruleSnapshotHash ?? "",
-      overrideSnapshotHash: previewUpload.overrideSnapshotHash ?? "",
-      mappingPreviewSummary: {
-        mappedCount: rows.filter((row) => row.mappingStatus === "MAPPED").length,
-        unmappedCount: rows.filter((row) => row.mappingStatus === "UNMAPPED").length,
-        conflictCount: rows.filter((row) => row.mappingStatus === "CONFLICT").length,
-        multipleRuleMatchCount: rows.filter((row) => row.mappingReason === "MULTIPLE_RULE_MATCHES").length,
-        intentionallyUnmappedCount: rows.filter((row) => row.mappingReason === "INTENTIONALLY_UNMAPPED").length,
-      },
-      requiresConfirm: previewUpload.weekdayValidationStatus === "PASSED",
-      status: "PREVIEW_PARSED",
-      rows,
-    };
-  });
 
   return {
     primaryStore,
     uploads: uploadsResponse.data,
-    previews,
+    previews: [],
     sources: collectSources(
       storeResponse,
-      salesUnitResponse,
       uploadsResponse,
-      ...previewRowsResponses,
     ),
   };
 }

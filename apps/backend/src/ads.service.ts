@@ -65,6 +65,7 @@ export class AdsService implements OnModuleInit {
         success: false,
         message: "엑셀(.xlsx) 파일만 업로드할 수 있습니다.",
         errors: [{ field: "file", reason: "EXCEL_REQUIRED_COLUMNS_MISSING" }],
+        fileName: originalFileName,
       });
     }
 
@@ -79,6 +80,7 @@ export class AdsService implements OnModuleInit {
           success: false,
           message: "필수 엑셀 컬럼이 누락되었습니다.",
           errors: [{ field: requiredHeader, reason: "EXCEL_REQUIRED_COLUMNS_MISSING" }],
+          fileName: originalFileName,
         });
       }
     });
@@ -97,15 +99,18 @@ export class AdsService implements OnModuleInit {
 
     const snapshot = this.databaseService.getSnapshot();
     const activeConfirmedRows = this.getActiveConfirmedRows(snapshot, storeId, reportDate);
-    this.assertNoDuplicateCampaignIds(
-      campaigns.map((campaign) => campaign.campaignId),
-      "AD_UPLOAD_DUPLICATE_IN_FILE",
-    );
-    this.assertNoCampaignIdOverlap(
-      campaigns.map((campaign) => campaign.campaignId),
-      activeConfirmedRows,
-      "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
-    );
+
+    // 요일 검증 실패 시 즉시 예외 던지기
+    if (weekdayValidationStatus !== "PASSED") {
+      throw new BadRequestException({
+        success: false,
+        message: this.describeWeekdayFailure(weekdayValidationStatus, detectedWeekdays, reportDate),
+        errors: [{ field: "file", reason: "AD_UPLOAD_WEEKDAY_VALIDATION_FAILED" }],
+        fileName: originalFileName,
+        weekdayValidationStatus,
+        detectedWeekday: detectedWeekdays[0] ?? null,
+      });
+    }
 
     const upload: AdExcelUpload = {
       id: createId(),
@@ -121,13 +126,13 @@ export class AdsService implements OnModuleInit {
       previewOverrideSnapshotHash: getOverrideSnapshotHash(snapshot, storeId),
       previewCreatedAt: nowIso(),
       previewExpiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
-      state: "PREVIEW_PARSED",
-      isActive: false,
+      state: "CONFIRMED",
+      isActive: true,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
 
-    const previewRows: AdUploadPreviewRow[] = campaigns.map((campaign) => {
+    const confirmedRows: AdCampaignDailyCost[] = campaigns.map((campaign) => {
       const normalizedCampaignName = normalizeText(campaign.campaignName);
       const inheritedOverride = this.findInheritedOverride(
         activeConfirmedRows,
@@ -143,6 +148,7 @@ export class AdsService implements OnModuleInit {
       return {
         id: createId(),
         uploadId: upload.id,
+        sourceUploadId: upload.id,
         storeId,
         reportDate,
         campaignId: campaign.campaignId,
@@ -168,8 +174,7 @@ export class AdsService implements OnModuleInit {
 
     this.databaseService.write((draft) => {
       draft.adExcelUploads.push(upload);
-      draft.adUploadPreviewRows = draft.adUploadPreviewRows.filter((row) => row.uploadId !== upload.id);
-      draft.adUploadPreviewRows.push(...previewRows);
+      draft.adCampaignDailyCosts.push(...confirmedRows);
     });
 
     this.auditLogService.record({
@@ -179,7 +184,7 @@ export class AdsService implements OnModuleInit {
       targetId: upload.id,
       actorIdentifier: "LOCALHOST_ADMIN",
       beforeJson: null,
-      afterJson: { reportDate, originalFileName },
+      afterJson: { reportDate, originalFileName, confirmedRowCount: confirmedRows.length },
     });
 
     return formatApiSuccess({
@@ -187,10 +192,8 @@ export class AdsService implements OnModuleInit {
       reportDate,
       detectedWeekday: upload.detectedWeekday,
       weekdayValidationStatus,
-      previewState: upload.state,
-      previewExpiresAt: upload.previewExpiresAt,
-      ruleSnapshotHash: upload.previewRuleSnapshotHash,
-      overrideSnapshotHash: upload.previewOverrideSnapshotHash,
+      status: "CONFIRMED",
+      confirmedRowCount: confirmedRows.length,
     });
   }
 
@@ -790,6 +793,22 @@ export class AdsService implements OnModuleInit {
   private summarizeCampaignIds(campaignIds: string[]) {
     const head = campaignIds.slice(0, 5).join(", ");
     return campaignIds.length > 5 ? `${head} and ${campaignIds.length - 5} more` : head;
+  }
+
+  private describeWeekdayFailure(
+    status: "MISSING" | "MULTIPLE" | "MISMATCH",
+    detectedWeekdays: string[],
+    reportDate: string,
+  ): string {
+    if (status === "MISSING") {
+      return "엑셀에 요일 정보가 없습니다.";
+    }
+    if (status === "MULTIPLE") {
+      return `여러 요일이 혼재되어 있습니다 (감지: ${detectedWeekdays.join(", ")}).`;
+    }
+    // MISMATCH
+    const expected = getWeekdayNameKo(reportDate);
+    return `reportDate(${reportDate}, ${expected})와 엑셀 요일(${detectedWeekdays[0]})이 일치하지 않습니다.`;
   }
 
   private normalizeHeaderCell(value: string | null | undefined) {
