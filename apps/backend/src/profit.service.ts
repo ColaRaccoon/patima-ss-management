@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
-import { VAT_RATE } from "@patima/shared";
+import { VAT_RATE, SalesUnitCostSnapshotEntry } from "@patima/shared";
 import { DatabaseService } from "./database.service";
 import {
   calculateDashboardSummary,
@@ -120,9 +120,25 @@ export class ProfitService {
         vatAdjustedRevenue: 0,
       };
 
-    const costSettings = snapshot.salesUnitCostSettings.filter(
-      (item) => item.storeId === storeId && item.canonicalSalesUnitId === salesUnitId,
-    );
+    // 스냅샷 기반 비용 조회 구축 (새 모델)
+    const snapshots = snapshot.salesUnitCostSnapshots
+      .filter((item) => item.storeId === storeId)
+      .sort((left, right) => left.effectiveFrom.localeCompare(right.effectiveFrom));
+
+    const entryIndex = new Map<string, Map<string, SalesUnitCostSnapshotEntry>>();
+    snapshot.salesUnitCostSnapshotEntries
+      .filter((item) => item.storeId === storeId)
+      .forEach((entry) => {
+        const sub = entryIndex.get(entry.snapshotId) ?? new Map();
+        sub.set(entry.canonicalSalesUnitId, entry);
+        entryIndex.set(entry.snapshotId, sub);
+      });
+
+    const costSettingsByUnit = snapshots.map((snapshot) => ({
+      snapshot,
+      entry: entryIndex.get(snapshot.id)?.get(salesUnitId) ?? null,
+    }));
+
     const orderItems = snapshot.orderItems.filter(
       (item) =>
         item.storeId === storeId &&
@@ -155,11 +171,11 @@ export class ProfitService {
       },
     );
     const fallbackFeeCostPortion = orderItems.reduce((total, item) => {
-      const costSetting = getCostSettingForDate(costSettings, item.paymentDate);
+      const costSetting = getCostSettingForDate(costSettingsByUnit, item.paymentDate);
       const fee = calculateFee(item, costSetting);
       return total + (fee.usedFallback ? fee.totalFeeCost : 0);
     }, 0);
-    const activeCostSetting = getCostSettingForDate(costSettings, date);
+    const activeCostSetting = getCostSettingForDate(costSettingsByUnit, date);
     const excludedSummary = calculateDashboardSummary(snapshot, storeId, date);
     const deliverySummary = calculateStoreDeliverySummary(snapshot, storeId, date, date);
 

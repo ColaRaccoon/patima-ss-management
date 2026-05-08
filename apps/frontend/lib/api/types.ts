@@ -236,6 +236,15 @@ export interface CostSettingListItem {
   isActive: boolean;
 }
 
+export interface CostSnapshotListItem {
+  id: string;
+  effectiveFrom: string;
+  entryCount: number;
+  missingSalesUnitCount: number;
+  sourceFileName: string | null;
+  createdAt: string;
+}
+
 export interface OperationListItem {
   operationId: string;
   operationType: OperationType;
@@ -405,7 +414,7 @@ export interface AdUploadsPageData {
 export interface CostsPageData {
   primaryStore: StoreListItem | null;
   salesUnits: SalesUnitListItem[];
-  costSettings: CostSettingListItem[];
+  costSnapshots: CostSnapshotListItem[];
   sources: SourceState[];
 }
 

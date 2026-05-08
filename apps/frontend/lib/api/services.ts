@@ -643,6 +643,26 @@ async function getCostSettings(storeId: string, salesUnits: SalesUnitListItem[])
   return { ...response, data: items };
 }
 
+async function getCostSnapshots(storeId: string) {
+  const response = await fetchApi<Array<Record<string, unknown>>>({
+    label: "Cost snapshots",
+    path: withQuery("/sales-unit-cost-snapshots", { storeId }),
+    fallback: [],
+  });
+
+  const snapshots = response.data.snapshots ?? response.data;
+  const items = (Array.isArray(snapshots) ? snapshots : []).map((item) => ({
+    id: String(item.id),
+    effectiveFrom: String(item.effectiveFrom),
+    entryCount: Number(item.entryCount ?? 0),
+    missingSalesUnitCount: Number(item.missingSalesUnitCount ?? 0),
+    sourceFileName: item.sourceFileName ? String(item.sourceFileName) : null,
+    createdAt: String(item.createdAt),
+  }));
+
+  return { ...response, data: items };
+}
+
 export async function getShellData(): Promise<ShellData> {
   const storeResponse = await getStores();
   return {
@@ -852,18 +872,18 @@ export async function getCostsPageData(): Promise<CostsPageData> {
     return {
       primaryStore: null,
       salesUnits: [],
-      costSettings: [],
+      costSnapshots: [],
       sources: collectSources(storeResponse),
     };
   }
 
   const salesUnitResponse = await getSalesUnits(primaryStore.id);
-  const costResponse = await getCostSettings(primaryStore.id, salesUnitResponse.data);
+  const snapshotResponse = await getCostSnapshots(primaryStore.id);
   return {
     primaryStore,
     salesUnits: salesUnitResponse.data,
-    costSettings: costResponse.data,
-    sources: collectSources(storeResponse, salesUnitResponse, costResponse),
+    costSnapshots: snapshotResponse.data,
+    sources: collectSources(storeResponse, salesUnitResponse, snapshotResponse),
   };
 }
 

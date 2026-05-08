@@ -8,10 +8,12 @@ import {
   Patch,
   Post,
   Query,
+  Res,
   UploadedFile,
   UseInterceptors,
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
+import type { Response } from "express";
 import { AdsService } from "./ads.service";
 import { CampaignMappingService } from "./campaign-mapping.service";
 import { CostService } from "./cost.service";
@@ -415,6 +417,51 @@ export class AppController {
   @Post("sales-unit-cost-settings/:costSettingId/deactivate")
   deactivateCostSetting(@Param("costSettingId") costSettingId: string) {
     return this.costService.deactivate(costSettingId);
+  }
+
+  @Post("sales-unit-cost-snapshots/import")
+  @UseInterceptors(FileInterceptor("file"))
+  async importCostSnapshot(
+    @Body() body: { storeId: string; effectiveFrom: string },
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    const result = await this.costService.importExcelSnapshot(body.storeId, body.effectiveFrom, file);
+    return formatApiSuccess(result);
+  }
+
+  @Get("sales-unit-cost-snapshots")
+  listCostSnapshots(
+    @Query("storeId") storeId: string,
+    @Query("page") page?: string,
+    @Query("pageSize") pageSize?: string,
+  ) {
+    const result = this.costService.listSnapshots(storeId, page ? Number(page) : undefined, pageSize ? Number(pageSize) : undefined);
+    return formatApiSuccess(result);
+  }
+
+  @Get("sales-unit-cost-snapshots/export")
+  exportCostSnapshot(
+    @Query("storeId") storeId: string,
+    @Res() res: Response,
+    @Query("effectiveFrom") effectiveFrom?: string,
+  ) {
+    const buffer = this.costService.exportExcel(storeId, effectiveFrom);
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=cost-snapshot-${storeId}-${effectiveFrom ?? "current"}.xlsx`,
+    );
+    res.setHeader("Content-Length", buffer.length.toString());
+    res.end(buffer);
+  }
+
+  @Delete("sales-unit-cost-snapshots/:snapshotId")
+  deleteCostSnapshot(@Param("snapshotId") snapshotId: string) {
+    const result = this.costService.deleteSnapshot(snapshotId);
+    return formatApiSuccess(result);
   }
 
   @Get("dashboard/summary")

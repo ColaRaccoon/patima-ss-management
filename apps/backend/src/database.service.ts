@@ -25,6 +25,8 @@ const STORAGE_TABLES: StorageTable[] = [
   { key: "adUploadPreviewRows", tableName: "ad_upload_preview_rows" },
   { key: "adCampaignDailyCosts", tableName: "ad_campaign_daily_costs" },
   { key: "salesUnitCostSettings", tableName: "sales_unit_cost_settings" },
+  { key: "salesUnitCostSnapshots", tableName: "sales_unit_cost_snapshots" },
+  { key: "salesUnitCostSnapshotEntries", tableName: "sales_unit_cost_snapshot_entries" },
   { key: "operations", tableName: "operations" },
   { key: "auditLogs", tableName: "audit_logs" },
 ];

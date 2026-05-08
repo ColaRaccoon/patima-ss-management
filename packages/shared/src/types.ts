@@ -358,6 +358,36 @@ export interface DailySalesUnitDetailDeliveryContext {
   note: string;
 }
 
+/**
+ * 특정 시점(effectiveFrom)부터 적용되는 비용 표 헤더.
+ * 한 스냅샷이 그 시점 이후의 모든 판매단위 비용을 표현.
+ * 다음 스냅샷의 effectiveFrom 이 자동으로 이 스냅샷의 종료점.
+ */
+export interface SalesUnitCostSnapshot {
+  id: string;
+  storeId: string;
+  effectiveFrom: string;          // YYYY-MM-DD (KST 기준)
+  sourceFileName: string | null;  // 업로드 원본 파일명 (감사용)
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * 한 스냅샷 안의 한 판매단위에 대한 비용 셀.
+ * (snapshotId, canonicalSalesUnitId) 가 사실상의 복합 키 — 코드에서 unique 보장.
+ */
+export interface SalesUnitCostSnapshotEntry {
+  id: string;
+  snapshotId: string;
+  storeId: string;                       // 동일 스토어 보장용 (cross-store 차단)
+  canonicalSalesUnitId: string;
+  unitCost: number;
+  feeRate: number | null;                // null = API 실측 수수료 폴백
+  otherCost: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DatabaseShape {
   stores: Store[];
   commerceCredentials: CommerceCredential[];
@@ -371,6 +401,8 @@ export interface DatabaseShape {
   adUploadPreviewRows: AdUploadPreviewRow[];
   adCampaignDailyCosts: AdCampaignDailyCost[];
   salesUnitCostSettings: SalesUnitCostSetting[];
+  salesUnitCostSnapshots: SalesUnitCostSnapshot[];
+  salesUnitCostSnapshotEntries: SalesUnitCostSnapshotEntry[];
   operations: OperationRecord[];
   auditLogs: AuditLog[];
 }

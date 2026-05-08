@@ -13,6 +13,8 @@ import {
   ProfitStatus,
   SaleStatus,
   SalesUnitCostSetting,
+  SalesUnitCostSnapshot,
+  SalesUnitCostSnapshotEntry,
   Store,
   VAT_RATE,
   normalizeMatchAlias,
@@ -40,6 +42,8 @@ export const createEmptyDatabase = (): DatabaseShape => ({
   adUploadPreviewRows: [],
   adCampaignDailyCosts: [],
   salesUnitCostSettings: [],
+  salesUnitCostSnapshots: [],
+  salesUnitCostSnapshotEntries: [],
   operations: [],
   auditLogs: [],
 });
@@ -501,26 +505,35 @@ export const getAdMappingStatus = (
   return item.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED";
 };
 
+/**
+ * paymentDate 기준으로 적용할 비용 entry 를 찾는다.
+ * 알고리즘: paymentDate ≤ effectiveFrom 인 가장 최근 스냅샷을 고른 뒤,
+ *           그 스냅샷에서 canonicalSalesUnitId 매칭 entry 반환.
+ * 매칭 entry 없으면 null → 손익에서 INCOMPLETE_COST 처리.
+ */
 export const getCostSettingForDate = (
-  costSettings: SalesUnitCostSetting[],
+  snapshotsForUnit: Array<{ snapshot: SalesUnitCostSnapshot; entry: SalesUnitCostSnapshotEntry | null }>,
   targetDate: string | null,
-): SalesUnitCostSetting | null => {
+): SalesUnitCostSnapshotEntry | null => {
   if (!targetDate) {
     return null;
   }
 
-  return (
-    costSettings.find((setting) => {
-      const starts = setting.effectiveFrom <= targetDate;
-      const ends = !setting.effectiveTo || setting.effectiveTo >= targetDate;
-      return setting.isActive && starts && ends;
-    }) ?? null
-  );
+  // snapshotsForUnit 은 calculateDailyProfitRows 가 미리 효과 시작일 오름차순으로 빌드해서 넘김.
+  // 가장 최근부터 역방향으로 첫 매칭을 찾음.
+  for (let i = snapshotsForUnit.length - 1; i >= 0; i -= 1) {
+    const { snapshot, entry } = snapshotsForUnit[i];
+    if (snapshot.effectiveFrom <= targetDate) {
+      return entry; // entry 가 null 이면 그 스냅샷에 해당 판매단위가 없음 → INCOMPLETE_COST
+    }
+  }
+
+  return null;
 };
 
 export const calculateFee = (
   orderItem: OrderItem,
-  costSetting: SalesUnitCostSetting | null,
+  costSetting: SalesUnitCostSnapshotEntry | null,
 ): { totalFeeCost: number; usedFallback: boolean; incomplete: boolean } => {
   const apiFee = sumNullable(
     orderItem.paymentCommission,
@@ -630,15 +643,32 @@ export const calculateDailyProfitRows = (
   const salesUnitsById = new Map(
     database.canonicalSalesUnits.filter((item) => item.storeId === storeId).map((item) => [item.id, item]),
   );
-  const costSettingsByUnit = new Map<string, SalesUnitCostSetting[]>();
 
-  database.salesUnitCostSettings
+  // 스토어의 스냅샷을 effectiveFrom 오름차순으로 정렬
+  const snapshots = database.salesUnitCostSnapshots
     .filter((item) => item.storeId === storeId)
-    .forEach((item) => {
-      const list = costSettingsByUnit.get(item.canonicalSalesUnitId) ?? [];
-      list.push(item);
-      list.sort((left, right) => left.effectiveFrom.localeCompare(right.effectiveFrom));
-      costSettingsByUnit.set(item.canonicalSalesUnitId, list);
+    .sort((left, right) => left.effectiveFrom.localeCompare(right.effectiveFrom));
+
+  // 판매단위별로 (snapshot, entry|null) 페어 배열 빌드
+  // entry 가 null 인 경우는 그 스냅샷에 해당 판매단위가 없는 경우 (케이스 2 누락 / 신규 판매단위)
+  const entryIndex = new Map<string, Map<string, SalesUnitCostSnapshotEntry>>(); // snapshotId → unitId → entry
+  database.salesUnitCostSnapshotEntries
+    .filter((item) => item.storeId === storeId)
+    .forEach((entry) => {
+      const sub = entryIndex.get(entry.snapshotId) ?? new Map();
+      sub.set(entry.canonicalSalesUnitId, entry);
+      entryIndex.set(entry.snapshotId, sub);
+    });
+
+  const costSettingsByUnit = new Map<string, Array<{ snapshot: SalesUnitCostSnapshot; entry: SalesUnitCostSnapshotEntry | null }>>();
+  database.canonicalSalesUnits
+    .filter((unit) => unit.storeId === storeId)
+    .forEach((unit) => {
+      const pairs = snapshots.map((snapshot) => ({
+        snapshot,
+        entry: entryIndex.get(snapshot.id)?.get(unit.id) ?? null,
+      }));
+      costSettingsByUnit.set(unit.id, pairs);
     });
 
   // Step 1: 자식 + 단독 판매단위의 주문 집계
