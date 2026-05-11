@@ -312,7 +312,7 @@ export interface DashboardSummary {
   deliveryUnitCost: number;
   estimatedDeliveryBaseCost: number;
   customerPaidDeliveryFee: number;
-  storeBorneDeliveryCost: number;
+  deliveryMargin: number;
 }
 
 export interface DailySalesUnitProfit {
@@ -353,7 +353,7 @@ export interface DailySalesUnitDetailDeliveryContext {
   deliveryUnitCost: number;
   estimatedDeliveryBaseCost: number;
   customerPaidDeliveryFee: number;
-  storeBorneDeliveryCost: number;
+  deliveryMargin: number;
   includedInThisSalesUnitNetProfit: false;
   note: string;
 }

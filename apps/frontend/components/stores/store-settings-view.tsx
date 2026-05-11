@@ -463,7 +463,7 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
                     }
                   />
                   <p className="mt-1 text-xs text-ink/55">
-                    배송 단가를 설정하면 대시보드의 스토어 부담 배송비가 자동으로 계산됩니다.
+                    배송 단가를 설정하면 대시보드의 배송 마진이 자동으로 계산됩니다.
                   </p>
                 </label>
               </div>

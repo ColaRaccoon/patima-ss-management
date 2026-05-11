@@ -239,9 +239,9 @@ function createMockDailySalesUnitDetail(
       deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
       estimatedDeliveryBaseCost: 0,
       customerPaidDeliveryFee: row.totalDeliveryFeeAmount,
-      storeBorneDeliveryCost: 0,
+      deliveryMargin: row.totalDeliveryFeeAmount,
       includedInThisSalesUnitNetProfit: false,
-      note: "스토어 공통 비용으로 대시보드에서만 순이익에 반영됩니다",
+      note: "스토어 공통 배송 마진으로 대시보드에서만 순이익에 반영됩니다",
     },
     costBreakdown: {
       costSettingStatus: mockProfitDetailPreview.profitStatus,
@@ -661,14 +661,18 @@ async function getCostSettings(storeId: string, salesUnits: SalesUnitListItem[])
 }
 
 async function getCostSnapshots(storeId: string) {
-  const response = await fetchApi<Array<Record<string, unknown>>>({
+  const response = await fetchApi<
+    Array<Record<string, unknown>> | { snapshots?: Array<Record<string, unknown>> }
+  >({
     label: "Cost snapshots",
     path: withQuery("/sales-unit-cost-snapshots", { storeId }),
     fallback: [],
   });
 
-  const snapshots = response.data.snapshots ?? response.data;
-  const items = (Array.isArray(snapshots) ? snapshots : []).map((item) => ({
+  const snapshots = Array.isArray(response.data)
+    ? response.data
+    : response.data.snapshots ?? [];
+  const items = snapshots.map((item) => ({
     id: String(item.id),
     effectiveFrom: String(item.effectiveFrom),
     entryCount: Number(item.entryCount ?? 0),

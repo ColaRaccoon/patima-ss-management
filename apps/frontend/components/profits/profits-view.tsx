@@ -15,7 +15,7 @@ import type {
   DailySalesUnitProfit,
   ProfitsPageData,
 } from "@/lib/api/types";
-import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
+import { formatCurrency, formatCurrencyWithSign, formatDate, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
 
 interface ExpandedGroups {
@@ -270,7 +270,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
       <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-950">
         <p className="font-semibold">선택한 날짜({formatDate(data.dateTo)}) 기준 배송비 계산 내역</p>
         <p className="mt-1">
-          순손익은 VAT 차감 매출 기준 판매단위 순손익 합에서 스토어 부담 배송비를 차감하여 산출됩니다. 개별 판매단위에는 배송비가 배분되지 않습니다.
+          순손익은 VAT 차감 매출 기준 판매단위 순손익 합에 배송 마진을 합산하여 산출됩니다. 개별 판매단위에는 배송비가 배분되지 않습니다.
         </p>
       </div>
 
@@ -303,7 +303,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
             ? "가구매 데이터 제외 완료"
             : data.summary.profitStatus === "INCOMPLETE_COST"
               ? "일부 원가 정보가 누락되었습니다."
-              : "스토어 부담 배송비 차감 완료";
+              : "배송 마진 합산 완료";
 
           return (
             <StatCard
@@ -332,10 +332,10 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           tone="muted"
         />
         <StatCard
-          label="스토어 부담 배송비"
-          value={formatCurrency(data.summary.storeBorneDeliveryCost)}
-          hint={`고객 부담 ${formatCurrency(data.summary.customerPaidDeliveryFee)} 차감 후`}
-          tone="muted"
+          label="배송 마진"
+          value={formatCurrencyWithSign(data.summary.deliveryMargin, { showPlus: true }).text}
+          hint={`고객 부담 ${formatCurrency(data.summary.customerPaidDeliveryFee)} - 추정 원가 ${formatCurrency(data.summary.estimatedDeliveryBaseCost)}`}
+          tone={data.summary.deliveryMargin >= 0 ? "success" : "warning"}
         />
         <StatCard
           label="고객 부담 배송비"
@@ -690,11 +690,11 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                     </div>
                     <div className="flex items-center justify-between">
                       <p className="text-sky-900/70">고객 부담 배송비</p>
-                      <p className="font-semibold text-sky-900">-{formatCurrency(selectedDetail.deliveryContext.customerPaidDeliveryFee)}</p>
+                      <p className="font-semibold text-sky-900">{formatCurrency(selectedDetail.deliveryContext.customerPaidDeliveryFee)}</p>
                     </div>
                     <div className="flex items-center justify-between border-t border-sky-900/10 pt-2">
-                      <p className="text-sky-900/70 font-semibold">스토어 부담 배송비</p>
-                      <p className="font-semibold text-sky-900">{formatCurrency(selectedDetail.deliveryContext.storeBorneDeliveryCost)}</p>
+                      <p className="text-sky-900/70 font-semibold">배송 마진</p>
+                      <p className="font-semibold text-sky-900">{formatCurrencyWithSign(selectedDetail.deliveryContext.deliveryMargin, { showPlus: true }).text}</p>
                     </div>
                     <p className="text-xs text-sky-900/60 mt-2">{selectedDetail.deliveryContext.note}</p>
                   </div>

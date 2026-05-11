@@ -577,17 +577,17 @@ export const calculateEstimatedDeliveryBaseCost = (
   deliveryUnitCost: number,
 ): number => uniquePackageCount * deliveryUnitCost;
 
-export const calculateStoreBorneDeliveryCost = (
+export const calculateDeliveryMargin = (
   estimated: number,
   customerPaid: number,
-): number => Math.max(0, estimated - customerPaid);
+): number => customerPaid - estimated;
 
 export interface StoreDeliverySummary {
   uniquePackageCount: number;
   deliveryUnitCost: number;
   estimatedDeliveryBaseCost: number;
   customerPaidDeliveryFee: number;
-  storeBorneDeliveryCost: number;
+  deliveryMargin: number;
 }
 
 const initRow = (
@@ -922,7 +922,7 @@ export const calculateStoreDeliverySummary = (
     uniquePackageCount,
     deliveryUnitCost,
   );
-  const storeBorneDeliveryCost = calculateStoreBorneDeliveryCost(
+  const deliveryMargin = calculateDeliveryMargin(
     estimatedDeliveryBaseCost,
     customerPaidDeliveryFee,
   );
@@ -932,7 +932,7 @@ export const calculateStoreDeliverySummary = (
     deliveryUnitCost,
     estimatedDeliveryBaseCost,
     customerPaidDeliveryFee,
-    storeBorneDeliveryCost,
+    deliveryMargin,
   };
 };
 
@@ -972,10 +972,10 @@ export const calculateDashboardSummary = (
     }
   }
 
-  // 최종 순이익 = 판매단위 순이익 합 − 스토어 부담 배송비
+  // 최종 순이익 = 판매단위 순이익 합 + 배송 마진
   const finalEstimatedNetProfit = incompleteRowCount > 0
     ? null
-    : sumRowEstimatedNetProfit - deliverySummary.storeBorneDeliveryCost;
+    : sumRowEstimatedNetProfit + deliverySummary.deliveryMargin;
 
   // 기존 estimatedNetProfit 임시 저장 (추후 복구)
   const estimatedNetProfit = finalEstimatedNetProfit;
@@ -1063,7 +1063,7 @@ export const calculateDashboardSummary = (
     deliveryUnitCost: deliverySummary.deliveryUnitCost,
     estimatedDeliveryBaseCost: deliverySummary.estimatedDeliveryBaseCost,
     customerPaidDeliveryFee: deliverySummary.customerPaidDeliveryFee,
-    storeBorneDeliveryCost: deliverySummary.storeBorneDeliveryCost,
+    deliveryMargin: deliverySummary.deliveryMargin,
   };
 };
 

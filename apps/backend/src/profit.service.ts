@@ -211,9 +211,9 @@ export class ProfitService {
         deliveryUnitCost: deliverySummary.deliveryUnitCost,
         estimatedDeliveryBaseCost: deliverySummary.estimatedDeliveryBaseCost,
         customerPaidDeliveryFee: deliverySummary.customerPaidDeliveryFee,
-        storeBorneDeliveryCost: deliverySummary.storeBorneDeliveryCost,
+        deliveryMargin: deliverySummary.deliveryMargin,
         includedInThisSalesUnitNetProfit: false,
-        note: "스토어 공통 비용으로 대시보드에서만 순이익에 반영됩니다",
+        note: "스토어 공통 배송 마진으로 대시보드에서만 순이익에 반영됩니다",
       },
       costBreakdown: {
         costSettingStatus: summary.profitStatus,

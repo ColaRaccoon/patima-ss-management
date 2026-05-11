@@ -99,6 +99,13 @@ export class AdsService implements OnModuleInit {
 
     const snapshot = this.databaseService.getSnapshot();
     const activeConfirmedRows = this.getActiveConfirmedRows(snapshot, storeId, reportDate);
+    const campaignIds = campaigns.map((campaign) => campaign.campaignId);
+    this.assertNoDuplicateCampaignIds(campaignIds, "AD_UPLOAD_DUPLICATE_IN_FILE");
+    this.assertNoCampaignIdOverlap(
+      campaignIds,
+      activeConfirmedRows,
+      "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
+    );
 
     // 요일 검증 실패 시 즉시 예외 던지기
     if (weekdayValidationStatus !== "PASSED") {

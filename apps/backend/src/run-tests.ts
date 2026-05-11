@@ -414,7 +414,7 @@ run("resolvePackageKey falls back to orderId when packageNumber is empty or null
   assert.equal(resolvePackageKey({ packageNumber: null, orderId: "ORD-001" } as never), "ORD-001");
 });
 
-run("calculateStoreDeliverySummary counts unique packages and computes store-borne cost", () => {
+run("calculateStoreDeliverySummary counts unique packages and computes delivery margin", () => {
   const database = createEmptyDatabase();
   database.stores.push({
     id: "store-1",
@@ -478,10 +478,10 @@ run("calculateStoreDeliverySummary counts unique packages and computes store-bor
   assert.equal(summary.deliveryUnitCost, 3500);
   assert.equal(summary.estimatedDeliveryBaseCost, 7000);
   assert.equal(summary.customerPaidDeliveryFee, 5000);
-  assert.equal(summary.storeBorneDeliveryCost, 2000);
+  assert.equal(summary.deliveryMargin, -2000);
 });
 
-run("calculateStoreDeliverySummary clamps negative delivery cost to 0", () => {
+run("calculateStoreDeliverySummary keeps positive delivery margin without clamping", () => {
   const database = createEmptyDatabase();
   database.stores.push({
     id: "store-1",
@@ -501,7 +501,7 @@ run("calculateStoreDeliverySummary clamps negative delivery cost to 0", () => {
   const summary = calculateStoreDeliverySummary(database, "store-1", "2026-04-02", "2026-04-02");
   assert.equal(summary.estimatedDeliveryBaseCost, 3500);
   assert.equal(summary.customerPaidDeliveryFee, 10000);
-  assert.equal(summary.storeBorneDeliveryCost, 0);
+  assert.equal(summary.deliveryMargin, 6500);
 });
 
 run("FakePurchaseService stores daily amounts by store and date with audit history", () => {
@@ -776,17 +776,22 @@ run("calculateDashboardSummary excludes conflict order revenue and conflict ad c
   const date = "2026-04-01";
 
   database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Diet Socks", ["dietsocks"]));
-  database.salesUnitCostSettings.push({
+  database.salesUnitCostSnapshots.push({
+    id: "snapshot-1",
+    storeId: "store-1",
+    effectiveFrom: date,
+    sourceFileName: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.salesUnitCostSnapshotEntries.push({
     id: "cost-1",
+    snapshotId: "snapshot-1",
     storeId: "store-1",
     canonicalSalesUnitId: "sales-1",
     unitCost: 10,
     feeRate: 0.1,
     otherCost: 5,
-    isActive: true,
-    deactivatedAt: null,
-    effectiveFrom: date,
-    effectiveTo: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   } as never);
@@ -941,17 +946,22 @@ run("profit rows keep delivery fee separate from product revenue and net profit"
   const date = "2026-04-02";
 
   database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Diet Socks", ["dietsocks"]));
-  database.salesUnitCostSettings.push({
+  database.salesUnitCostSnapshots.push({
+    id: "snapshot-delivery-profit",
+    storeId: "store-1",
+    effectiveFrom: date,
+    sourceFileName: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.salesUnitCostSnapshotEntries.push({
     id: "cost-1",
+    snapshotId: "snapshot-delivery-profit",
     storeId: "store-1",
     canonicalSalesUnitId: "sales-1",
     unitCost: 10,
     feeRate: 0.1,
     otherCost: 5,
-    isActive: true,
-    deactivatedAt: null,
-    effectiveFrom: date,
-    effectiveTo: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   } as never);
@@ -1022,7 +1032,7 @@ run("profit rows keep delivery fee separate from product revenue and net profit"
   assert.equal(summary.estimatedNetProfit, -3415);
   assert.equal(summary.uniquePackageCount, 1);
   assert.equal(summary.deliveryUnitCost, 3500);
-  assert.equal(summary.storeBorneDeliveryCost, 3480);
+  assert.equal(summary.deliveryMargin, -3480);
 });
 
 run("AdsService confirms two same-date uploads and sums ad cost across active confirmed uploads", () => {
@@ -1033,19 +1043,17 @@ run("AdsService confirms two same-date uploads and sums ad cost across active co
     draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha", "beta"]));
   });
 
-  const firstPreview = adsService.previewUpload(
+  adsService.previewUpload(
     "store-1",
     date,
     createAdUploadFile(date, [{ campaignId: "cmp-1001", campaignName: "alpha launch", totalCost: 120 }]),
   );
-  void adsService.performConfirm(firstPreview.data.uploadId);
 
-  const secondPreview = adsService.previewUpload(
+  adsService.previewUpload(
     "store-1",
     date,
     createAdUploadFile(date, [{ campaignId: "cmp-1002", campaignName: "beta launch", totalCost: 80 }]),
   );
-  void adsService.performConfirm(secondPreview.data.uploadId);
 
   const snapshot = databaseService.getSnapshot();
   const activeConfirmedUploads = snapshot.adExcelUploads.filter(
@@ -1163,17 +1171,22 @@ run("ProfitService keeps delivery fee references separate from product revenue a
 
   databaseService.write((draft) => {
     draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
-    draft.salesUnitCostSettings.push({
+    draft.salesUnitCostSnapshots.push({
+      id: "snapshot-profit-service",
+      storeId: "store-1",
+      effectiveFrom: date,
+      sourceFileName: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as never);
+    draft.salesUnitCostSnapshotEntries.push({
       id: "cost-1",
+      snapshotId: "snapshot-profit-service",
       storeId: "store-1",
       canonicalSalesUnitId: "sales-1",
       unitCost: 0,
       feeRate: 0,
       otherCost: 0,
-      isActive: true,
-      deactivatedAt: null,
-      effectiveFrom: date,
-      effectiveTo: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     } as never);
@@ -1228,7 +1241,7 @@ run("ProfitService keeps delivery fee references separate from product revenue a
   assert.equal(detail.data.revenueBreakdown.vatAmount, 10);
   assert.equal(detail.data.revenueBreakdown.vatAdjustedRevenue, 90);
   assert.equal(detail.data.deliveryContext.uniquePackageCount, 1);
-  assert.equal(detail.data.deliveryContext.storeBorneDeliveryCost, 3470);
+  assert.equal(detail.data.deliveryContext.deliveryMargin, -3470);
   assert.equal(detail.data.deliveryContext.includedInThisSalesUnitNetProfit, false);
 });
 

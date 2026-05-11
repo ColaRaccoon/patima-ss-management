@@ -9,7 +9,7 @@ import { SourceBanner } from "@/components/shared/source-banner";
 import { StatCard } from "@/components/shared/stat-card";
 import { StatusBadge } from "@/components/shared/status-badge";
 import type { DashboardPageData } from "@/lib/api/types";
-import { formatCurrency, formatDate, formatDateTime, formatNumber } from "@/lib/format";
+import { formatCurrency, formatCurrencyWithSign, formatDate, formatDateTime, formatNumber } from "@/lib/format";
 import { toneForOperationStatus, toneForProfitStatus } from "@/lib/status-tone";
 
 export function DashboardView({ data }: { data: DashboardPageData }) {
@@ -48,9 +48,9 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
       <SourceBanner sources={data.sources} />
 
       <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-950">
-        <p className="font-semibold">순손익 = 판매단위별 순손익 합 − 스토어 부담 배송비</p>
+        <p className="font-semibold">순손익 = 판매단위별 순손익 합 + 배송 마진</p>
         <p className="mt-1">
-          각 판매단위의 순손익은 VAT 차감 매출 기준으로 계산되며, 스토어 부담 배송비는 대시보드 레벨에서만 차감됩니다.
+          각 판매단위의 순손익은 VAT 차감 매출 기준으로 계산되며, 배송 마진은 대시보드 레벨에서만 합산됩니다.
         </p>
       </div>
 
@@ -92,10 +92,10 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
           tone="muted"
         />
         <StatCard
-          label="스토어 부담 배송비"
-          value={formatCurrency(data.summary.storeBorneDeliveryCost)}
-          hint={`고객 부담 ${formatCurrency(data.summary.customerPaidDeliveryFee)} 차감 후`}
-          tone="muted"
+          label="배송 마진"
+          value={formatCurrencyWithSign(data.summary.deliveryMargin, { showPlus: true }).text}
+          hint={`고객 부담 ${formatCurrency(data.summary.customerPaidDeliveryFee)} - 추정 원가 ${formatCurrency(data.summary.estimatedDeliveryBaseCost)}`}
+          tone={data.summary.deliveryMargin >= 0 ? "success" : "warning"}
         />
         <StatCard
           label="조정 손익"

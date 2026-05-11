@@ -37,6 +37,7 @@ export interface StoreListItem {
   lastOrderSyncStatus: "SUCCEEDED" | "FAILED" | "NEVER";
   credentialConnectionStatus: "SUCCEEDED" | "FAILED" | "NOT_TESTED";
   lastCredentialTestAt: string | null;
+  deliveryUnitCost: number;
   memo?: string | null;
 }
 

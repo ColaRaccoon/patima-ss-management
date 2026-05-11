@@ -191,6 +191,11 @@ export const mockSignatures: OrderSourceSignatureListItem[] = [
     canonicalSalesUnitId: "sales-unit-1",
     canonicalDisplayName: "러닝모자 / 블랙",
     usageCount: 18,
+    externalProductId: null,
+    optionCode: null,
+    fallbackProductName: null,
+    fallbackProductNameSource: null,
+    storeSlug: null,
   },
   {
     id: "signature-2",
@@ -201,6 +206,11 @@ export const mockSignatures: OrderSourceSignatureListItem[] = [
     canonicalSalesUnitId: "sales-unit-2",
     canonicalDisplayName: "두줄 무릎 보호대 / 모던그레이",
     usageCount: 9,
+    externalProductId: null,
+    optionCode: null,
+    fallbackProductName: null,
+    fallbackProductNameSource: null,
+    storeSlug: null,
   },
   {
     id: "signature-3",
@@ -211,6 +221,11 @@ export const mockSignatures: OrderSourceSignatureListItem[] = [
     canonicalSalesUnitId: null,
     canonicalDisplayName: null,
     usageCount: 3,
+    externalProductId: null,
+    optionCode: null,
+    fallbackProductName: null,
+    fallbackProductNameSource: null,
+    storeSlug: null,
   },
 ];
 
@@ -244,7 +259,7 @@ export const mockDashboardSummary: DashboardSummary = {
   deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
   estimatedDeliveryBaseCost: 10500,
   customerPaidDeliveryFee: 12000,
-  storeBorneDeliveryCost: 0,
+  deliveryMargin: 1500,
 };
 
 export const mockProfits: DailySalesUnitProfit[] = [
