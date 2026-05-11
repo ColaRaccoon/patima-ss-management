@@ -32,6 +32,7 @@ import type {
   CostsPageData,
   CostSettingListItem,
   CredentialSummary,
+  DailyFakePurchaseResponse,
   DailySalesUnitDetail,
   DashboardPageData,
   MappingsPageData,
@@ -376,6 +377,22 @@ async function getUnmappedSummary(storeId: string, dateFrom: string, dateTo: str
     label: "Unmapped summary",
     path: withQuery("/profits/unmapped-summary", { storeId, dateFrom, dateTo }),
     ...(useFallback ? { fallback: mockUnmappedSummary } : {}),
+  });
+}
+
+async function getDailyFakePurchase(storeId: string, date: string, useFallback = true) {
+  return fetchApi<DailyFakePurchaseResponse>({
+    label: "Daily fake purchase",
+    path: withQuery("/daily-fake-purchases", { storeId, date }),
+    ...(useFallback
+      ? {
+          fallback: {
+            amount: 0,
+            exists: false,
+            updatedAt: null,
+          },
+        }
+      : {}),
   });
 }
 
@@ -908,6 +925,7 @@ export async function getProfitsPageData(params?: {
       summary: mockDashboardSummary,
       profits: [],
       unmappedSummary: mockUnmappedSummary,
+      fakePurchase: null,
       selectedDetail: null,
       sources: collectSources(storeResponse),
     };
@@ -926,10 +944,11 @@ export async function getProfitsPageData(params?: {
   const dateFrom = requestedDateFrom || requestedDateTo || resolvedDate;
   const dateTo = requestedDateTo || requestedDateFrom || resolvedDate;
 
-  const [summaryResponse, profitResponse, unmappedResponse] = await Promise.all([
+  const [summaryResponse, profitResponse, unmappedResponse, fakePurchaseResponse] = await Promise.all([
     getDashboardSummary(primaryStore.id, dateTo || MOCK_SELECTED_DATE, USE_PROFITS_MOCK_FALLBACK),
     getProfitRows(primaryStore.id, dateFrom, dateTo, USE_PROFITS_MOCK_FALLBACK),
     getUnmappedSummary(primaryStore.id, dateFrom, dateTo, USE_PROFITS_MOCK_FALLBACK),
+    getDailyFakePurchase(primaryStore.id, dateTo || MOCK_SELECTED_DATE, USE_PROFITS_MOCK_FALLBACK),
   ]);
 
   const firstProfit = profitResponse.data[0] ?? null;
@@ -954,6 +973,7 @@ export async function getProfitsPageData(params?: {
     summary: summaryResponse.data,
     profits: profitResponse.data,
     unmappedSummary: unmappedResponse.data,
+    fakePurchase: fakePurchaseResponse.data,
     selectedDetail: detailResponse?.data ?? null,
     sources: collectSources(
       storeResponse,
@@ -961,6 +981,7 @@ export async function getProfitsPageData(params?: {
       summaryResponse,
       profitResponse,
       unmappedResponse,
+      fakePurchaseResponse,
       ...(detailResponse ? [detailResponse] : []),
     ),
   };

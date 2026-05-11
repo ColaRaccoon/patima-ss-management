@@ -1,5 +1,6 @@
 import {
   Body,
+  BadRequestException,
   Controller,
   Delete,
   Get,
@@ -7,6 +8,7 @@ import {
   ParseIntPipe,
   Patch,
   Post,
+  Put,
   Query,
   Res,
   UploadedFile,
@@ -18,6 +20,7 @@ import { AdsService } from "./ads.service";
 import { CampaignMappingService } from "./campaign-mapping.service";
 import { CostService } from "./cost.service";
 import { CredentialService } from "./credential.service";
+import { FakePurchaseService } from "./fake-purchase.service";
 import { MappingSeedService } from "./mapping-seed.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
@@ -26,6 +29,23 @@ import { ProfitService } from "./profit.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 import { formatApiSuccess } from "./helpers";
+
+const normalizeFakePurchaseAmount = (value: number | string | null | undefined): number => {
+  if (value == null || value === "") {
+    return 0;
+  }
+
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) {
+    throw new BadRequestException({
+      success: false,
+      message: "가구매 금액은 0 이상의 정수여야 합니다.",
+      errors: [{ field: "amount", reason: "INVALID_AMOUNT" }],
+    });
+  }
+
+  return Math.floor(amount);
+};
 
 @Controller("api/v1")
 export class AppController {
@@ -38,6 +58,7 @@ export class AppController {
     private readonly adsService: AdsService,
     private readonly campaignMappingService: CampaignMappingService,
     private readonly costService: CostService,
+    private readonly fakePurchaseService: FakePurchaseService,
     private readonly profitService: ProfitService,
     private readonly operationService: OperationService,
     private readonly mappingSeedService: MappingSeedService,
@@ -462,6 +483,27 @@ export class AppController {
   deleteCostSnapshot(@Param("snapshotId") snapshotId: string) {
     const result = this.costService.deleteSnapshot(snapshotId);
     return formatApiSuccess(result);
+  }
+
+  @Get("daily-fake-purchases")
+  getDailyFakePurchase(
+    @Query("storeId") storeId: string,
+    @Query("date") date: string,
+  ) {
+    return formatApiSuccess(this.fakePurchaseService.get(storeId, date));
+  }
+
+  @Put("daily-fake-purchases")
+  upsertDailyFakePurchase(
+    @Body() body: { storeId: string; date: string; amount?: number | string | null },
+  ) {
+    return formatApiSuccess(
+      this.fakePurchaseService.upsert({
+        storeId: body.storeId,
+        date: body.date,
+        amount: normalizeFakePurchaseAmount(body.amount),
+      }),
+    );
   }
 
   @Get("dashboard/summary")

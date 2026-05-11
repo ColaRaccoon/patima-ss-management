@@ -8,6 +8,7 @@ import { CredentialService } from "./credential.service";
 import { CryptoService } from "./crypto.service";
 import { DatabaseService } from "./database.service";
 import { EnvironmentBootstrapService } from "./environment-bootstrap.service";
+import { FakePurchaseService } from "./fake-purchase.service";
 import { MappingSeedService } from "./mapping-seed.service";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { NaverCommerceService } from "./naver-commerce.service";
@@ -37,6 +38,7 @@ import { StoreService } from "./store.service";
     AdsService,
     CampaignMappingService,
     CostService,
+    FakePurchaseService,
     ProfitService,
     MappingSeedService,
   ],

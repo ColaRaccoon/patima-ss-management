@@ -10,7 +10,11 @@ import { SourceBanner } from "@/components/shared/source-banner";
 import { StatCard } from "@/components/shared/stat-card";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { readApiResponse } from "@/lib/api/browser";
-import type { DailySalesUnitDetail, DailySalesUnitProfit, ProfitsPageData } from "@/lib/api/types";
+import type {
+  DailySalesUnitDetail,
+  DailySalesUnitProfit,
+  ProfitsPageData,
+} from "@/lib/api/types";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
 
@@ -36,11 +40,26 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
   const [isRefreshing, startRefresh] = useTransition();
   const [expandedGroups, setExpandedGroups] = useState<ExpandedGroups>({});
   const [excludedSummaryExpanded, setExcludedSummaryExpanded] = useState(false);
-  const [manualFakePurchaseAmount, setManualFakePurchaseAmount] = useState("");
+  const [savedAmount, setSavedAmount] = useState(data.fakePurchase?.amount ?? 0);
+  const [draftAmount, setDraftAmount] = useState(() => {
+    const initialAmount = data.fakePurchase?.amount ?? 0;
+    return initialAmount === 0 ? "" : String(initialAmount);
+  });
+  const [isSavingFakePurchase, setIsSavingFakePurchase] = useState(false);
+  const [fakePurchaseError, setFakePurchaseError] = useState<string | null>(null);
+  const [fakePurchaseNotice, setFakePurchaseNotice] = useState<string | null>(null);
 
   useEffect(() => {
     setSelectedDate(data.dateTo);
   }, [data.dateTo]);
+
+  useEffect(() => {
+    const nextAmount = data.fakePurchase?.amount ?? 0;
+    setSavedAmount(nextAmount);
+    setDraftAmount(nextAmount === 0 ? "" : String(nextAmount));
+    setFakePurchaseError(null);
+    setFakePurchaseNotice(null);
+  }, [data.fakePurchase, data.dateTo]);
 
   useEffect(() => {
     if (
@@ -70,6 +89,55 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
     startRefresh(() => {
       router.replace(searchParams.size > 0 ? `/profits?${searchParams.toString()}` : "/profits");
     });
+  };
+
+  const draftAmountNumber = draftAmount.trim() === "" ? 0 : Number(draftAmount);
+  const isDraftAmountValid = Number.isFinite(draftAmountNumber) && draftAmountNumber >= 0;
+  const normalizedDraftAmount = isDraftAmountValid ? Math.floor(draftAmountNumber) : 0;
+  const isFakePurchaseDirty = isDraftAmountValid && normalizedDraftAmount !== savedAmount;
+  const canSaveFakePurchase =
+    selectedDate === data.dateTo && isFakePurchaseDirty && !isSavingFakePurchase;
+
+  const handleSaveFakePurchase = async () => {
+    if (!data.primaryStore) {
+      return;
+    }
+    if (!isDraftAmountValid) {
+      setFakePurchaseError("가구매 금액은 0 이상의 정수여야 합니다.");
+      setFakePurchaseNotice(null);
+      return;
+    }
+
+    setIsSavingFakePurchase(true);
+    setFakePurchaseError(null);
+    setFakePurchaseNotice(null);
+
+    try {
+      const persisted = await readApiResponse<{ amount: number }>(
+        await fetch("/api/daily-fake-purchases", {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            storeId: data.primaryStore.id,
+            date: data.dateTo,
+            amount: normalizedDraftAmount,
+          }),
+        }),
+        "가구매 금액 저장에 실패했습니다.",
+      );
+
+      setSavedAmount(persisted.amount);
+      setDraftAmount(persisted.amount === 0 ? "" : String(persisted.amount));
+      setFakePurchaseNotice(`${formatDate(data.dateTo)} 가구매 ${formatCurrency(persisted.amount)} 저장됨`);
+    } catch (error) {
+      setFakePurchaseError(
+        error instanceof Error ? error.message : "가구매 금액 저장에 실패했습니다.",
+      );
+    } finally {
+      setIsSavingFakePurchase(false);
+    }
   };
 
   if (!data.primaryStore) {
@@ -146,10 +214,24 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           className="input-shell"
           type="number"
           placeholder="0"
-          value={manualFakePurchaseAmount}
-          onChange={(event) => setManualFakePurchaseAmount(event.target.value)}
+          min={0}
+          step={1}
+          value={draftAmount}
+          onChange={(event) => {
+            setDraftAmount(event.target.value);
+            setFakePurchaseError(null);
+            setFakePurchaseNotice(null);
+          }}
         />
       </label>
+      <button
+        className="button-shell button-secondary"
+        type="button"
+        disabled={!canSaveFakePurchase}
+        onClick={handleSaveFakePurchase}
+      >
+        {isSavingFakePurchase ? "저장 중..." : "가구매 저장"}
+      </button>
       <button
         className="button-shell button-primary"
         type="submit"
@@ -168,6 +250,11 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
         actions={
           <div className="space-y-3">
             {dateFilterForm}
+            {fakePurchaseError ? (
+              <p className="text-sm text-rose-700">{fakePurchaseError}</p>
+            ) : fakePurchaseNotice ? (
+              <p className="text-sm text-emerald-700">{fakePurchaseNotice}</p>
+            ) : null}
             {dateAvailabilityNotice ? (
               <div className="rounded-2xl border border-amber-300/40 bg-amber-100/70 px-4 py-3 text-sm leading-6 text-amber-900">
                 <p className="font-semibold">{dateAvailabilityNotice.title}</p>
@@ -207,11 +294,11 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
           tone={data.summary.roughProfit >= 0 ? "success" : "danger"}
         />
         {(() => {
-          const fakePurchaseStr = manualFakePurchaseAmount.trim();
-          const hasFakePurchase = fakePurchaseStr !== "" && !isNaN(Number(fakePurchaseStr)) && Number(fakePurchaseStr) !== 0;
-          const displayProfit = hasFakePurchase
-            ? data.summary.estimatedNetProfit - Number(fakePurchaseStr)
-            : data.summary.estimatedNetProfit;
+          const hasFakePurchase = savedAmount > 0;
+          const displayProfit =
+            data.summary.estimatedNetProfit == null
+              ? null
+              : data.summary.estimatedNetProfit - savedAmount;
           const hintText = hasFakePurchase
             ? "가구매 데이터 제외 완료"
             : data.summary.profitStatus === "INCOMPLETE_COST"

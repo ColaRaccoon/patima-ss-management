@@ -283,6 +283,12 @@ export interface UnmappedSummary {
   intentionalUnmappedAdCost: number;
 }
 
+export interface DailyFakePurchaseResponse {
+  amount: number;
+  exists: boolean;
+  updatedAt: string | null;
+}
+
 export interface ProfitDetailPreview {
   displayName: string;
   orderCount: number;
@@ -428,6 +434,7 @@ export interface ProfitsPageData {
   summary: DashboardSummary;
   profits: DailySalesUnitProfit[];
   unmappedSummary: UnmappedSummary;
+  fakePurchase: DailyFakePurchaseResponse | null;
   selectedDetail: DailySalesUnitDetail | null;
   sources: SourceState[];
 }

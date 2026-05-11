@@ -177,10 +177,10 @@ export class CampaignMappingService implements OnModuleInit {
         errors: [{ field: "campaignPattern", reason: "INVALID_VALUE" }],
       });
     }
-    if (normalized.length < 3) {
+    if (normalized.length < 2) {
       throw new BadRequestException({
         success: false,
-        message: "패턴 길이는 3자 이상이어야 합니다.",
+        message: "패턴 길이는 2자 이상이어야 합니다.",
         errors: [{ field: "campaignPattern", reason: "INVALID_VALUE" }],
       });
     }

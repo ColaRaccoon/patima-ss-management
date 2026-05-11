@@ -27,6 +27,7 @@ const STORAGE_TABLES: StorageTable[] = [
   { key: "salesUnitCostSettings", tableName: "sales_unit_cost_settings" },
   { key: "salesUnitCostSnapshots", tableName: "sales_unit_cost_snapshots" },
   { key: "salesUnitCostSnapshotEntries", tableName: "sales_unit_cost_snapshot_entries" },
+  { key: "dailyFakePurchases", tableName: "daily_fake_purchases" },
   { key: "operations", tableName: "operations" },
   { key: "auditLogs", tableName: "audit_logs" },
 ];
@@ -174,6 +175,10 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
   private normalizeSnapshot(snapshot: DatabaseShape): DatabaseShape {
     const normalized = this.cloneSnapshot(snapshot);
+
+    normalized.dailyFakePurchases = Array.isArray(normalized.dailyFakePurchases)
+      ? normalized.dailyFakePurchases
+      : [];
 
     // 스토어 deliveryUnitCost 기본값 보정 (마이그레이션)
     normalized.stores = normalized.stores.map((store) => ({

@@ -7,7 +7,7 @@ import {
 
 export async function proxyRequest(params: {
   path: string;
-  method: "GET" | "POST" | "PATCH";
+  method: "GET" | "POST" | "PATCH" | "PUT";
   fallbackMessage: string;
   body?: BodyInit | null;
   headers?: HeadersInit;

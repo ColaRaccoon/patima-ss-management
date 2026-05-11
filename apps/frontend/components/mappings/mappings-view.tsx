@@ -96,6 +96,10 @@ function getMappingTypeIndicator(signature: MappingsPageData["signatures"][numbe
   return "TEXT_MAPPED";
 }
 
+function isCampaignMappableSalesUnit(salesUnit: MappingsPageData["salesUnits"][number]) {
+  return salesUnit.isActive && (salesUnit.isStoreLevel || salesUnit.isGroup || !salesUnit.parentSalesUnitId);
+}
+
 function hasGroupShipping(rawOptionInfo: string | null): boolean {
   return rawOptionInfo?.includes("[함께배송") ?? false;
 }
@@ -216,6 +220,8 @@ function SelectionTable<T extends SelectableRow>(props: {
 
 export function MappingsView({ data }: { data: MappingsPageData }) {
   const router = useRouter();
+  const campaignMappableSalesUnits = data.salesUnits.filter(isCampaignMappableSalesUnit);
+  const defaultCampaignSalesUnitId = campaignMappableSalesUnits[0]?.id ?? "";
   const [selectedSignatureIds, setSelectedSignatureIds] = useState<string[]>([]);
   const [selectedMappingId, setSelectedMappingId] = useState<string | null>(data.campaignMappings[0]?.id ?? null);
   const [selectedAdCostIds, setSelectedAdCostIds] = useState<string[]>([]);
@@ -224,9 +230,9 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   );
   const [signatureDraft, setSignatureDraft] = useState(emptySignatureDraft());
   const [campaignDraft, setCampaignDraft] = useState(
-    emptyCampaignDraft(data.campaignMappings[0]?.canonicalSalesUnitId ?? data.salesUnits[0]?.id ?? ""),
+    emptyCampaignDraft(data.campaignMappings[0]?.canonicalSalesUnitId ?? defaultCampaignSalesUnitId),
   );
-  const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(data.salesUnits[0]?.id ?? "");
+  const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(defaultCampaignSalesUnitId);
   const [hideZeroCostAdRows, setHideZeroCostAdRows] = useState(true);
   const [showOnlyUnmappedOrders, setShowOnlyUnmappedOrders] = useState(false);
   const [showOnlyUnmappedAds, setShowOnlyUnmappedAds] = useState(false);
@@ -330,7 +336,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     const selectedIds = new Set(selectedAdCostIds);
     const rows = data.adCosts.filter((item) => selectedIds.has(item.id));
     if (!rows.length) {
-      setAdCostSalesUnitId(data.salesUnits[0]?.id ?? "");
+      setAdCostSalesUnitId(defaultCampaignSalesUnitId);
       setIntentionalReason("");
       return;
     }
@@ -338,14 +344,14 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       rows.every((item) => item.canonicalSalesUnitId === rows[0]?.canonicalSalesUnitId) &&
       rows[0]?.canonicalSalesUnitId
         ? rows[0].canonicalSalesUnitId
-        : data.salesUnits[0]?.id ?? "";
+        : defaultCampaignSalesUnitId;
     const sharedReason =
       rows.every((item) => item.reasonNote === rows[0]?.reasonNote)
         ? rows[0]?.reasonNote ?? ""
         : "";
     setAdCostSalesUnitId(sharedSalesUnitId);
     setIntentionalReason(sharedReason);
-  }, [data.adCosts, data.salesUnits, selectedAdCostIds]);
+  }, [data.adCosts, defaultCampaignSalesUnitId, selectedAdCostIds]);
 
   useEffect(() => {
     if (selectedMapping) {
@@ -355,8 +361,8 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       });
       return;
     }
-    setCampaignDraft(emptyCampaignDraft(data.salesUnits[0]?.id ?? ""));
-  }, [data.salesUnits, selectedMapping]);
+    setCampaignDraft(emptyCampaignDraft(defaultCampaignSalesUnitId));
+  }, [defaultCampaignSalesUnitId, selectedMapping]);
 
   useEffect(() => {
     if (selectedMappingId === null) return;
@@ -643,7 +649,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               disabled={isBusy}
               onClick={() => {
                 setSelectedMappingId(null);
-                setCampaignDraft(emptyCampaignDraft(data.salesUnits[0]?.id ?? ""));
+                setCampaignDraft(emptyCampaignDraft(defaultCampaignSalesUnitId));
                 setCampaignError(null);
                 setCampaignSuccess(null);
               }}
@@ -1222,15 +1228,19 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               <span className="mb-2 block text-sm font-medium text-ink">판매단위</span>
               <select className="input-shell" value={campaignDraft.canonicalSalesUnitId} onChange={(event) => setCampaignDraft((current) => ({ ...current, canonicalSalesUnitId: event.target.value }))}>
                 <option value="">판매단위 선택</option>
-                {[...data.salesUnits]
-                  .filter((u) => u.isStoreLevel || u.isGroup)
+                {[...campaignMappableSalesUnits]
                   .sort((a, b) => {
-                    if (a.isStoreLevel === b.isStoreLevel) return 0;
-                    return a.isStoreLevel ? -1 : 1;
+                    const rank = (unit: typeof a) => (unit.isStoreLevel ? 0 : unit.isGroup ? 1 : 2);
+                    const rankDiff = rank(a) - rank(b);
+                    return rankDiff || a.displayName.localeCompare(b.displayName, "ko");
                   })
                   .map((salesUnit) => (
                     <option key={salesUnit.id} value={salesUnit.id}>
-                      {salesUnit.isStoreLevel ? `[스토어 전체] ${salesUnit.displayName}` : salesUnit.displayName}
+                      {salesUnit.isStoreLevel
+                        ? `[스토어 전체] ${salesUnit.displayName}`
+                        : salesUnit.isGroup
+                          ? `[그룹] ${salesUnit.displayName}`
+                          : salesUnit.displayName}
                     </option>
                   ))}
               </select>
@@ -1250,19 +1260,34 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
             {campaignSuccess ? <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{campaignSuccess}</div> : null}
 
             <div className="flex flex-wrap gap-3">
-              <button className="button-shell button-primary flex-1" type="button" disabled={isBusy || !data.salesUnits.length} onClick={() => void handleSaveCampaign()}>
+              <button className="button-shell button-primary flex-1" type="button" disabled={isBusy || !campaignMappableSalesUnits.length} onClick={() => void handleSaveCampaign()}>
                 {selectedMapping ? "변경사항 저장" : "규칙 생성"}
               </button>
               {selectedMapping ? (
-                selectedMapping.isEnabled ? (
-                  <button className="button-shell button-ghost" type="button" disabled={isBusy} onClick={() => void handleToggleCampaign("deactivate")}>
-                    비활성화
+                <>
+                  <button
+                    className="button-shell button-secondary"
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() => {
+                      setSelectedMappingId(null);
+                      setCampaignDraft(emptyCampaignDraft(defaultCampaignSalesUnitId));
+                      setCampaignError(null);
+                      setCampaignSuccess(null);
+                    }}
+                  >
+                    새 규칙
                   </button>
-                ) : (
-                  <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={() => void handleToggleCampaign("activate")}>
-                    활성화
-                  </button>
-                )
+                  {selectedMapping.isEnabled ? (
+                    <button className="button-shell button-ghost" type="button" disabled={isBusy} onClick={() => void handleToggleCampaign("deactivate")}>
+                      비활성화
+                    </button>
+                  ) : (
+                    <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={() => void handleToggleCampaign("activate")}>
+                      활성화
+                    </button>
+                  )}
+                </>
               ) : null}
             </div>
           </div>

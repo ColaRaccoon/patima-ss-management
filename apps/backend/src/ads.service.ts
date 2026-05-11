@@ -692,7 +692,9 @@ export class AdsService implements OnModuleInit {
     for (let index = 1; index < rows.length; index += 1) {
       const row = rows[index];
       const campaignId = repairMojibakeText(row[getColumnIndex("캠페인 ID")!] ?? "");
-      const campaignName = repairMojibakeText(row[getColumnIndex("캠페인 이름")!] ?? "");
+      const campaignName = this.normalizeCampaignNameForStorage(
+        repairMojibakeText(row[getColumnIndex("캠페인 이름")!] ?? ""),
+      );
 
       if (!campaignId || campaignId.includes("결과")) {
         continue;
@@ -815,6 +817,12 @@ export class AdsService implements OnModuleInit {
     return String(value ?? "")
       .replace(/\uFEFF/g, "")
       .trim();
+  }
+
+  private normalizeCampaignNameForStorage(value: string) {
+    const trimmed = value.trim();
+    const withoutDatePrefix = trimmed.replace(/^\d{4}_+/, "").trim();
+    return withoutDatePrefix || trimmed;
   }
 
   private parseNumericCell(value: string | number | null | undefined) {

@@ -388,6 +388,15 @@ export interface SalesUnitCostSnapshotEntry {
   updatedAt: string;
 }
 
+export interface DailyFakePurchase {
+  id: string;
+  storeId: string;
+  date: string;
+  amount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DatabaseShape {
   stores: Store[];
   commerceCredentials: CommerceCredential[];
@@ -403,6 +412,7 @@ export interface DatabaseShape {
   salesUnitCostSettings: SalesUnitCostSetting[];
   salesUnitCostSnapshots: SalesUnitCostSnapshot[];
   salesUnitCostSnapshotEntries: SalesUnitCostSnapshotEntry[];
+  dailyFakePurchases: DailyFakePurchase[];
   operations: OperationRecord[];
   auditLogs: AuditLog[];
 }

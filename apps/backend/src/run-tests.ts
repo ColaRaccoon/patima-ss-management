@@ -3,6 +3,7 @@ import { createSourceSignature, normalizeText, DEFAULT_DELIVERY_UNIT_COST } from
 import * as XLSX from "xlsx";
 import { evaluateAdMapping, getAdMappingOverride } from "./ad-mapping-engine";
 import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
+import { FakePurchaseService } from "./fake-purchase.service";
 import {
   calculateDashboardSummary,
   calculateDailyProfitRows,
@@ -105,6 +106,53 @@ const createOrderMappingServiceHarness = () => {
   );
 
   return { databaseService, orderMappingService, enqueueCalls };
+};
+
+const createFakePurchaseServiceHarness = () => {
+  const databaseService = createMemoryDatabaseService();
+  const auditCalls: Array<Record<string, unknown>> = [];
+  const fakePurchaseService = new FakePurchaseService(
+    databaseService as never,
+    {
+      ensureWritable: (storeId: string) => {
+        const exists = databaseService
+          .getSnapshot()
+          .stores.some((store: { id: string }) => store.id === storeId);
+        if (!exists) {
+          throw new Error("STORE_NOT_FOUND");
+        }
+      },
+    } as never,
+    {
+      record: (params: Record<string, unknown>) => {
+        auditCalls.push(params);
+        return params;
+      },
+    } as never,
+  );
+
+  databaseService.write((draft) => {
+    draft.stores.push({
+      id: "store-1",
+      name: "Main Store",
+      platformType: "NAVER_SMARTSTORE",
+      sellerAccountId: "seller-1",
+      channelNo: "channel-1",
+      isPrimary: true,
+      isActive: true,
+      deactivatedAt: null,
+      memo: null,
+      lastOrderSyncAt: null,
+      lastOrderSyncStatus: "NEVER",
+      credentialConnectionStatus: "NOT_TESTED",
+      lastCredentialTestAt: null,
+      deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  });
+
+  return { databaseService, fakePurchaseService, auditCalls };
 };
 
 const createOrderSourceSignature = (id: string, productName: string, storeId = "store-1") =>
@@ -454,6 +502,60 @@ run("calculateStoreDeliverySummary clamps negative delivery cost to 0", () => {
   assert.equal(summary.estimatedDeliveryBaseCost, 3500);
   assert.equal(summary.customerPaidDeliveryFee, 10000);
   assert.equal(summary.storeBorneDeliveryCost, 0);
+});
+
+run("FakePurchaseService stores daily amounts by store and date with audit history", () => {
+  const { databaseService, fakePurchaseService, auditCalls } = createFakePurchaseServiceHarness();
+
+  assert.deepEqual(fakePurchaseService.get("store-1", "2026-04-02"), {
+    amount: 0,
+    exists: false,
+    updatedAt: null,
+  });
+
+  const created = fakePurchaseService.upsert({
+    storeId: "store-1",
+    date: "2026-04-02",
+    amount: 12000,
+  });
+
+  assert.equal(created.amount, 12000);
+  assert.deepEqual(fakePurchaseService.get("store-1", "2026-04-02"), {
+    amount: 12000,
+    exists: true,
+    updatedAt: created.updatedAt,
+  });
+
+  const updated = fakePurchaseService.upsert({
+    storeId: "store-1",
+    date: "2026-04-02",
+    amount: 0,
+  });
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(updated.id, created.id);
+  assert.equal(updated.amount, 0);
+  assert.equal(snapshot.dailyFakePurchases.length, 1);
+  assert.equal(snapshot.dailyFakePurchases[0].amount, 0);
+  assert.equal(auditCalls.length, 2);
+  assert.deepEqual(auditCalls[0], {
+    storeId: "store-1",
+    domain: "FAKE_PURCHASE",
+    action: "UPSERT",
+    targetId: "store-1-2026-04-02",
+    actorIdentifier: "LOCALHOST_ADMIN",
+    beforeJson: null,
+    afterJson: 12000,
+  });
+  assert.deepEqual(auditCalls[1], {
+    storeId: "store-1",
+    domain: "FAKE_PURCHASE",
+    action: "UPSERT",
+    targetId: "store-1-2026-04-02",
+    actorIdentifier: "LOCALHOST_ADMIN",
+    beforeJson: 12000,
+    afterJson: 0,
+  });
 });
 
 run("getAdMappingOverride returns manual mapped rows as overrides", () => {
