@@ -271,6 +271,29 @@ export interface OperationDetail {
   resultSummary: Record<string, unknown> | null;
 }
 
+export interface OrderSyncAllResult {
+  dateFrom: string;
+  dateTo: string;
+  rangeMode: "MANUAL" | "AUTO_LAST_30_DAYS";
+  targetStoreCount: number;
+  skippedStoreCount: number;
+  operations: Array<{
+    storeId: string;
+    storeName: string;
+    operationId: string;
+    operationType: "ORDER_SYNC";
+    status: OperationStatus;
+  }>;
+  skippedStores: Array<{
+    storeId: string;
+    storeName: string;
+    reason:
+      | "NAVER_CREDENTIALS_NOT_CONFIGURED"
+      | "ORDER_SYNC_ALREADY_IN_FLIGHT"
+      | "STORE_INACTIVE";
+  }>;
+}
+
 export interface UnmappedSummary {
   unmappedOrderItemCount: number;
   unmappedOrderRevenue: number;
@@ -354,11 +377,15 @@ export interface DailySalesUnitDetail {
 }
 
 export interface ShellData {
+  stores: StoreListItem[];
   primaryStore: StoreListItem | null;
   storeSource: DataSource;
   today: string;
 }
 
+// In page data objects, primaryStore currently means "active selected store"
+// for backward-compatible component props. It falls back to the real primary
+// store only when URL storeId is missing or invalid.
 export interface DashboardPageData {
   primaryStore: StoreListItem | null;
   selectedDate: string;

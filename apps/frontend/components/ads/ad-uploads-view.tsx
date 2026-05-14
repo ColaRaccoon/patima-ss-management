@@ -12,6 +12,7 @@ import { StatusBadge } from "@/components/shared/status-badge";
 import type { AdUploadsPageData } from "@/lib/api/types";
 import { formatDate, formatDateTime, formatNullableText } from "@/lib/format";
 import { toneForWeekdayValidation } from "@/lib/status-tone";
+import { buildHrefWithStore } from "@/lib/store-selection";
 
 export function AdUploadsView({ data }: { data: AdUploadsPageData }) {
   const router = useRouter();
@@ -36,6 +37,7 @@ export function AdUploadsView({ data }: { data: AdUploadsPageData }) {
   }
 
   const primaryStore = data.primaryStore;
+  const mappingsHref = buildHrefWithStore("/mappings", null, primaryStore.id);
   const isDeleting = deletingUploadId !== null;
   const isBusy = isUploading || isDeleting || isRefreshing;
 
@@ -76,7 +78,7 @@ export function AdUploadsView({ data }: { data: AdUploadsPageData }) {
         description="같은 reportDate에 대해 .xlsx 파일을 한 번에 여러 개 선택해서 업로드합니다. 요일 검증을 통과한 파일은 즉시 적용됩니다."
         actions={
           <>
-            <Link className="button-shell button-secondary" href="/mappings">
+            <Link className="button-shell button-secondary" href={mappingsHref}>
               Open mappings
             </Link>
             <button

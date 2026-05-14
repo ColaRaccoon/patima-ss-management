@@ -1,6 +1,7 @@
 import type { DashboardSummary, DailySalesUnitProfit, SaleStatus } from "@patima/shared";
 import { DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import { fetchApi, withQuery } from "@/lib/api/client";
+import { pickPrimaryStore, resolveSelectedStore } from "@/lib/store-selection";
 import {
   mockAdCosts,
   mockCampaignMappings,
@@ -74,9 +75,6 @@ const collectSources = (
     endpoint: source.endpoint,
     error: source.error,
   }));
-
-const pickPrimaryStore = (stores: StoreListItem[]) =>
-  stores.find((store) => store.isPrimary) ?? stores[0] ?? null;
 
 const MAX_FRONTEND_PAGE_SIZE = 200;
 const USE_AD_UPLOADS_MOCK_FALLBACK = false;
@@ -687,15 +685,18 @@ async function getCostSnapshots(storeId: string) {
 export async function getShellData(): Promise<ShellData> {
   const storeResponse = await getStores();
   return {
+    stores: storeResponse.data,
     primaryStore: pickPrimaryStore(storeResponse.data),
     storeSource: storeResponse.source,
     today: nowInSeoul(),
   };
 }
 
-export async function getDashboardPageData(): Promise<DashboardPageData> {
+export async function getDashboardPageData(params?: {
+  storeId?: string;
+}): Promise<DashboardPageData> {
   const storeResponse = await getStores();
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {
@@ -724,9 +725,11 @@ export async function getDashboardPageData(): Promise<DashboardPageData> {
   };
 }
 
-export async function getStoreSettingsPageData(): Promise<StoreSettingsPageData> {
+export async function getStoreSettingsPageData(params?: {
+  storeId?: string;
+}): Promise<StoreSettingsPageData> {
   const storeResponse = await getStores();
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {
@@ -747,10 +750,10 @@ export async function getStoreSettingsPageData(): Promise<StoreSettingsPageData>
 }
 
 export async function getOrdersPageData(
-  filtersInput?: Partial<OrdersPageFilters>,
+  filtersInput?: Partial<OrdersPageFilters> & { storeId?: string },
 ): Promise<OrdersPageData> {
   const storeResponse = await getStores();
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, filtersInput?.storeId);
   const filters = normalizeOrdersPageFilters(filtersInput);
 
   if (!primaryStore) {
@@ -794,9 +797,11 @@ export async function getOrdersPageData(
   };
 }
 
-export async function getSalesUnitsPageData(): Promise<SalesUnitsPageData> {
+export async function getSalesUnitsPageData(params?: {
+  storeId?: string;
+}): Promise<SalesUnitsPageData> {
   const storeResponse = await getStores();
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {
@@ -817,9 +822,11 @@ export async function getSalesUnitsPageData(): Promise<SalesUnitsPageData> {
   };
 }
 
-export async function getMappingsPageData(): Promise<MappingsPageData> {
+export async function getMappingsPageData(params?: {
+  storeId?: string;
+}): Promise<MappingsPageData> {
   const storeResponse = await getStores();
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {
@@ -859,9 +866,11 @@ export async function getMappingsPageData(): Promise<MappingsPageData> {
   };
 }
 
-export async function getAdUploadsPageData(): Promise<AdUploadsPageData> {
+export async function getAdUploadsPageData(params?: {
+  storeId?: string;
+}): Promise<AdUploadsPageData> {
   const storeResponse = await getStores(USE_AD_UPLOADS_MOCK_FALLBACK);
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {
@@ -885,9 +894,11 @@ export async function getAdUploadsPageData(): Promise<AdUploadsPageData> {
   };
 }
 
-export async function getCostsPageData(): Promise<CostsPageData> {
+export async function getCostsPageData(params?: {
+  storeId?: string;
+}): Promise<CostsPageData> {
   const storeResponse = await getStores();
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {
@@ -909,13 +920,14 @@ export async function getCostsPageData(): Promise<CostsPageData> {
 }
 
 export async function getProfitsPageData(params?: {
+  storeId?: string;
   dateFrom?: string;
   dateTo?: string;
 }): Promise<ProfitsPageData> {
   const requestedDateFrom = params?.dateFrom?.trim();
   const requestedDateTo = params?.dateTo?.trim();
   const storeResponse = await getStores(USE_PROFITS_MOCK_FALLBACK);
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     const fallbackDate = requestedDateFrom || requestedDateTo || MOCK_SELECTED_DATE;
@@ -991,9 +1003,11 @@ export async function getProfitsPageData(params?: {
   };
 }
 
-export async function getOperationsPageData(): Promise<OperationsPageData> {
+export async function getOperationsPageData(params?: {
+  storeId?: string;
+}): Promise<OperationsPageData> {
   const storeResponse = await getStores();
-  const primaryStore = pickPrimaryStore(storeResponse.data);
+  const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {

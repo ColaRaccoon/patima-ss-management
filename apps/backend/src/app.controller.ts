@@ -117,6 +117,11 @@ export class AppController {
     return this.credentialService.test(storeId);
   }
 
+  @Post("stores/order-sync-all")
+  orderSyncAll(@Body() body: { dateFrom?: string; dateTo?: string }) {
+    return this.orderSyncService.enqueueSyncAll(body.dateFrom, body.dateTo);
+  }
+
   @Post("stores/:storeId/order-sync")
   orderSync(
     @Param("storeId") storeId: string,
@@ -535,6 +540,32 @@ export class AppController {
       page: page ? Number(page) : undefined,
       pageSize: pageSize ? Number(pageSize) : undefined,
     });
+  }
+
+  @Get("profits/daily-sales-units/export")
+  exportDailySalesUnits(
+    @Query("storeId") storeId: string,
+    @Query("dateFrom") dateFrom: string,
+    @Query("dateTo") dateTo: string,
+    @Res() res: Response,
+    @Query("canonicalSalesUnitId") canonicalSalesUnitId?: string,
+  ) {
+    const buffer = this.profitService.exportDailySalesUnitsExcel({
+      storeId,
+      dateFrom,
+      dateTo,
+      canonicalSalesUnitId,
+    });
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=profit-daily-rows-${storeId}-${dateFrom}-${dateTo}.xlsx`,
+    );
+    res.setHeader("Content-Length", buffer.length.toString());
+    res.end(buffer);
   }
 
   @Get("profits/daily-sales-units/:salesUnitId")

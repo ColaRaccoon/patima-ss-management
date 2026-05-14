@@ -13,6 +13,7 @@ import { SourceBanner } from "@/components/shared/source-banner";
 import { StatusBadge } from "@/components/shared/status-badge";
 import type { MappingsPageData } from "@/lib/api/types";
 import { buildNaverStoreProductUrl, formatCurrency, formatDate, formatNullableText, formatNumber } from "@/lib/format";
+import { buildHrefWithStore } from "@/lib/store-selection";
 
 type MappingStatus = "MAPPED" | "UNMAPPED" | "CONFLICT";
 
@@ -382,6 +383,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   }
 
   const primaryStoreId = data.primaryStore.id;
+  const salesUnitsHref = buildHrefWithStore("/sales-units", null, primaryStoreId);
 
   const saveScrollPositions = () => {
     if (orderScrollRef.current) {
@@ -640,7 +642,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         description="주문 시그니처와 광고 캠페인을 판매단위에 연결합니다. 항목을 검색하고 드래그로 다중 선택한 뒤 일괄 매핑할 수 있습니다."
         actions={
           <>
-            <Link className="button-shell button-secondary" href="/sales-units">
+            <Link className="button-shell button-secondary" href={salesUnitsHref}>
               판매단위 관리
             </Link>
             <button

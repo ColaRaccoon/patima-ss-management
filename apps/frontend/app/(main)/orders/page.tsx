@@ -1,10 +1,8 @@
 import { OrdersView } from "@/components/orders/orders-view";
 import { getOrdersPageData } from "@/lib/api/services";
+import { readSearchParam } from "@/lib/store-selection";
 
 type SearchParams = Record<string, string | string[] | undefined>;
-
-const readSearchParam = (value: string | string[] | undefined) =>
-  Array.isArray(value) ? value[0] : value;
 
 export default async function OrdersPage({
   searchParams,
@@ -13,6 +11,7 @@ export default async function OrdersPage({
 }) {
   const resolvedSearchParams = (await searchParams) ?? {};
   const data = await getOrdersPageData({
+    storeId: readSearchParam(resolvedSearchParams.storeId),
     dateFrom: readSearchParam(resolvedSearchParams.dateFrom),
     dateTo: readSearchParam(resolvedSearchParams.dateTo),
     productName: readSearchParam(resolvedSearchParams.productName),

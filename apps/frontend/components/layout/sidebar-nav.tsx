@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import {
   BarChart3,
   Boxes,
@@ -15,6 +15,7 @@ import {
   Upload,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 
 const navItems = [
   { href: "/", label: "대시보드", icon: LayoutDashboard },
@@ -30,6 +31,10 @@ const navItems = [
 
 export function SidebarNav() {
   const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const selectedStoreId = searchParams.get(STORE_ID_QUERY_KEY);
+  const hrefWithStore = (href: string) =>
+    buildHrefWithStore(href, null, selectedStoreId);
 
   return (
     <aside className="border-b border-ink/10 bg-ink text-white lg:sticky lg:top-0 lg:h-screen lg:border-b-0 lg:border-r lg:border-r-white/10">
@@ -54,7 +59,7 @@ export function SidebarNav() {
             return (
               <Link
                 key={href}
-                href={href}
+                href={hrefWithStore(href)}
                 className={cn(
                   "flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-medium transition",
                   active

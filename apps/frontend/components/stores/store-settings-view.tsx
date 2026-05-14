@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState, useTransition, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
@@ -19,6 +19,7 @@ import type {
 } from "@/lib/api/types";
 import { formatDateTime, formatNullableText } from "@/lib/format";
 import { toneForActive } from "@/lib/status-tone";
+import { buildHrefWithStore } from "@/lib/store-selection";
 
 function createStoreDraft(store?: StoreListItem | null) {
   return {
@@ -32,8 +33,10 @@ function createStoreDraft(store?: StoreListItem | null) {
 
 export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
   const router = useRouter();
+  const serverSelectedStoreId = data.primaryStore?.id ?? data.stores[0]?.id ?? null;
+  const previousServerSelectedStoreIdRef = useRef(serverSelectedStoreId);
   const [selectedStoreId, setSelectedStoreId] = useState<string | null>(
-    data.primaryStore?.id ?? data.stores[0]?.id ?? null,
+    serverSelectedStoreId,
   );
   const [storeDraft, setStoreDraft] = useState(createStoreDraft(data.primaryStore));
   const [credentialSummary, setCredentialSummary] = useState<CredentialSummary | null>(
@@ -58,11 +61,17 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
   );
 
   useEffect(() => {
+    if (previousServerSelectedStoreIdRef.current !== serverSelectedStoreId) {
+      previousServerSelectedStoreIdRef.current = serverSelectedStoreId;
+      setSelectedStoreId(serverSelectedStoreId);
+      return;
+    }
+
     if (selectedStoreId && data.stores.some((store) => store.id === selectedStoreId)) {
       return;
     }
-    setSelectedStoreId(data.primaryStore?.id ?? data.stores[0]?.id ?? null);
-  }, [data.primaryStore, data.stores, selectedStoreId]);
+    setSelectedStoreId(serverSelectedStoreId);
+  }, [data.stores, selectedStoreId, serverSelectedStoreId]);
 
   useEffect(() => {
     setStoreDraft(createStoreDraft(selectedStore));
@@ -261,6 +270,13 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
     isTestingCredential ||
     isLoadingCredential ||
     isRefreshing;
+  const selectedStoreHrefId = selectedStore?.id ?? data.primaryStore?.id ?? null;
+  const ordersHref = buildHrefWithStore("/orders", null, selectedStoreHrefId);
+  const operationsHref = buildHrefWithStore(
+    "/operations",
+    null,
+    selectedStoreHrefId,
+  );
 
   return (
     <div className="space-y-6">
@@ -270,10 +286,10 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
         description="스토어 기본 정보, 대표 스토어 상태, 커머스 API 인증 정보를 한 곳에서 관리합니다."
         actions={
           <>
-            <Link className="button-shell button-secondary" href="/orders">
+            <Link className="button-shell button-secondary" href={ordersHref}>
               주문 화면으로 이동
             </Link>
-            <Link className="button-shell button-primary" href="/operations">
+            <Link className="button-shell button-primary" href={operationsHref}>
               작업 이력 보기
             </Link>
           </>

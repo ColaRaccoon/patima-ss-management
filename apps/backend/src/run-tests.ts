@@ -22,6 +22,8 @@ import {
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { NaverCommerceService, createNaverClientSecretSign } from "./naver-commerce.service";
 import { OrderMappingService } from "./order-mapping.service";
+import { OrderSyncService } from "./order-sync.service";
+import { OperationService } from "./operation.service";
 import { ProfitService } from "./profit.service";
 import { recalculateOrderMappingsForStore, resolveOrderSignatureAutoMapping } from "./sales-unit-auto-mapper";
 import { isMeaningfulName, extractNameFromOptionInfo, enrichSignatureDisplayName } from "./signature-enrichment";
@@ -153,6 +155,89 @@ const createFakePurchaseServiceHarness = () => {
   });
 
   return { databaseService, fakePurchaseService, auditCalls };
+};
+
+const createStoreRecord = (id: string, name: string, isActive = true) =>
+  ({
+    id,
+    name,
+    platformType: "NAVER_SMARTSTORE",
+    sellerAccountId: `seller-${id}`,
+    channelNo: `channel-${id}`,
+    isPrimary: id === "store-live",
+    isActive,
+    deactivatedAt: isActive ? null : new Date().toISOString(),
+    memo: null,
+    lastOrderSyncAt: null,
+    lastOrderSyncStatus: "NEVER",
+    credentialConnectionStatus: "NOT_TESTED",
+    lastCredentialTestAt: null,
+    deliveryUnitCost: DEFAULT_DELIVERY_UNIT_COST,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }) as never;
+
+const createOrderSyncServiceHarness = (params?: {
+  stores?: ReturnType<typeof createStoreRecord>[];
+  configuredStoreIds?: string[];
+  inFlightStoreIds?: string[];
+}) => {
+  const databaseService = createMemoryDatabaseService();
+  const enqueueCalls: Array<{
+    storeId: string;
+    operationType: string;
+    requestJson: Record<string, unknown>;
+  }> = [];
+  const retryExecutors = new Map<string, (operation: Record<string, unknown>) => unknown>();
+  const configuredStoreIds = new Set(params?.configuredStoreIds ?? ["store-live"]);
+  const inFlightStoreIds = new Set(params?.inFlightStoreIds ?? []);
+
+  databaseService.write((draft) => {
+    draft.stores.push(
+      ...(params?.stores ?? [
+        createStoreRecord("store-live", "Live Store"),
+        createStoreRecord("store-missing", "Missing Credential Store"),
+        createStoreRecord("store-inactive", "Inactive Store", false),
+      ]),
+    );
+  });
+
+  const operationService = {
+    registerRetryExecutor: (
+      operationType: string,
+      executor: (operation: Record<string, unknown>) => unknown,
+    ) => {
+      retryExecutors.set(operationType, executor);
+    },
+    hasInFlightOperation: (storeId: string) => inFlightStoreIds.has(storeId),
+    enqueue: (
+      storeId: string,
+      operationType: string,
+      requestJson: Record<string, unknown>,
+    ) => {
+      enqueueCalls.push({ storeId, operationType, requestJson });
+      return {
+        id: `operation-${enqueueCalls.length}`,
+        operationType,
+        status: "QUEUED",
+      };
+    },
+  };
+
+  const orderSyncService = new OrderSyncService(
+    databaseService as never,
+    operationService as never,
+    { record: () => null } as never,
+    {
+      getResolvedConfiguration: (storeId: string) =>
+        configuredStoreIds.has(storeId) ? { store: { id: storeId }, credential: {} } : null,
+      fetchOrderItems: () => {
+        throw new Error("fetchOrderItems not used in enqueue tests");
+      },
+    } as never,
+  );
+
+  return { orderSyncService, enqueueCalls, retryExecutors };
 };
 
 const createOrderSourceSignature = (id: string, productName: string, storeId = "store-1") =>
@@ -310,6 +395,126 @@ run("NaverCommerceService prefers productOption over optionCode for readable opt
     ),
     "컬러: 옵션3.핑크베이지+핑크베이지 / 사이즈: M(32~35cm)",
   );
+});
+
+run("OrderSyncService enqueueSyncAll targets active configured stores and skips missing credentials", () => {
+  const { orderSyncService, enqueueCalls } = createOrderSyncServiceHarness();
+  const result = orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
+
+  assert.equal(result.data.dateFrom, "2026-05-10");
+  assert.equal(result.data.dateTo, "2026-05-10");
+  assert.equal(result.data.rangeMode, "MANUAL");
+  assert.equal(result.data.targetStoreCount, 1);
+  assert.equal(result.data.skippedStoreCount, 1);
+  assert.equal(result.data.operations[0].storeId, "store-live");
+  assert.equal(result.data.operations.some((item) => item.storeId === "store-inactive"), false);
+  assert.equal(result.data.skippedStores[0].storeId, "store-missing");
+  assert.equal(result.data.skippedStores[0].reason, "NAVER_CREDENTIALS_NOT_CONFIGURED");
+  assert.equal(enqueueCalls.length, 1);
+  assert.equal(enqueueCalls[0].requestJson.requireLiveCredential, true);
+  assert.equal(enqueueCalls[0].requestJson.requestedByBatch, true);
+});
+
+run("OrderSyncService enqueueSyncAll skips stores with in-flight ORDER_SYNC", () => {
+  const { orderSyncService, enqueueCalls } = createOrderSyncServiceHarness({
+    stores: [
+      createStoreRecord("store-live", "Live Store"),
+      createStoreRecord("store-live-2", "Live Store 2"),
+    ],
+    configuredStoreIds: ["store-live", "store-live-2"],
+    inFlightStoreIds: ["store-live"],
+  });
+  const result = orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
+
+  assert.equal(result.data.targetStoreCount, 1);
+  assert.equal(result.data.skippedStoreCount, 1);
+  assert.equal(result.data.operations[0].storeId, "store-live-2");
+  assert.equal(result.data.skippedStores[0].storeId, "store-live");
+  assert.equal(result.data.skippedStores[0].reason, "ORDER_SYNC_ALREADY_IN_FLIGHT");
+  assert.equal(enqueueCalls.length, 1);
+});
+
+run("OrderSyncService retry executor preserves requireLiveCredential", () => {
+  const { orderSyncService, retryExecutors } = createOrderSyncServiceHarness();
+  let capturedOptions: { requireLiveCredential?: boolean } | undefined;
+  orderSyncService.performSync = ((
+    _storeId: string,
+    _dateFrom: string,
+    _dateTo: string,
+    _rangeMode: "MANUAL" | "AUTO_LAST_30_DAYS",
+    options?: { requireLiveCredential?: boolean },
+  ) => {
+    capturedOptions = options;
+    return {};
+  }) as never;
+
+  orderSyncService.onModuleInit();
+  const retryExecutor = retryExecutors.get("ORDER_SYNC");
+  assert.ok(retryExecutor);
+  retryExecutor({
+    storeId: "store-live",
+    requestJson: {
+      dateFrom: "2026-05-10",
+      dateTo: "2026-05-10",
+      rangeMode: "MANUAL",
+      requireLiveCredential: true,
+    },
+  });
+
+  assert.equal(capturedOptions?.requireLiveCredential, true);
+});
+
+run("OrderSyncService enqueueSyncAll rejects manual ranges over 30 days", () => {
+  const { orderSyncService } = createOrderSyncServiceHarness();
+
+  assert.throws(() => orderSyncService.enqueueSyncAll("2026-01-01", "2026-02-01"));
+});
+
+run("OperationService hasInFlightOperation checks queued and running operations by type", () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    { record: () => null } as never,
+  );
+
+  databaseService.write((draft) => {
+    draft.operations.push(
+      {
+        id: "op-queued",
+        storeId: "store-1",
+        operationType: "ORDER_SYNC",
+        status: "QUEUED",
+        retryOfOperationId: null,
+        requestedBy: "LOCALHOST_ADMIN",
+        requestJson: {},
+        resultJson: null,
+        errorMessage: null,
+        cutoffAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        startedAt: null,
+        finishedAt: null,
+      },
+      {
+        id: "op-done",
+        storeId: "store-1",
+        operationType: "RECALCULATE_AD_MAPPING",
+        status: "SUCCEEDED",
+        retryOfOperationId: null,
+        requestedBy: "LOCALHOST_ADMIN",
+        requestJson: {},
+        resultJson: null,
+        errorMessage: null,
+        cutoffAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        startedAt: null,
+        finishedAt: new Date().toISOString(),
+      },
+    );
+  });
+
+  assert.equal(operationService.hasInFlightOperation("store-1", "ORDER_SYNC"), true);
+  assert.equal(operationService.hasInFlightOperation("store-1", "RECALCULATE_AD_MAPPING"), false);
+  assert.equal(operationService.hasInFlightOperation("store-2", "ORDER_SYNC"), false);
 });
 
 run("NaverCommerceService omits optionCode when readable option fields are present", () => {

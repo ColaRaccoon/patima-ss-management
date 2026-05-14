@@ -17,6 +17,7 @@ import type {
 } from "@/lib/api/types";
 import { formatCurrency, formatCurrencyWithSign, formatDate, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
+import { STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 
 interface ExpandedGroups {
   [groupId: string]: boolean;
@@ -82,6 +83,9 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
 
   const applyDateFilter = (nextDate: string) => {
     const searchParams = new URLSearchParams();
+    if (data.primaryStore?.id) {
+      searchParams.set(STORE_ID_QUERY_KEY, data.primaryStore.id);
+    }
     if (nextDate) {
       searchParams.set("date", nextDate);
     }
@@ -89,6 +93,19 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
     startRefresh(() => {
       router.replace(searchParams.size > 0 ? `/profits?${searchParams.toString()}` : "/profits");
     });
+  };
+
+  const handleDownloadExcel = () => {
+    if (!data.primaryStore) {
+      return;
+    }
+
+    const searchParams = new URLSearchParams({
+      storeId: data.primaryStore.id,
+      dateFrom: data.dateFrom,
+      dateTo: data.dateTo,
+    });
+    window.location.href = `/api/profits/daily-sales-units/export?${searchParams.toString()}`;
   };
 
   const draftAmountNumber = draftAmount.trim() === "" ? 0 : Number(draftAmount);
@@ -238,6 +255,14 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
         disabled={isRefreshing}
       >
         {isRefreshing ? "새로고침 중..." : "새로고침"}
+      </button>
+      <button
+        className="button-shell button-secondary"
+        type="button"
+        disabled={isRefreshing}
+        onClick={handleDownloadExcel}
+      >
+        엑셀 다운로드
       </button>
     </form>
   );

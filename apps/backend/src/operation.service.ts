@@ -41,6 +41,17 @@ export class OperationService implements OnModuleInit {
     return snapshot.operations.some((operation) => operation.storeId === storeId && operation.status === "RUNNING");
   }
 
+  hasInFlightOperation(storeId: string, operationType?: OperationType): boolean {
+    this.cleanupStaleOperations();
+    const snapshot = this.databaseService.getSnapshot();
+    return snapshot.operations.some(
+      (operation) =>
+        operation.storeId === storeId &&
+        (operation.status === "QUEUED" || operation.status === "RUNNING") &&
+        (!operationType || operation.operationType === operationType),
+    );
+  }
+
   list(storeId: string, status?: OperationStatus, operationType?: OperationType, page?: number, pageSize?: number) {
     this.cleanupStaleOperations();
     const snapshot = this.databaseService.getSnapshot();

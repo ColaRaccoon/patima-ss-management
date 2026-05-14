@@ -1,10 +1,8 @@
 import { ProfitsView } from "@/components/profits/profits-view";
 import { getProfitsPageData } from "@/lib/api/services";
+import { readSearchParam } from "@/lib/store-selection";
 
 type SearchParams = Record<string, string | string[] | undefined>;
-
-const readSearchParam = (value: string | string[] | undefined) =>
-  Array.isArray(value) ? value[0] : value;
 
 export default async function ProfitsPage({
   searchParams,
@@ -22,6 +20,7 @@ export default async function ProfitsPage({
       : dateToParam ?? dateFromParam);
 
   const data = await getProfitsPageData({
+    storeId: readSearchParam(resolvedSearchParams.storeId),
     dateFrom: selectedDate,
     dateTo: selectedDate,
   });

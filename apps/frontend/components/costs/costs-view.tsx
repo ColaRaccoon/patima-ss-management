@@ -11,6 +11,7 @@ import { SourceBanner } from "@/components/shared/source-banner";
 import { readApiResponse } from "@/lib/api/browser";
 import type { CostSnapshotListItem, CostsPageData } from "@/lib/api/types";
 import { formatDate, formatDateTime, formatNumber } from "@/lib/format";
+import { buildHrefWithStore } from "@/lib/store-selection";
 
 function Toast({ message, duration = 5000 }: { message: string; duration?: number }) {
   const [visible, setVisible] = useState(true);
@@ -51,6 +52,11 @@ export function CostsView({ data }: { data: CostsPageData }) {
   }
 
   const isBusy = isUploading || isRefreshing;
+  const salesUnitsHref = buildHrefWithStore(
+    "/sales-units",
+    null,
+    data.primaryStore.id,
+  );
 
   const startRefreshMessage = (message: string) => {
     setSuccessMessage(message);
@@ -144,7 +150,7 @@ export function CostsView({ data }: { data: CostsPageData }) {
         description="판매단위와 비용을 통합 엑셀로 관리합니다."
         actions={
           <>
-            <Link className="button-shell button-secondary" href="/sales-units">
+            <Link className="button-shell button-secondary" href={salesUnitsHref}>
               판매단위 보기
             </Link>
           </>

@@ -1,8 +1,18 @@
 import { DashboardView } from "@/components/dashboard/dashboard-view";
 import { getDashboardPageData } from "@/lib/api/services";
+import { readSearchParam } from "@/lib/store-selection";
 
-export default async function DashboardPage() {
-  const data = await getDashboardPageData();
+type SearchParams = Record<string, string | string[] | undefined>;
+
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams?: Promise<SearchParams>;
+}) {
+  const resolvedSearchParams = (await searchParams) ?? {};
+  const data = await getDashboardPageData({
+    storeId: readSearchParam(resolvedSearchParams.storeId),
+  });
 
   return <DashboardView data={data} />;
 }

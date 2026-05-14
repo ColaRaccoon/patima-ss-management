@@ -13,6 +13,7 @@ import { StatusBadge } from "@/components/shared/status-badge";
 import type { SalesUnitListItem, SalesUnitsPageData } from "@/lib/api/types";
 import { formatDate, formatNumber, formatPercent } from "@/lib/format";
 import { toneForActive } from "@/lib/status-tone";
+import { buildHrefWithStore } from "@/lib/store-selection";
 
 interface ExpandedGroupState {
   [groupId: string]: boolean;
@@ -131,6 +132,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
     (item) => !data.costSettings.some((cost) => cost.canonicalSalesUnitId === item.id && cost.isActive),
   ).length;
   const primaryStore = data.primaryStore;
+  const mappingsHref = buildHrefWithStore("/mappings", null, primaryStore.id);
   const isBusy = isSubmitting || isToggling || isRefreshing;
   const isEditing = Boolean(selectedSalesUnit);
 
@@ -174,7 +176,7 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
         description="표시명은 UI에만 쓰이고 자동 매핑은 matchAliases 기준으로만 동작합니다."
         actions={
           <>
-            <Link className="button-shell button-secondary" href="/mappings">
+            <Link className="button-shell button-secondary" href={mappingsHref}>
               매핑 화면으로 이동
             </Link>
             <button

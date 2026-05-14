@@ -78,12 +78,18 @@ export class OrderSyncService implements OnModuleInit {
 
   onModuleInit(): void {
     this.operationService.registerRetryExecutor("ORDER_SYNC", async (operation) => {
-      const request = operation.requestJson as { dateFrom: string; dateTo: string; rangeMode: string };
+      const request = operation.requestJson as {
+        dateFrom: string;
+        dateTo: string;
+        rangeMode: string;
+        requireLiveCredential?: boolean;
+      };
       return this.performSync(
         operation.storeId,
         request.dateFrom,
         request.dateTo,
         request.rangeMode as "MANUAL" | "AUTO_LAST_30_DAYS",
+        { requireLiveCredential: request.requireLiveCredential === true },
       );
     });
   }
@@ -111,11 +117,97 @@ export class OrderSyncService implements OnModuleInit {
     });
   }
 
+  enqueueSyncAll(dateFrom?: string, dateTo?: string) {
+    const { dateFrom: normalizedDateFrom, dateTo: normalizedDateTo, rangeMode } =
+      ensureKstDateRange(dateFrom, dateTo);
+    const snapshot = this.databaseService.getSnapshot();
+    const activeStores = snapshot.stores.filter((store) => store.isActive);
+    const operations: Array<{
+      storeId: string;
+      storeName: string;
+      operationId: string;
+      operationType: "ORDER_SYNC";
+      status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
+    }> = [];
+    const skippedStores: Array<{
+      storeId: string;
+      storeName: string;
+      reason: "NAVER_CREDENTIALS_NOT_CONFIGURED" | "ORDER_SYNC_ALREADY_IN_FLIGHT";
+    }> = [];
+
+    activeStores.forEach((store) => {
+      if (this.operationService.hasInFlightOperation(store.id, "ORDER_SYNC")) {
+        skippedStores.push({
+          storeId: store.id,
+          storeName: store.name,
+          reason: "ORDER_SYNC_ALREADY_IN_FLIGHT",
+        });
+        return;
+      }
+
+      if (!this.naverCommerceService.getResolvedConfiguration(store.id)) {
+        skippedStores.push({
+          storeId: store.id,
+          storeName: store.name,
+          reason: "NAVER_CREDENTIALS_NOT_CONFIGURED",
+        });
+        return;
+      }
+
+      const operation = this.operationService.enqueue(
+        store.id,
+        "ORDER_SYNC",
+        {
+          dateFrom: normalizedDateFrom,
+          dateTo: normalizedDateTo,
+          rangeMode,
+          requireLiveCredential: true,
+          requestedByBatch: true,
+        },
+        () =>
+          this.performSync(
+            store.id,
+            normalizedDateFrom,
+            normalizedDateTo,
+            rangeMode,
+            { requireLiveCredential: true },
+          ),
+      );
+
+      operations.push({
+        storeId: store.id,
+        storeName: store.name,
+        operationId: operation.id,
+        operationType: "ORDER_SYNC",
+        status: operation.status,
+      });
+    });
+
+    if (operations.length === 0 && skippedStores.length === 0) {
+      throw new BadRequestException({
+        success: false,
+        message: "활성 스토어가 없습니다.",
+        errors: [{ field: "storeId", reason: "NO_ACTIVE_STORES" }],
+      });
+    }
+
+    return formatApiSuccess({
+      dateFrom: normalizedDateFrom,
+      dateTo: normalizedDateTo,
+      rangeMode,
+      targetStoreCount: operations.length,
+      skippedStoreCount: skippedStores.length,
+      operations,
+      skippedStores,
+    });
+  }
+
   async performSync(
     storeId: string,
     dateFrom: string,
     dateTo: string,
     rangeMode: "MANUAL" | "AUTO_LAST_30_DAYS",
+    options?: { requireLiveCredential?: boolean },
   ) {
     const snapshot = this.databaseService.getSnapshot();
     const store = ensureStoreExists(snapshot, storeId);
@@ -124,7 +216,13 @@ export class OrderSyncService implements OnModuleInit {
     }
 
     try {
-      const liveEnabled = !!this.naverCommerceService.getResolvedConfiguration(storeId);
+      const resolvedConfiguration = this.naverCommerceService.getResolvedConfiguration(storeId);
+      const liveEnabled = !!resolvedConfiguration;
+
+      if (options?.requireLiveCredential && !liveEnabled) {
+        throw new BadRequestException("NAVER_CREDENTIALS_NOT_CONFIGURED");
+      }
+
       const liveEntries = liveEnabled
         ? await this.naverCommerceService.fetchOrderItems(storeId, dateFrom, dateTo)
         : null;

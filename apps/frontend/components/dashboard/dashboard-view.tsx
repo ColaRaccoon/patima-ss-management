@@ -11,6 +11,7 @@ import { StatusBadge } from "@/components/shared/status-badge";
 import type { DashboardPageData } from "@/lib/api/types";
 import { formatCurrency, formatCurrencyWithSign, formatDate, formatDateTime, formatNumber } from "@/lib/format";
 import { toneForOperationStatus, toneForProfitStatus } from "@/lib/status-tone";
+import { buildHrefWithStore } from "@/lib/store-selection";
 
 export function DashboardView({ data }: { data: DashboardPageData }) {
   if (!data.primaryStore) {
@@ -25,6 +26,8 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
   }
 
   const hasConflict = data.summary.conflictOrderItemCount > 0 || data.summary.conflictCampaignCount > 0;
+  const profitsHref = buildHrefWithStore("/profits", null, data.primaryStore.id);
+  const mappingsHref = buildHrefWithStore("/mappings", null, data.primaryStore.id);
 
   return (
     <div className="space-y-6">
@@ -35,10 +38,10 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
         description="일자별 손익, 제외 금액, 최근 작업을 한 화면에서 확인합니다. 배송료는 배송료 규칙이 최종화될 때까지 상품 매출과 별도로 표시됩니다."
         actions={
           <>
-            <Link className="button-shell button-secondary" href="/profits">
+            <Link className="button-shell button-secondary" href={profitsHref}>
               손익 분석 보기
             </Link>
-            <Link className="button-shell button-primary" href="/mappings">
+            <Link className="button-shell button-primary" href={mappingsHref}>
               매핑 검토
             </Link>
           </>

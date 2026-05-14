@@ -10,7 +10,11 @@ import { Panel } from "@/components/shared/panel";
 import { SourceBanner } from "@/components/shared/source-banner";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { readApiResponse } from "@/lib/api/browser";
-import type { OrdersPageData, OrdersPageFilters } from "@/lib/api/types";
+import type {
+  OrdersPageData,
+  OrdersPageFilters,
+  OrderSyncAllResult,
+} from "@/lib/api/types";
 import {
   buildNaverStoreProductUrl,
   formatCurrency,
@@ -21,6 +25,7 @@ import {
   formatNumber,
 } from "@/lib/format";
 import { toneForOperationStatus, toneForSaleStatus } from "@/lib/status-tone";
+import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 
 const SALE_STATUS_OPTIONS = [
   "ALL",
@@ -56,9 +61,15 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
   }
 
   const isBusy = isSyncing || isRefreshing;
+  const operationsHref = buildHrefWithStore(
+    "/operations",
+    null,
+    data.primaryStore.id,
+  );
 
   const applyFilters = (nextFilters: OrdersPageFilters) => {
     const searchParams = new URLSearchParams();
+    searchParams.set(STORE_ID_QUERY_KEY, data.primaryStore!.id);
     Object.entries(nextFilters).forEach(([key, value]) => {
       if (!value || value === "ALL") {
         return;
@@ -106,6 +117,42 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
     }
   };
 
+  const startAllStoreOrderSync = async () => {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setIsSyncing(true);
+    try {
+      const result = await readApiResponse<OrderSyncAllResult>(
+        await fetch("/api/stores/order-sync-all", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            dateFrom: filters.dateFrom,
+            dateTo: filters.dateTo,
+          }),
+        }),
+        "전체 스토어 주문 동기화 시작에 실패했습니다.",
+      );
+
+      setSuccessMessage(
+        `${result.targetStoreCount}개 스토어 동기화 작업을 시작했습니다. ${result.skippedStoreCount}개 스토어는 건너뛰었습니다.`,
+      );
+      startRefresh(() => {
+        router.refresh();
+      });
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "전체 스토어 주문 동기화 요청 중 오류가 발생했습니다.",
+      );
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -118,36 +165,13 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               className="button-shell button-secondary"
               type="button"
               disabled={isBusy}
-              onClick={async () => {
-                setErrorMessage(null);
-                setSuccessMessage(null);
-                setIsSyncing(true);
-                try {
-                  await readApiResponse(
-                    await fetch(`/api/stores/${data.primaryStore!.id}/order-sync`, {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                      },
-                      body: JSON.stringify({}),
-                    }),
-                    "최근 30일 주문 동기화 시작에 실패했습니다.",
-                  );
-
-                  setSuccessMessage("최근 30일 주문 동기화를 큐에 등록했습니다.");
-                  startRefresh(() => {
-                    router.refresh();
-                  });
-                } catch (error) {
-                  setErrorMessage(
-                    error instanceof Error
-                      ? error.message
-                      : "주문 동기화 요청 중 오류가 발생했습니다.",
-                  );
-                } finally {
-                  setIsSyncing(false);
-                }
-              }}
+              onClick={() =>
+                void startOrderSync(
+                  {},
+                  "최근 30일 주문 동기화 시작에 실패했습니다.",
+                  "최근 30일 주문 동기화를 큐에 등록했습니다.",
+                )
+              }
             >
               최근 30일 동기화
             </button>
@@ -168,7 +192,15 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
             >
               {"\uC120\uD0DD \uB0A0\uC9DC \uB3D9\uAE30\uD654"}
             </button>
-            <Link className="button-shell button-primary" href="/operations">
+            <button
+              className="button-shell button-secondary"
+              type="button"
+              disabled={isBusy}
+              onClick={() => void startAllStoreOrderSync()}
+            >
+              전체 스토어 주문 동기화
+            </button>
+            <Link className="button-shell button-primary" href={operationsHref}>
               작업 상세 보기
             </Link>
           </>

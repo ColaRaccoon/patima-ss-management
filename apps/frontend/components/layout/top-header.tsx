@@ -1,11 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { CalendarRange, Clock3, RefreshCw, UploadCloud } from "lucide-react";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { formatDate, formatDateTime } from "@/lib/format";
 import type { ShellData } from "@/lib/api/types";
+import {
+  buildHrefWithStore,
+  resolveSelectedStore,
+  STORE_ID_QUERY_KEY,
+} from "@/lib/store-selection";
 
 const routeMeta: Record<string, { title: string; description: string }> = {
   "/": {
@@ -61,8 +66,22 @@ function resolveMeta(pathname: string) {
 
 export function TopHeader({ shellData }: { shellData: ShellData }) {
   const pathname = usePathname();
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const meta = resolveMeta(pathname);
-  const store = shellData.primaryStore;
+  const store = resolveSelectedStore(
+    shellData.stores,
+    searchParams.get(STORE_ID_QUERY_KEY),
+  );
+  const selectedStoreId = store?.id ?? null;
+  const ordersHref = buildHrefWithStore("/orders", searchParams, selectedStoreId);
+  const uploadsHref = buildHrefWithStore("/ads/uploads", searchParams, selectedStoreId);
+
+  const handleStoreChange = (nextStoreId: string) => {
+    const nextHref = buildHrefWithStore(pathname, searchParams, nextStoreId || null);
+    router.replace(nextHref);
+    router.refresh();
+  };
 
   return (
     <header className="sticky top-0 z-20 border-b border-ink/10 bg-[rgba(247,241,230,0.84)] backdrop-blur-xl">
@@ -88,11 +107,11 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <Link className="button-shell button-secondary" href="/orders">
+            <Link className="button-shell button-secondary" href={ordersHref}>
               <RefreshCw className="h-4 w-4" />
               주문 동기화
             </Link>
-            <Link className="button-shell button-ghost" href="/ads/uploads">
+            <Link className="button-shell button-ghost" href={uploadsHref}>
               <UploadCloud className="h-4 w-4" />
               엑셀 업로드
             </Link>
@@ -113,11 +132,25 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
           <div className="rounded-2xl bg-white/70 px-4 py-3">
             <div className="flex items-center gap-2 text-xs tracking-tight text-ink/65">
               <Clock3 className="h-3.5 w-3.5" />
-              고정 스토어
+              선택 스토어
             </div>
-            <p className="mt-2 text-sm font-medium text-ink">
-              {store?.name ?? "대표 스토어 미설정"}
-            </p>
+            <select
+              className="input-shell mt-2 h-9 text-sm"
+              value={store?.id ?? ""}
+              onChange={(event) => handleStoreChange(event.target.value)}
+              disabled={shellData.stores.length === 0}
+            >
+              {shellData.stores.length === 0 ? (
+                <option value="">스토어 없음</option>
+              ) : null}
+              {shellData.stores.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                  {item.isPrimary ? " (대표)" : ""}
+                  {item.isActive ? "" : " (비활성)"}
+                </option>
+              ))}
+            </select>
             <p className="mt-1 text-xs text-ink/55">
               {store
                 ? `${store.sellerAccountId} / ${store.channelNo}`

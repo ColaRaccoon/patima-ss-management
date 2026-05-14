@@ -1,5 +1,7 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { VAT_RATE, SalesUnitCostSnapshotEntry } from "@patima/shared";
+import type { DailySalesUnitProfit } from "@patima/shared";
+import * as XLSX from "xlsx";
 import { DatabaseService } from "./database.service";
 import {
   calculateDashboardSummary,
@@ -15,6 +17,12 @@ import {
   paginate,
   repairMojibakeText,
 } from "./helpers";
+
+type ExportStoreSummary = {
+  fakePurchaseAmount: number | "";
+  deliveryMargin: number | "";
+  storeNetProfit: number | "";
+};
 
 @Injectable()
 export class ProfitService {
@@ -86,6 +94,174 @@ export class ProfitService {
       query.includeGroupChildren,
     );
     return formatApiSuccess(paginate(rows, query.page, query.pageSize));
+  }
+
+  exportDailySalesUnitsExcel(query: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+    canonicalSalesUnitId?: string;
+  }): Buffer {
+    if (!query.storeId || !query.dateFrom || !query.dateTo) {
+      throw new BadRequestException({
+        success: false,
+        message: "storeId, dateFrom, dateTo가 필요합니다.",
+        errors: [{ field: "query", reason: "REQUIRED_EXPORT_QUERY_MISSING" }],
+      });
+    }
+
+    const snapshot = this.databaseService.getSnapshot();
+    const rows = calculateDailyProfitRows(
+      snapshot,
+      query.storeId,
+      query.dateFrom,
+      query.dateTo,
+      query.canonicalSalesUnitId,
+      true,
+    );
+
+    const dailyStoreSummaries = this.buildDailyStoreProfitSummaryMap(
+      snapshot,
+      query.storeId,
+      rows.map((row) => row.date),
+    );
+    const flatRows = this.flattenDailyProfitRowsForExport(rows, dailyStoreSummaries);
+    const headers = [
+      "일자",
+      "판매단위명",
+      "수량",
+      "상품 매출",
+      "VAT",
+      "광고비",
+      "수수료",
+      "원가",
+      "제품별 순이익",
+      "",
+      "스토어 가구매값",
+      "스토어 배송마진",
+      "스토어 전체 순이익",
+    ];
+    const data: unknown[][] = [headers, ...flatRows];
+
+    const workbook = XLSX.utils.book_new();
+    const sheet = XLSX.utils.aoa_to_sheet(data);
+    sheet["!cols"] = [
+      { wch: 12 },
+      { wch: 32 },
+      { wch: 10 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 4 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 18 },
+    ];
+    XLSX.utils.book_append_sheet(workbook, sheet, "DailyProfitRows");
+
+    return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+  }
+
+  private buildDailyStoreProfitSummaryMap(
+    database: ReturnType<DatabaseService["getSnapshot"]>,
+    storeId: string,
+    dates: string[],
+  ): Map<string, ExportStoreSummary> {
+    const uniqueDates = Array.from(new Set(dates));
+    const summaryMap = new Map<string, ExportStoreSummary>();
+
+    uniqueDates.forEach((date) => {
+      const summary = calculateDashboardSummary(database, storeId, date);
+      const fakePurchaseAmount =
+        database.dailyFakePurchases.find((row) => row.storeId === storeId && row.date === date)?.amount ?? 0;
+      const storeNetProfit =
+        summary.estimatedNetProfit == null ? "" : summary.estimatedNetProfit - fakePurchaseAmount;
+
+      summaryMap.set(date, {
+        fakePurchaseAmount,
+        deliveryMargin: summary.deliveryMargin,
+        storeNetProfit,
+      });
+    });
+
+    return summaryMap;
+  }
+
+  private flattenDailyProfitRowsForExport(
+    rows: DailySalesUnitProfit[],
+    dailyStoreSummaries: Map<string, ExportStoreSummary>,
+  ): unknown[][] {
+    const flatRows: unknown[][] = [];
+    let hasWrittenStoreSummary = false;
+
+    rows.forEach((row) => {
+      const storeSummary = dailyStoreSummaries.get(row.date) ?? {
+        fakePurchaseAmount: 0,
+        deliveryMargin: 0,
+        storeNetProfit: "",
+      };
+      const storeSummaryForRow: ExportStoreSummary = hasWrittenStoreSummary
+        ? { fakePurchaseAmount: "", deliveryMargin: "", storeNetProfit: "" }
+        : storeSummary;
+
+      flatRows.push(
+        this.createDailyProfitExportRow({
+          row,
+          adCostAmount: row.totalAdCost,
+          netProfitAmount: row.estimatedNetProfit ?? "",
+          storeSummary: storeSummaryForRow,
+          displayQuantity: row.isGroup ? "" : undefined,
+        }),
+      );
+      hasWrittenStoreSummary = true;
+
+      row.childRows?.forEach((childRow) => {
+        flatRows.push(
+          this.createDailyProfitExportRow({
+            row: childRow,
+            adCostAmount: "",
+            netProfitAmount: "",
+            storeSummary: { fakePurchaseAmount: "", deliveryMargin: "", storeNetProfit: "" },
+          }),
+        );
+      });
+    });
+
+    return flatRows;
+  }
+
+  private createDailyProfitExportRow(params: {
+    row: DailySalesUnitProfit;
+    adCostAmount: number | "";
+    netProfitAmount: number | "";
+    storeSummary: ExportStoreSummary;
+    displayQuantity?: number | "";
+  }): unknown[] {
+    const { row, adCostAmount, netProfitAmount, storeSummary, displayQuantity } = params;
+    const isStoreLevel = row.isStoreLevel === true;
+
+    return [
+      row.date,
+      this.formatExportDisplayName(row),
+      isStoreLevel ? "" : displayQuantity ?? row.totalQuantity,
+      isStoreLevel ? "" : row.totalProductRevenue,
+      isStoreLevel ? "" : row.vatAmount,
+      adCostAmount,
+      isStoreLevel ? "" : row.totalFeeCost,
+      isStoreLevel ? "" : row.totalUnitCost,
+      isStoreLevel ? "" : netProfitAmount,
+      "",
+      storeSummary.fakePurchaseAmount,
+      storeSummary.deliveryMargin,
+      storeSummary.storeNetProfit,
+    ];
+  }
+
+  private formatExportDisplayName(row: DailySalesUnitProfit): string {
+    return row.isGroup ? `[그룹단위]${row.displayName}` : row.displayName;
   }
 
   getDailySalesUnitDetail(storeId: string, salesUnitId: string, date: string) {
