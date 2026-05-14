@@ -16,6 +16,7 @@ import {
   getOrderItemMappingStatus,
   paginate,
   repairMojibakeText,
+  roundHalfUp,
 } from "./helpers";
 
 type ExportStoreSummary = {
@@ -130,10 +131,13 @@ export class ProfitService {
       "일자",
       "판매단위명",
       "수량",
+      "판매가",
       "상품 매출",
       "VAT",
       "광고비",
       "수수료",
+      "상품당 고정비용",
+      "상품당 고정비 마진률",
       "원가",
       "제품별 순이익",
       "",
@@ -145,6 +149,8 @@ export class ProfitService {
 
     const workbook = XLSX.utils.book_new();
     const sheet = XLSX.utils.aoa_to_sheet(data);
+    this.applyIntegerNumberFormat(sheet);
+    this.applyPercentageNumberFormat(sheet, headers.indexOf("상품당 고정비 마진률"));
     sheet["!cols"] = [
       { wch: 12 },
       { wch: 32 },
@@ -153,6 +159,9 @@ export class ProfitService {
       { wch: 14 },
       { wch: 14 },
       { wch: 14 },
+      { wch: 14 },
+      { wch: 18 },
+      { wch: 20 },
       { wch: 14 },
       { wch: 14 },
       { wch: 4 },
@@ -242,15 +251,30 @@ export class ProfitService {
   }): unknown[] {
     const { row, adCostAmount, netProfitAmount, storeSummary, displayQuantity } = params;
     const isStoreLevel = row.isStoreLevel === true;
+    const shouldShowPerUnitValues = !isStoreLevel && !row.isGroup;
+    const salePrice = shouldShowPerUnitValues && row.totalQuantity > 0
+      ? roundHalfUp(row.totalProductRevenue / row.totalQuantity)
+      : "";
+    const fixedCostPerProduct =
+      shouldShowPerUnitValues && row.totalQuantity > 0
+        ? roundHalfUp((row.totalFeeCost + row.vatAmount + row.totalUnitCost) / row.totalQuantity)
+        : "";
+    const fixedCostMarginRate =
+      typeof salePrice === "number" && salePrice > 0 && typeof fixedCostPerProduct === "number"
+        ? (salePrice - fixedCostPerProduct) / salePrice
+        : "";
 
     return [
       row.date,
       this.formatExportDisplayName(row),
       isStoreLevel ? "" : displayQuantity ?? row.totalQuantity,
+      isStoreLevel ? "" : salePrice,
       isStoreLevel ? "" : row.totalProductRevenue,
       isStoreLevel ? "" : row.vatAmount,
       adCostAmount,
       isStoreLevel ? "" : row.totalFeeCost,
+      isStoreLevel ? "" : fixedCostPerProduct,
+      fixedCostMarginRate,
       isStoreLevel ? "" : row.totalUnitCost,
       isStoreLevel ? "" : netProfitAmount,
       "",
@@ -262,6 +286,34 @@ export class ProfitService {
 
   private formatExportDisplayName(row: DailySalesUnitProfit): string {
     return row.isGroup ? `[그룹단위]${row.displayName}` : row.displayName;
+  }
+
+  private applyIntegerNumberFormat(sheet: XLSX.WorkSheet): void {
+    Object.keys(sheet).forEach((cellAddress) => {
+      if (cellAddress.startsWith("!")) {
+        return;
+      }
+
+      const cell = sheet[cellAddress];
+      if (cell?.t === "n") {
+        cell.z = "0";
+      }
+    });
+  }
+
+  private applyPercentageNumberFormat(sheet: XLSX.WorkSheet, zeroBasedColumnIndex: number): void {
+    if (zeroBasedColumnIndex < 0) {
+      return;
+    }
+
+    const range = XLSX.utils.decode_range(sheet["!ref"] ?? "A1:A1");
+    for (let rowIndex = 1; rowIndex <= range.e.r; rowIndex += 1) {
+      const cellAddress = XLSX.utils.encode_cell({ r: rowIndex, c: zeroBasedColumnIndex });
+      const cell = sheet[cellAddress];
+      if (cell?.t === "n") {
+        cell.z = "0.0%";
+      }
+    }
   }
 
   getDailySalesUnitDetail(storeId: string, salesUnitId: string, date: string) {
