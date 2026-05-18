@@ -39,6 +39,8 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
     serverSelectedStoreId,
   );
   const [storeDraft, setStoreDraft] = useState(createStoreDraft(data.primaryStore));
+  const [newStoreDraft, setNewStoreDraft] = useState(createStoreDraft(null));
+  const [isCreateStoreOpen, setIsCreateStoreOpen] = useState(false);
   const [credentialSummary, setCredentialSummary] = useState<CredentialSummary | null>(
     data.credential,
   );
@@ -47,6 +49,9 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
   const [testResult, setTestResult] = useState<CredentialTestResult | null>(null);
   const [storeError, setStoreError] = useState<string | null>(null);
   const [storeSuccess, setStoreSuccess] = useState<string | null>(null);
+  const [createStoreError, setCreateStoreError] = useState<string | null>(null);
+  const [createStoreSuccess, setCreateStoreSuccess] = useState<string | null>(null);
+  const [isCreatingStore, setIsCreatingStore] = useState(false);
   const [credentialError, setCredentialError] = useState<string | null>(null);
   const [credentialSuccess, setCredentialSuccess] = useState<string | null>(null);
   const [isSavingStore, setIsSavingStore] = useState(false);
@@ -266,6 +271,7 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
 
   const isBusy =
     isSavingStore ||
+    isCreatingStore ||
     isSavingCredential ||
     isTestingCredential ||
     isLoadingCredential ||
@@ -277,6 +283,55 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
     null,
     selectedStoreHrefId,
   );
+  const handleCreateStore = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setCreateStoreError(null);
+    setCreateStoreSuccess(null);
+
+    if (
+      !newStoreDraft.name.trim() ||
+      !newStoreDraft.sellerAccountId.trim() ||
+      !newStoreDraft.channelNo.trim()
+    ) {
+      setCreateStoreError("스토어명, sellerAccountId, channelNo는 모두 필수입니다.");
+      return;
+    }
+
+    setIsCreatingStore(true);
+    try {
+      const created = await readApiResponse<{ storeId: string; name: string }>(
+        await fetch("/api/stores", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            name: newStoreDraft.name.trim(),
+            sellerAccountId: newStoreDraft.sellerAccountId.trim(),
+            channelNo: newStoreDraft.channelNo.trim(),
+            memo: newStoreDraft.memo.trim() || null,
+            platformType: "NAVER_SMARTSTORE",
+          }),
+        }),
+        "스토어 생성에 실패했습니다.",
+      );
+
+      setSelectedStoreId(created.storeId);
+      setNewStoreDraft(createStoreDraft(null));
+      setIsCreateStoreOpen(false);
+      setCreateStoreSuccess(`${created.name} 스토어를 생성했습니다.`);
+      router.replace(buildHrefWithStore("/settings/stores", null, created.storeId));
+      startRefresh(() => {
+        router.refresh();
+      });
+    } catch (error) {
+      setCreateStoreError(
+        error instanceof Error ? error.message : "스토어 생성 중 오류가 발생했습니다.",
+      );
+    } finally {
+      setIsCreatingStore(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -357,6 +412,105 @@ export function StoreSettingsView({ data }: { data: StoreSettingsPageData }) {
           rows={data.stores}
           getRowKey={(row) => row.id}
         />
+
+        <div className="mt-5 flex flex-wrap gap-3">
+          <button
+            className="button-shell button-primary"
+            type="button"
+            disabled={isBusy}
+            onClick={() => {
+              setIsCreateStoreOpen((current) => !current);
+              setCreateStoreError(null);
+              setCreateStoreSuccess(null);
+            }}
+          >
+            {isCreateStoreOpen ? "추가 취소" : "새 스토어 추가"}
+          </button>
+        </div>
+
+        {createStoreSuccess ? (
+          <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+            {createStoreSuccess}
+          </div>
+        ) : null}
+
+        {isCreateStoreOpen ? (
+          <form className="mt-6 border-t border-ink/10 pt-5" onSubmit={handleCreateStore}>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="block sm:col-span-2">
+                <span className="mb-2 block text-sm font-medium text-ink">스토어명</span>
+                <input
+                  className="input-shell"
+                  placeholder="예: 두줄 스포츠"
+                  value={newStoreDraft.name}
+                  onChange={(event) =>
+                    setNewStoreDraft((current) => ({ ...current, name: event.target.value }))
+                  }
+                />
+              </label>
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">sellerAccountId</span>
+                <input
+                  className="input-shell"
+                  placeholder="네이버 판매자 account UID"
+                  value={newStoreDraft.sellerAccountId}
+                  onChange={(event) =>
+                    setNewStoreDraft((current) => ({
+                      ...current,
+                      sellerAccountId: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">channelNo</span>
+                <input
+                  className="input-shell"
+                  placeholder="스마트스토어 채널 번호"
+                  value={newStoreDraft.channelNo}
+                  onChange={(event) =>
+                    setNewStoreDraft((current) => ({ ...current, channelNo: event.target.value }))
+                  }
+                />
+              </label>
+              <label className="block sm:col-span-2">
+                <span className="mb-2 block text-sm font-medium text-ink">메모</span>
+                <textarea
+                  className="input-shell min-h-24"
+                  placeholder="운영 구분이나 확인 메모"
+                  value={newStoreDraft.memo}
+                  onChange={(event) =>
+                    setNewStoreDraft((current) => ({ ...current, memo: event.target.value }))
+                  }
+                />
+              </label>
+            </div>
+
+            {createStoreError ? (
+              <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {createStoreError}
+              </div>
+            ) : null}
+
+            <div className="mt-5 flex flex-wrap gap-3">
+              <button className="button-shell button-primary" type="submit" disabled={isBusy}>
+                스토어 생성
+              </button>
+              <button
+                className="button-shell button-ghost"
+                type="button"
+                disabled={isBusy}
+                onClick={() => {
+                  setIsCreateStoreOpen(false);
+                  setNewStoreDraft(createStoreDraft(null));
+                  setCreateStoreError(null);
+                }}
+              >
+                취소
+              </button>
+            </div>
+          </form>
+        ) : null}
       </Panel>
 
       {selectedStore ? (

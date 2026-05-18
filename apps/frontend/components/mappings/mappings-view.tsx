@@ -248,6 +248,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const [adCostError, setAdCostError] = useState<string | null>(null);
   const [adCostSuccess, setAdCostSuccess] = useState<string | null>(null);
   const [isSavingOrder, setIsSavingOrder] = useState(false);
+  const [isRecalculatingOrder, setIsRecalculatingOrder] = useState(false);
   const [isSavingCampaign, setIsSavingCampaign] = useState(false);
   const [isSavingAdCost, setIsSavingAdCost] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
@@ -260,7 +261,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const selectedMapping = data.campaignMappings.find((mapping) => mapping.id === selectedMappingId) ?? null;
   const visibleAdCostsBase = hideZeroCostAdRows ? data.adCosts.filter((item) => item.totalCost !== 0) : data.adCosts;
   const hiddenZeroCostCount = data.adCosts.length - visibleAdCostsBase.length;
-  const isBusy = isSavingOrder || isSavingCampaign || isSavingAdCost || isRefreshing;
+  const isBusy = isSavingOrder || isRecalculatingOrder || isSavingCampaign || isSavingAdCost || isRefreshing;
   const conflictSignatureCount = data.signatures.filter((item) => item.mappingStatus === "CONFLICT").length;
   const conflictAdCostCount = data.adCosts.filter((item) => item.mappingStatus === "CONFLICT").length;
   const selectedSignatureSet = new Set(selectedSignatureIds);
@@ -529,6 +530,24 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     }
   }
 
+  async function handleRecalculateOrderMappings() {
+    setOrderError(null);
+    setOrderSuccess(null);
+    setIsRecalculatingOrder(true);
+    try {
+      await postJson(
+        `/api/stores/${primaryStoreId}/order-mapping/recalculate`,
+        {},
+        "Failed to recalculate order mappings.",
+      );
+      refreshWithMessage("order", "주문 자동 매핑 재계산 작업을 시작했습니다.");
+    } catch (error) {
+      setOrderError(error instanceof Error ? error.message : "Failed to recalculate order mappings.");
+    } finally {
+      setIsRecalculatingOrder(false);
+    }
+  }
+
   async function handleSaveCampaign() {
     if (!campaignDraft.canonicalSalesUnitId || !campaignDraft.campaignPattern.trim()) {
       return setCampaignError("Select a sales unit and enter a campaign pattern.");
@@ -642,6 +661,14 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         description="주문 시그니처와 광고 캠페인을 판매단위에 연결합니다. 항목을 검색하고 드래그로 다중 선택한 뒤 일괄 매핑할 수 있습니다."
         actions={
           <>
+            <button
+              className="button-shell button-secondary"
+              type="button"
+              disabled={isBusy}
+              onClick={() => void handleRecalculateOrderMappings()}
+            >
+              오토매핑 재계산
+            </button>
             <Link className="button-shell button-secondary" href={salesUnitsHref}>
               판매단위 관리
             </Link>

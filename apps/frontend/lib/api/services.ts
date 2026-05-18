@@ -19,8 +19,6 @@ import {
   mockStores,
   mockUnmappedSummary,
   mockUploads,
-  MOCK_DATE_FROM,
-  MOCK_DATE_TO,
   MOCK_SELECTED_DATE,
 } from "@/lib/api/mock-data";
 import type {
@@ -60,6 +58,14 @@ const nowInSeoul = () =>
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
+
+const yesterdayInSeoul = () =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(Date.now() - 24 * 60 * 60 * 1000));
 
 const collectSources = (
   ...sources: Array<{
@@ -178,6 +184,7 @@ async function fetchAllRecordPages<T>(params: {
 function normalizeOrdersPageFilters(
   filters?: Partial<OrdersPageFilters>,
 ): OrdersPageFilters {
+  const defaultDate = yesterdayInSeoul();
   const mappingStatus =
     filters?.mappingStatus === "MAPPED" ||
     filters?.mappingStatus === "UNMAPPED" ||
@@ -200,8 +207,8 @@ function normalizeOrdersPageFilters(
       : "ALL";
 
   return {
-    dateFrom: filters?.dateFrom?.trim() || MOCK_DATE_FROM,
-    dateTo: filters?.dateTo?.trim() || MOCK_DATE_TO,
+    dateFrom: filters?.dateFrom?.trim() || defaultDate,
+    dateTo: filters?.dateTo?.trim() || filters?.dateFrom?.trim() || defaultDate,
     productName: filters?.productName?.trim() || "",
     optionInfo: filters?.optionInfo?.trim() || "",
     mappingStatus,

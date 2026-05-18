@@ -884,7 +884,7 @@ run("recalculateOrderMappingsForStore marks ambiguous alias matches as conflict"
   assert.equal(database.orderItems[0].canonicalSalesUnitId, null);
 });
 
-run("OrderMappingService saveMappings deduplicates signatures and enqueues one recalculation", () => {
+run("OrderMappingService saveMappings deduplicates signatures without recalculation", () => {
   const { databaseService, orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
 
   databaseService.write((draft) => {
@@ -892,6 +892,22 @@ run("OrderMappingService saveMappings deduplicates signatures and enqueues one r
     draft.orderSourceSignatures.push(
       createOrderSourceSignature("sig-1", "diet socks"),
       createOrderSourceSignature("sig-2", "diet socks black"),
+    );
+    draft.orderItems.push(
+      {
+        id: "order-item-1",
+        storeId: "store-1",
+        orderSourceSignatureId: "sig-1",
+        canonicalSalesUnitId: null,
+        updatedAt: new Date().toISOString(),
+      } as never,
+      {
+        id: "order-item-2",
+        storeId: "store-1",
+        orderSourceSignatureId: "sig-2",
+        canonicalSalesUnitId: null,
+        updatedAt: new Date().toISOString(),
+      } as never,
     );
   });
 
@@ -901,14 +917,29 @@ run("OrderMappingService saveMappings deduplicates signatures and enqueues one r
   const snapshot = databaseService.getSnapshot();
   const first = snapshot.orderSourceSignatures.find((item: { id: string }) => item.id === "sig-1");
   const second = snapshot.orderSourceSignatures.find((item: { id: string }) => item.id === "sig-2");
+  const firstOrderItem = snapshot.orderItems.find((item: { id: string }) => item.id === "order-item-1");
+  const secondOrderItem = snapshot.orderItems.find((item: { id: string }) => item.id === "order-item-2");
 
   assert.equal(result.data.updatedCount, 2);
-  assert.equal(enqueueCalls.length, 1);
-  assert.deepEqual(enqueueCalls[0]?.requestJson.signatureIds, ["sig-1", "sig-2"]);
+  assert.equal(result.data.operationId, null);
+  assert.equal(enqueueCalls.length, 0);
   assert.equal(first?.canonicalSalesUnitId, "sales-1");
   assert.equal(second?.canonicalSalesUnitId, "sales-1");
+  assert.equal(firstOrderItem?.canonicalSalesUnitId, "sales-1");
+  assert.equal(secondOrderItem?.canonicalSalesUnitId, "sales-1");
   assert.equal(first?.mappingStatus, "MAPPED");
   assert.equal(second?.mappingStatus, "MAPPED");
+});
+
+run("OrderMappingService enqueueRecalculate starts one order mapping recalculation", () => {
+  const { orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
+
+  const result = orderMappingService.enqueueRecalculate("store-1");
+
+  assert.equal(result.data.operationId, "operation-1");
+  assert.equal(enqueueCalls.length, 1);
+  assert.equal(enqueueCalls[0]?.storeId, "store-1");
+  assert.equal(enqueueCalls[0]?.requestJson.reason, "MANUAL_RECALCULATE_ORDER_MAPPING");
 });
 
 run("OrderMappingService createAndMapMany skips order recalculation during sales-unit creation", () => {

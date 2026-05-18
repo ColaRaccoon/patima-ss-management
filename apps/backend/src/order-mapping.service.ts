@@ -41,6 +41,23 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
+  enqueueRecalculate(storeId: string) {
+    this.storeService.ensureWritable(storeId);
+    const operation = this.operationService.enqueue(
+      storeId,
+      "RECALCULATE_ORDER_MAPPING",
+      { storeId, reason: "MANUAL_RECALCULATE_ORDER_MAPPING" },
+      () => this.recalculate(storeId),
+    );
+
+    return formatApiSuccess({
+      operationId: operation.id,
+      operationType: operation.operationType,
+      status: operation.status,
+      requestSummary: operation.requestJson,
+    });
+  }
+
   saveMappings(signatureIds: string[], payload: { canonicalSalesUnitId: string }) {
     const result = this.saveMappingsInternal(signatureIds, payload);
     return formatApiSuccess({
@@ -122,18 +139,18 @@ export class OrderMappingService implements OnModuleInit {
         item.confirmedAt = timestamp;
         item.updatedAt = timestamp;
       });
+      draft.orderItems.forEach((item) => {
+        if (!item.orderSourceSignatureId || !targetIds.has(item.orderSourceSignatureId)) {
+          return;
+        }
+        item.canonicalSalesUnitId = payload.canonicalSalesUnitId;
+        item.updatedAt = timestamp;
+      });
     });
-
-    const operation = this.operationService.enqueue(
-      storeId,
-      "RECALCULATE_ORDER_MAPPING",
-      { storeId, reason: "ORDER_MAPPING_CHANGED", signatureIds: dedupedIds },
-      () => this.recalculate(storeId),
-    );
 
     return {
       signatureIds: dedupedIds,
-      operationId: operation.id,
+      operationId: null,
     };
   }
 

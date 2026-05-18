@@ -212,6 +212,11 @@ export class AppController {
     return this.orderMappingService.createAndMapMany(body.signatureIds, body);
   }
 
+  @Post("stores/:storeId/order-mapping/recalculate")
+  recalculateOrderMappings(@Param("storeId") storeId: string) {
+    return this.orderMappingService.enqueueRecalculate(storeId);
+  }
+
   @Post("mapping-seed/:storeId")
   generateInitialMappingSeed(@Param("storeId") storeId: string) {
     const result = this.mappingSeedService.generateInitialMappings(storeId);
