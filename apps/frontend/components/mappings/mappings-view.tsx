@@ -1,6 +1,6 @@
 "use client";
 
-import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { FormEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import Link from "next/link";
 import { useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
@@ -11,11 +11,36 @@ import { PageHeader } from "@/components/shared/page-header";
 import { Panel } from "@/components/shared/panel";
 import { SourceBanner } from "@/components/shared/source-banner";
 import { StatusBadge } from "@/components/shared/status-badge";
-import type { MappingsPageData } from "@/lib/api/types";
+import type { MappingListStatus, MappingsPageData } from "@/lib/api/types";
 import { buildNaverStoreProductUrl, formatCurrency, formatDate, formatNullableText, formatNumber } from "@/lib/format";
-import { buildHrefWithStore } from "@/lib/store-selection";
+import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 
 type MappingStatus = "MAPPED" | "UNMAPPED" | "CONFLICT";
+type MappingListKind = "order" | "ad";
+
+const MAPPING_STATUS_OPTIONS: Array<{ value: MappingListStatus; label: string }> = [
+  { value: "ALL", label: "전체" },
+  { value: "MAPPED", label: "매핑 완료" },
+  { value: "UNMAPPED", label: "미매핑" },
+  { value: "CONFLICT", label: "충돌" },
+];
+
+const PAGE_SIZE_OPTIONS = [50, 100, 200] as const;
+
+const MAPPING_QUERY_PARAM_NAMES = {
+  order: {
+    page: "orderPage",
+    pageSize: "orderPageSize",
+    mappingStatus: "orderStatus",
+    q: "orderQ",
+  },
+  ad: {
+    page: "adPage",
+    pageSize: "adPageSize",
+    mappingStatus: "adStatus",
+    q: "adQ",
+  },
+} as const;
 
 interface SignatureDraft {
   displayName: string;
@@ -74,12 +99,6 @@ function toneForMappingStatus(status: MappingStatus) {
   if (status === "MAPPED") return "success" as const;
   if (status === "CONFLICT") return "danger" as const;
   return "warning" as const;
-}
-
-function matchesQuery(fields: Array<string | null | undefined>, query: string) {
-  const keyword = query.trim().toLowerCase();
-  if (!keyword) return true;
-  return fields.some((field) => field?.toLowerCase().includes(keyword));
 }
 
 function applySelectionChange(currentIds: string[], targetIds: string[], nextChecked: boolean) {
@@ -235,12 +254,10 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   );
   const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(defaultCampaignSalesUnitId);
   const [hideZeroCostAdRows, setHideZeroCostAdRows] = useState(true);
-  const [showOnlyUnmappedOrders, setShowOnlyUnmappedOrders] = useState(false);
-  const [showOnlyUnmappedAds, setShowOnlyUnmappedAds] = useState(false);
   const [hideZeroOrderSignatures, setHideZeroOrderSignatures] = useState(true);
   const [intentionalReason, setIntentionalReason] = useState("");
-  const [orderSearch, setOrderSearch] = useState("");
-  const [adSearch, setAdSearch] = useState("");
+  const [orderSearchInput, setOrderSearchInput] = useState(data.signatureQuery.q);
+  const [adSearchInput, setAdSearchInput] = useState(data.adCostQuery.q);
   const [orderError, setOrderError] = useState<string | null>(null);
   const [orderSuccess, setOrderSuccess] = useState<string | null>(null);
   const [campaignError, setCampaignError] = useState<string | null>(null);
@@ -266,33 +283,13 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const conflictAdCostCount = data.adCosts.filter((item) => item.mappingStatus === "CONFLICT").length;
   const selectedSignatureSet = new Set(selectedSignatureIds);
   const selectedAdCostSet = new Set(selectedAdCostIds);
-  const filteredSignatures = data.signatures
-    .filter((item) => {
-      const matchesSearch = matchesQuery([item.sourceSignature, item.rawProductNameSnapshot, item.rawOptionInfoSnapshot, item.canonicalDisplayName], orderSearch);
-      const matchesUnmapped = !showOnlyUnmappedOrders || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
-      const matchesUsageCount = !hideZeroOrderSignatures || item.usageCount !== 0;
-      return matchesSearch && matchesUnmapped && matchesUsageCount;
-    });
-  const filteredAdCosts = visibleAdCostsBase.filter((item) => {
-    const matchesSearch = matchesQuery([item.campaignName, item.canonicalDisplayName, item.mappingReason, item.reasonNote, item.reportDate], adSearch);
-    const matchesUnmapped = !showOnlyUnmappedAds || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
-    return matchesSearch && matchesUnmapped;
-  });
+  const filteredSignatures = data.signatures.filter((item) => !hideZeroOrderSignatures || item.usageCount !== 0);
+  const filteredAdCosts = visibleAdCostsBase;
   const selectedSignatureRows = data.signatures.filter((item) => selectedSignatureSet.has(item.id));
   const selectedAdCostRows = data.adCosts.filter((item) => selectedAdCostSet.has(item.id));
   const visibleSelectedSignatureCount = filteredSignatures.filter((item) => selectedSignatureSet.has(item.id)).length;
   const visibleSelectedAdCostCount = filteredAdCosts.filter((item) => selectedAdCostSet.has(item.id)).length;
-  const hiddenSignaturesCount = data.signatures.filter((item) => {
-    const matchesSearch = matchesQuery([item.sourceSignature, item.rawProductNameSnapshot, item.rawOptionInfoSnapshot, item.canonicalDisplayName], orderSearch);
-    const matchesUnmapped = !showOnlyUnmappedOrders || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
-    const matchesUsageCount = !hideZeroOrderSignatures || item.usageCount !== 0;
-    return !(matchesSearch && matchesUnmapped && matchesUsageCount);
-  }).length;
-  const hiddenAdCostsCount = visibleAdCostsBase.filter((item) => {
-    const matchesSearch = matchesQuery([item.campaignName, item.canonicalDisplayName, item.mappingReason, item.reasonNote, item.reportDate], adSearch);
-    const matchesUnmapped = !showOnlyUnmappedAds || item.mappingStatus === "UNMAPPED" || item.mappingStatus === "CONFLICT";
-    return !(matchesSearch && matchesUnmapped);
-  }).length;
+  const hiddenSignaturesCount = data.signatures.length - filteredSignatures.length;
 
   useEffect(() => {
     const stopSelection = () => {
@@ -306,6 +303,32 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       window.removeEventListener("pointercancel", stopSelection);
     };
   }, []);
+
+  useEffect(() => {
+    setOrderSearchInput(data.signatureQuery.q);
+  }, [data.signatureQuery.q]);
+
+  useEffect(() => {
+    setAdSearchInput(data.adCostQuery.q);
+  }, [data.adCostQuery.q]);
+
+  useEffect(() => {
+    setSelectedSignatureIds([]);
+  }, [
+    data.signatureQuery.mappingStatus,
+    data.signatureQuery.page,
+    data.signatureQuery.pageSize,
+    data.signatureQuery.q,
+  ]);
+
+  useEffect(() => {
+    setSelectedAdCostIds([]);
+  }, [
+    data.adCostQuery.mappingStatus,
+    data.adCostQuery.page,
+    data.adCostQuery.pageSize,
+    data.adCostQuery.q,
+  ]);
 
   useEffect(() => {
     const validIds = new Set(data.signatures.map((item) => item.id));
@@ -385,6 +408,53 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   const primaryStoreId = data.primaryStore.id;
   const salesUnitsHref = buildHrefWithStore("/sales-units", null, primaryStoreId);
+  const orderPage = data.signaturePage;
+  const adPage = data.adCostPage;
+
+  const navigateMappingList = (
+    kind: MappingListKind,
+    patch: Partial<{
+      mappingStatus: MappingListStatus;
+      q: string;
+      page: number;
+      pageSize: number;
+    }>,
+  ) => {
+    const current = kind === "order" ? data.signatureQuery : data.adCostQuery;
+    const next = { ...current, ...patch };
+    const paramNames = MAPPING_QUERY_PARAM_NAMES[kind];
+    const searchParams = new URLSearchParams(window.location.search);
+
+    searchParams.set(STORE_ID_QUERY_KEY, primaryStoreId);
+    searchParams.set(paramNames.page, String(next.page));
+    searchParams.set(paramNames.pageSize, String(next.pageSize));
+    searchParams.set(paramNames.mappingStatus, next.mappingStatus);
+    if (next.q.trim()) {
+      searchParams.set(paramNames.q, next.q.trim());
+    } else {
+      searchParams.delete(paramNames.q);
+    }
+
+    if (kind === "order") {
+      setSelectedSignatureIds([]);
+    } else {
+      setSelectedAdCostIds([]);
+    }
+
+    startRefresh(() => {
+      router.replace(`/mappings?${searchParams.toString()}`);
+    });
+  };
+
+  const submitOrderSearch = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    navigateMappingList("order", { q: orderSearchInput, page: 1 });
+  };
+
+  const submitAdSearch = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    navigateMappingList("ad", { q: adSearchInput, page: 1 });
+  };
 
   const saveScrollPositions = () => {
     if (orderScrollRef.current) {
@@ -708,12 +778,72 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         >
           <div className="flex min-h-0 flex-1 flex-col gap-4">
             <div className="space-y-3">
-              <input
-                className="input-shell"
-                value={orderSearch}
-                onChange={(event) => setOrderSearch(event.target.value)}
-                placeholder="시그니처, 상품명, 옵션, 판매단위 검색"
-              />
+              <form className="flex flex-col gap-2 sm:flex-row" onSubmit={submitOrderSearch}>
+                <input
+                  className="input-shell min-w-0 flex-1"
+                  value={orderSearchInput}
+                  onChange={(event) => setOrderSearchInput(event.target.value)}
+                  placeholder="시그니처, 상품명, 옵션, 판매단위 검색"
+                />
+                <button className="button-shell button-secondary" type="submit" disabled={isBusy}>
+                  검색
+                </button>
+                {data.signatureQuery.q ? (
+                  <button
+                    className="button-shell button-ghost"
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() => {
+                      setOrderSearchInput("");
+                      navigateMappingList("order", { q: "", page: 1 });
+                    }}
+                  >
+                    초기화
+                  </button>
+                ) : null}
+              </form>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink/60">상태</span>
+                  <select
+                    className="input-shell"
+                    value={data.signatureQuery.mappingStatus}
+                    onChange={(event) =>
+                      navigateMappingList("order", {
+                        mappingStatus: event.target.value as MappingListStatus,
+                        page: 1,
+                      })
+                    }
+                    disabled={isBusy}
+                  >
+                    {MAPPING_STATUS_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink/60">페이지 크기</span>
+                  <select
+                    className="input-shell"
+                    value={data.signatureQuery.pageSize}
+                    onChange={(event) =>
+                      navigateMappingList("order", {
+                        pageSize: Number(event.target.value),
+                        page: 1,
+                      })
+                    }
+                    disabled={isBusy}
+                  >
+                    {PAGE_SIZE_OPTIONS.map((pageSize) => (
+                      <option key={pageSize} value={pageSize}>
+                        {formatNumber(pageSize)}개
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
               <div className="flex flex-wrap gap-2">
                 <button
                   className="button-shell button-secondary"
@@ -734,25 +864,45 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
               </div>
               <div className="flex flex-wrap gap-3">
                 <label className="inline-flex items-center gap-2 text-xs text-ink/60">
-                  <input checked={showOnlyUnmappedOrders} onChange={(event) => setShowOnlyUnmappedOrders(event.target.checked)} type="checkbox" />
-                  미매핑/충돌만 보기
-                </label>
-                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
                   <input checked={hideZeroOrderSignatures} onChange={(event) => setHideZeroOrderSignatures(event.target.checked)} type="checkbox" />
                   주문 0건 숨기기
                 </label>
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink/50">
-              <span>조회 {formatNumber(filteredSignatures.length)}건</span>
-              <span>선택 {formatNumber(selectedSignatureRows.length)}건</span>
-              {selectedSignatureRows.length > visibleSelectedSignatureCount ? (
-                <span>검색으로 숨겨진 선택 {formatNumber(selectedSignatureRows.length - visibleSelectedSignatureCount)}건</span>
-              ) : null}
-              {hiddenSignaturesCount > 0 ? (
-                <span>필터로 숨겨진 {formatNumber(hiddenSignaturesCount)}건</span>
-              ) : null}
+            <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-ink/50">
+              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                <span>총 {formatNumber(orderPage.totalCount)}건</span>
+                <span>
+                  페이지 {formatNumber(orderPage.page)} / {formatNumber(orderPage.totalPages)}
+                </span>
+                <span>현재 표시 {formatNumber(filteredSignatures.length)}건</span>
+                <span>선택 {formatNumber(selectedSignatureRows.length)}건</span>
+                {selectedSignatureRows.length > visibleSelectedSignatureCount ? (
+                  <span>숨겨진 선택 {formatNumber(selectedSignatureRows.length - visibleSelectedSignatureCount)}건</span>
+                ) : null}
+                {hiddenSignaturesCount > 0 ? (
+                  <span>0건 숨김 {formatNumber(hiddenSignaturesCount)}건</span>
+                ) : null}
+              </div>
+              <div className="flex gap-2">
+                <button
+                  className="button-shell button-ghost"
+                  type="button"
+                  disabled={isBusy || orderPage.page <= 1}
+                  onClick={() => navigateMappingList("order", { page: Math.max(1, orderPage.page - 1) })}
+                >
+                  이전
+                </button>
+                <button
+                  className="button-shell button-ghost"
+                  type="button"
+                  disabled={isBusy || !orderPage.hasNext}
+                  onClick={() => navigateMappingList("order", { page: orderPage.page + 1 })}
+                >
+                  다음
+                </button>
+              </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-y-auto pr-1" ref={orderScrollRef}>
@@ -1028,12 +1178,72 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         >
           <div className="flex min-h-0 flex-1 flex-col gap-4">
             <div className="space-y-3">
-              <input
-                className="input-shell"
-                value={adSearch}
-                onChange={(event) => setAdSearch(event.target.value)}
-                placeholder="캠페인명, 판매단위, 사유, 날짜 검색"
-              />
+              <form className="flex flex-col gap-2 sm:flex-row" onSubmit={submitAdSearch}>
+                <input
+                  className="input-shell min-w-0 flex-1"
+                  value={adSearchInput}
+                  onChange={(event) => setAdSearchInput(event.target.value)}
+                  placeholder="캠페인명, 캠페인 ID, 판매단위, 사유, 날짜 검색"
+                />
+                <button className="button-shell button-secondary" type="submit" disabled={isBusy}>
+                  검색
+                </button>
+                {data.adCostQuery.q ? (
+                  <button
+                    className="button-shell button-ghost"
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() => {
+                      setAdSearchInput("");
+                      navigateMappingList("ad", { q: "", page: 1 });
+                    }}
+                  >
+                    초기화
+                  </button>
+                ) : null}
+              </form>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink/60">상태</span>
+                  <select
+                    className="input-shell"
+                    value={data.adCostQuery.mappingStatus}
+                    onChange={(event) =>
+                      navigateMappingList("ad", {
+                        mappingStatus: event.target.value as MappingListStatus,
+                        page: 1,
+                      })
+                    }
+                    disabled={isBusy}
+                  >
+                    {MAPPING_STATUS_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink/60">페이지 크기</span>
+                  <select
+                    className="input-shell"
+                    value={data.adCostQuery.pageSize}
+                    onChange={(event) =>
+                      navigateMappingList("ad", {
+                        pageSize: Number(event.target.value),
+                        page: 1,
+                      })
+                    }
+                    disabled={isBusy}
+                  >
+                    {PAGE_SIZE_OPTIONS.map((pageSize) => (
+                      <option key={pageSize} value={pageSize}>
+                        {formatNumber(pageSize)}개
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
               <div className="flex flex-wrap gap-2">
                 <button
                   className="button-shell button-secondary"
@@ -1056,24 +1266,40 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink/50">
-                <span>조회 {formatNumber(filteredAdCosts.length)}건</span>
+                <span>총 {formatNumber(adPage.totalCount)}건</span>
+                <span>
+                  페이지 {formatNumber(adPage.page)} / {formatNumber(adPage.totalPages)}
+                </span>
+                <span>현재 표시 {formatNumber(filteredAdCosts.length)}건</span>
                 <span>선택 {formatNumber(selectedAdCostRows.length)}건</span>
                 {selectedAdCostRows.length > visibleSelectedAdCostCount ? (
-                  <span>검색으로 숨겨진 선택 {formatNumber(selectedAdCostRows.length - visibleSelectedAdCostCount)}건</span>
+                  <span>숨겨진 선택 {formatNumber(selectedAdCostRows.length - visibleSelectedAdCostCount)}건</span>
                 ) : null}
-                {hiddenAdCostsCount > 0 ? (
-                  <span>필터로 숨겨진 {formatNumber(hiddenAdCostsCount)}건</span>
-                ) : null}
+                {hiddenZeroCostCount > 0 ? <span>0원 숨김 {formatNumber(hiddenZeroCostCount)}건</span> : null}
               </div>
-              <div className="flex flex-wrap gap-3">
-                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
-                  <input checked={showOnlyUnmappedAds} onChange={(event) => setShowOnlyUnmappedAds(event.target.checked)} type="checkbox" />
-                  미매핑/충돌만 보기
-                </label>
+              <div className="flex flex-wrap items-center gap-3">
                 <label className="inline-flex items-center gap-2 text-xs text-ink/60">
                   <input checked={hideZeroCostAdRows} onChange={(event) => setHideZeroCostAdRows(event.target.checked)} type="checkbox" />
-                  0원 항목 숨기기{hiddenZeroCostCount > 0 ? ` (${formatNumber(hiddenZeroCostCount)}건)` : ""}
+                  0원 항목 숨기기
                 </label>
+                <div className="flex gap-2">
+                  <button
+                    className="button-shell button-ghost"
+                    type="button"
+                    disabled={isBusy || adPage.page <= 1}
+                    onClick={() => navigateMappingList("ad", { page: Math.max(1, adPage.page - 1) })}
+                  >
+                    이전
+                  </button>
+                  <button
+                    className="button-shell button-ghost"
+                    type="button"
+                    disabled={isBusy || !adPage.hasNext}
+                    onClick={() => navigateMappingList("ad", { page: adPage.page + 1 })}
+                  >
+                    다음
+                  </button>
+                </div>
               </div>
             </div>
 

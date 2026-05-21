@@ -1,6 +1,8 @@
 import { createHash } from "crypto";
 import {
   CanonicalSalesUnit,
+  AdCampaignSignature,
+  AdCampaignDailyCost,
   createSourceSignature,
   DailySalesUnitProfit,
   DashboardSummary,
@@ -38,6 +40,7 @@ export const createEmptyDatabase = (): DatabaseShape => ({
   orders: [],
   orderItems: [],
   campaignMappings: [],
+  adCampaignSignatures: [],
   adExcelUploads: [],
   adUploadPreviewRows: [],
   adCampaignDailyCosts: [],
@@ -497,7 +500,7 @@ export const getOrderItemMappingStatus = (
 };
 
 export const getAdMappingStatus = (
-  item: Pick<DatabaseShape["adCampaignDailyCosts"][number], "canonicalSalesUnitId" | "mappingReason">,
+  item: Pick<AdCampaignDailyCost | AdCampaignSignature, "canonicalSalesUnitId" | "mappingReason">,
 ): MappingStatus => {
   if (item.mappingReason === "MULTIPLE_RULES") {
     return "CONFLICT";

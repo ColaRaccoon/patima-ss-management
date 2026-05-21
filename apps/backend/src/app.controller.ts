@@ -377,6 +377,42 @@ export class AppController {
     return this.adsService.recalculateMappings(body.adCostIds);
   }
 
+  @Get("ad-campaign-signatures")
+  getAdCampaignSignatures(
+    @Query("storeId") storeId: string,
+    @Query("dateFrom") dateFrom?: string,
+    @Query("dateTo") dateTo?: string,
+    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
+    @Query("q") q?: string,
+    @Query("page") page?: string,
+    @Query("pageSize") pageSize?: string,
+  ) {
+    return this.adsService.listAdCampaignSignatures({
+      storeId,
+      dateFrom,
+      dateTo,
+      mappingStatus,
+      q,
+      page: page ? Number(page) : undefined,
+      pageSize: pageSize ? Number(pageSize) : undefined,
+    });
+  }
+
+  @Post("ad-campaign-signatures/batch-mapping")
+  saveAdCampaignSignatureMappings(@Body() body: { signatureIds: string[]; canonicalSalesUnitId: string }) {
+    return this.adsService.saveManualMappings(body.signatureIds, body);
+  }
+
+  @Post("ad-campaign-signatures/batch-intentional-unmapped")
+  setAdCampaignSignaturesIntentionalUnmapped(@Body() body: { signatureIds: string[]; reasonNote: string }) {
+    return this.adsService.setIntentionalUnmappedMany(body.signatureIds, body);
+  }
+
+  @Post("ad-campaign-signatures/batch-recalculate-mapping")
+  recalculateAdCampaignSignatureMappings(@Body() body: { signatureIds: string[] }) {
+    return this.adsService.recalculateMappings(body.signatureIds);
+  }
+
   @Get("campaign-mappings")
   getCampaignMappings(
     @Query("storeId") storeId: string,

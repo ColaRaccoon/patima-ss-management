@@ -1,4 +1,5 @@
 import {
+  AdCampaignSignature,
   AdCampaignDailyCost,
   AdUploadPreviewRow,
   CampaignMappingReason,
@@ -118,8 +119,19 @@ export const getRuleSnapshotHash = (database: DatabaseShape, storeId: string): s
   });
 
 export const getOverrideSnapshotHash = (database: DatabaseShape, storeId: string): string =>
-  hashJson(
-    database.adCampaignDailyCosts
+  hashJson([
+    ...database.adCampaignSignatures
+      .filter((item) => item.storeId === storeId && item.confirmedAt)
+      .map((signature) => ({
+        signatureId: signature.id,
+        campaignId: signature.campaignId,
+        normalizedCampaignName: signature.normalizedCampaignName,
+        mappingReason: signature.mappingReason,
+        canonicalSalesUnitId: signature.canonicalSalesUnitId,
+        reasonNote: signature.reasonNote,
+        confirmedAt: signature.confirmedAt,
+      })),
+    ...database.adCampaignDailyCosts
       .filter((item) => item.storeId === storeId)
       .map((item) => ({
         row: item,
@@ -136,10 +148,10 @@ export const getOverrideSnapshotHash = (database: DatabaseShape, storeId: string
         reasonNote:
           override.type === "INTENTIONALLY_UNMAPPED" ? override.reasonNote : null,
       })),
-  );
+  ]);
 
 export const getAdMappingOverride = (
-  item: Pick<AdCampaignDailyCost | AdUploadPreviewRow, "canonicalSalesUnitId" | "mappingReason" | "reasonNote">,
+  item: Pick<AdCampaignDailyCost | AdUploadPreviewRow | AdCampaignSignature, "canonicalSalesUnitId" | "mappingReason" | "reasonNote">,
 ): AdMappingOverride | null => {
   if (item.mappingReason === "MANUAL_MAPPED" && item.canonicalSalesUnitId) {
     return {
@@ -308,7 +320,334 @@ export const evaluateAdMapping = (
 
 export const normalizeCampaignPattern = (pattern: string): string => normalizeText(pattern);
 
+const getSignatureCampaignId = (campaignId: string | null | undefined): string | null => {
+  const trimmed = campaignId?.trim();
+  return trimmed ? trimmed : null;
+};
+
+export const getAdCampaignSignatureKey = (
+  value: Pick<AdCampaignSignature, "storeId" | "channel" | "campaignId" | "normalizedCampaignName">,
+): string =>
+  [
+    value.storeId,
+    value.channel,
+    value.campaignId ? `id:${value.campaignId}` : `name:${value.normalizedCampaignName}`,
+  ].join("|");
+
+export const findAdCampaignSignature = (
+  database: DatabaseShape,
+  params: {
+    storeId: string;
+    channel?: "NAVER_DA";
+    campaignId?: string | null;
+    normalizedCampaignName: string;
+  },
+): AdCampaignSignature | null => {
+  const key = [
+    params.storeId,
+    params.channel ?? "NAVER_DA",
+    getSignatureCampaignId(params.campaignId)
+      ? `id:${getSignatureCampaignId(params.campaignId)}`
+      : `name:${params.normalizedCampaignName}`,
+  ].join("|");
+  return database.adCampaignSignatures.find((signature) => getAdCampaignSignatureKey(signature) === key) ?? null;
+};
+
+export const upsertAdCampaignSignature = (
+  database: DatabaseShape,
+  params: {
+    storeId: string;
+    channel?: "NAVER_DA";
+    campaignId?: string | null;
+    campaignName: string;
+    normalizedCampaignName?: string;
+    reportDate?: string | null;
+    countUsage?: boolean;
+  },
+): AdCampaignSignature => {
+  const timestamp = nowIso();
+  const channel = params.channel ?? "NAVER_DA";
+  const normalizedCampaignName = params.normalizedCampaignName ?? normalizeText(params.campaignName);
+  const campaignId = getSignatureCampaignId(params.campaignId);
+  const existing = findAdCampaignSignature(database, {
+    storeId: params.storeId,
+    channel,
+    campaignId,
+    normalizedCampaignName,
+  });
+
+  if (existing) {
+    existing.campaignNameSnapshot = params.campaignName;
+    existing.normalizedCampaignName = normalizedCampaignName;
+    existing.campaignId = existing.campaignId ?? campaignId;
+    if (params.countUsage !== false) {
+      existing.usageCount = (existing.usageCount ?? 0) + 1;
+    }
+    if (params.reportDate) {
+      if (!existing.firstSeenDate || params.reportDate < existing.firstSeenDate) {
+        existing.firstSeenDate = params.reportDate;
+      }
+      if (!existing.lastSeenDate || params.reportDate > existing.lastSeenDate) {
+        existing.lastSeenDate = params.reportDate;
+      }
+    }
+    existing.updatedAt = timestamp;
+    return existing;
+  }
+
+  const created: AdCampaignSignature = {
+    id: createId(),
+    storeId: params.storeId,
+    channel,
+    campaignId,
+    campaignNameSnapshot: params.campaignName,
+    normalizedCampaignName,
+    canonicalSalesUnitId: null,
+    mappingReason: "NO_RULE",
+    matchedRuleCount: 0,
+    reasonNote: "일치하는 규칙이 없습니다.",
+    reasonNoteInherited: false,
+    confirmedAt: null,
+    usageCount: params.countUsage === false ? 0 : 1,
+    firstSeenDate: params.reportDate ?? null,
+    lastSeenDate: params.reportDate ?? null,
+    lastAutoMappedAt: null,
+    mappingRuleHash: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  database.adCampaignSignatures.push(created);
+  return created;
+};
+
+export const ensureAdCampaignSignaturesForStore = (
+  database: DatabaseShape,
+  storeId: string,
+  rowIds?: Set<string> | string[] | null,
+): Set<string> => {
+  const targetRowIds = rowIds ? new Set(Array.from(rowIds).filter(Boolean)) : null;
+  const touchedSignatureIds = new Set<string>();
+
+  database.adCampaignDailyCosts
+    .filter((row) => row.storeId === storeId && (!targetRowIds || targetRowIds.has(row.id)))
+    .forEach((row) => {
+      if (row.adCampaignSignatureId) {
+        touchedSignatureIds.add(row.adCampaignSignatureId);
+        return;
+      }
+
+      const signature = upsertAdCampaignSignature(database, {
+        storeId,
+        campaignId: row.campaignId,
+        campaignName: row.campaignName,
+        normalizedCampaignName: row.normalizedCampaignName,
+        reportDate: row.reportDate,
+      });
+      row.adCampaignSignatureId = signature.id;
+      touchedSignatureIds.add(signature.id);
+    });
+
+  return touchedSignatureIds;
+};
+
+export const applyAdCampaignSignatureToRows = (
+  database: DatabaseShape,
+  params: {
+    storeId: string;
+    signatureIds?: Set<string> | string[] | null;
+    dateFrom?: string | null;
+    dateTo?: string | null;
+  },
+): void => {
+  const timestamp = nowIso();
+  const signatureIds = params.signatureIds ? new Set(Array.from(params.signatureIds).filter(Boolean)) : null;
+  const signaturesById = new Map(database.adCampaignSignatures.map((signature) => [signature.id, signature]));
+
+  database.adCampaignDailyCosts
+    .filter(
+      (row) =>
+        row.storeId === params.storeId &&
+        row.adCampaignSignatureId &&
+        (!signatureIds || signatureIds.has(row.adCampaignSignatureId)) &&
+        (!params.dateFrom || row.reportDate >= params.dateFrom) &&
+        (!params.dateTo || row.reportDate <= params.dateTo),
+    )
+    .forEach((row) => {
+      const signature = signaturesById.get(row.adCampaignSignatureId!);
+      if (!signature) {
+        return;
+      }
+      row.canonicalSalesUnitId = signature.canonicalSalesUnitId;
+      row.matchedRuleCount = signature.matchedRuleCount;
+      row.mappingReason = signature.mappingReason;
+      row.reasonNote = signature.reasonNote;
+      row.reasonNoteInherited = signature.reasonNoteInherited;
+      row.updatedAt = timestamp;
+    });
+};
+
+export const refreshAdCampaignSignatureSummaries = (
+  database: DatabaseShape,
+  params: {
+    storeId: string;
+    signatureIds?: Set<string> | string[] | null;
+  },
+): void => {
+  const signatureIds = params.signatureIds ? new Set(Array.from(params.signatureIds).filter(Boolean)) : null;
+  const summaries = new Map<
+    string,
+    {
+      usageCount: number;
+      firstSeenDate: string | null;
+      lastSeenDate: string | null;
+      latestRow: AdCampaignDailyCost | null;
+    }
+  >();
+
+  database.adCampaignDailyCosts
+    .filter(
+      (row) =>
+        row.storeId === params.storeId &&
+        row.adCampaignSignatureId &&
+        (!signatureIds || signatureIds.has(row.adCampaignSignatureId)),
+    )
+    .forEach((row) => {
+      const current = summaries.get(row.adCampaignSignatureId!) ?? {
+        usageCount: 0,
+        firstSeenDate: null,
+        lastSeenDate: null,
+        latestRow: null,
+      };
+      current.usageCount += 1;
+      if (!current.firstSeenDate || row.reportDate < current.firstSeenDate) {
+        current.firstSeenDate = row.reportDate;
+      }
+      if (!current.lastSeenDate || row.reportDate > current.lastSeenDate) {
+        current.lastSeenDate = row.reportDate;
+      }
+      if (
+        !current.latestRow ||
+        `${row.reportDate}:${row.updatedAt}`.localeCompare(`${current.latestRow.reportDate}:${current.latestRow.updatedAt}`) > 0
+      ) {
+        current.latestRow = row;
+      }
+      summaries.set(row.adCampaignSignatureId!, current);
+    });
+
+  const timestamp = nowIso();
+  database.adCampaignSignatures
+    .filter((signature) => signature.storeId === params.storeId && (!signatureIds || signatureIds.has(signature.id)))
+    .forEach((signature) => {
+      const summary = summaries.get(signature.id);
+      signature.usageCount = summary?.usageCount ?? 0;
+      signature.firstSeenDate = summary?.firstSeenDate ?? null;
+      signature.lastSeenDate = summary?.lastSeenDate ?? null;
+      if (summary?.latestRow) {
+        signature.campaignNameSnapshot = summary.latestRow.campaignName;
+        signature.normalizedCampaignName = summary.latestRow.normalizedCampaignName;
+        signature.campaignId = summary.latestRow.campaignId || signature.campaignId;
+      }
+      signature.updatedAt = timestamp;
+    });
+};
+
+const ensureStoreLevelSalesUnitIfNeeded = (database: DatabaseShape, storeId: string, needsStoreLevelUnit: boolean) => {
+  if (!needsStoreLevelUnit) {
+    return;
+  }
+
+  const store = database.stores.find((s) => s.id === storeId);
+  const existing = database.canonicalSalesUnits.find(
+    (u) => u.storeId === storeId && u.isStoreLevel === true,
+  );
+
+  if (store && !existing) {
+    database.canonicalSalesUnits.push({
+      id: createId(),
+      storeId,
+      displayName: "스토어 전체 광고비",
+      matchAliases: [],
+      normalizedMatchAliases: [],
+      linkedProductIds: [],
+      linkedOptionCodes: [],
+      linkedManageCodes: [],
+      memo: "자동 생성된 스토어 전체 광고비 판매단위",
+      isActive: true,
+      deactivatedAt: null,
+      isStoreLevel: true,
+      parentSalesUnitId: null,
+      isGroup: false,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+  }
+};
+
+export const recalculateAdCampaignSignaturesForStore = (
+  database: DatabaseShape,
+  storeId: string,
+  options?: {
+    signatureIds?: Set<string> | string[] | null;
+    onlyUnconfirmed?: boolean;
+    applyToRows?: boolean;
+    applyToRowsFrom?: string | null;
+    applyToRowsTo?: string | null;
+  },
+): void => {
+  const shouldApplyToRows =
+    options?.applyToRows === true ||
+    options?.applyToRowsFrom != null ||
+    options?.applyToRowsTo != null;
+  if (shouldApplyToRows) {
+    ensureAdCampaignSignaturesForStore(database, storeId);
+  }
+  const targetSignatureIds = options?.signatureIds
+    ? new Set(Array.from(options.signatureIds).filter(Boolean))
+    : null;
+  const candidates = database.adCampaignSignatures.filter(
+    (signature) => signature.storeId === storeId && (!targetSignatureIds || targetSignatureIds.has(signature.id)),
+  );
+  const autoCandidates = candidates.filter((signature) => !signature.confirmedAt);
+  const needsStoreLevelUnit = autoCandidates.some(
+    (signature) => evaluateAdMapping(database, storeId, signature.normalizedCampaignName).needsStoreLevelUnit === true,
+  );
+  ensureStoreLevelSalesUnitIfNeeded(database, storeId, needsStoreLevelUnit);
+
+  const timestamp = nowIso();
+  const ruleHash = getRuleSnapshotHash(database, storeId);
+  autoCandidates.forEach((signature) => {
+    const mapping = evaluateAdMapping(database, storeId, signature.normalizedCampaignName);
+    const storeLevelUnit =
+      mapping.needsStoreLevelUnit === true
+        ? database.canonicalSalesUnits.find((u) => u.storeId === storeId && u.isStoreLevel === true)
+        : null;
+
+    signature.canonicalSalesUnitId =
+      mapping.needsStoreLevelUnit === true ? storeLevelUnit?.id ?? null : mapping.canonicalSalesUnitId;
+    signature.matchedRuleCount = mapping.matchedRuleCount;
+    signature.mappingReason = mapping.mappingReason;
+    signature.reasonNote = mapping.reasonNote;
+    signature.reasonNoteInherited = mapping.reasonNoteInherited;
+    signature.lastAutoMappedAt = timestamp;
+    signature.mappingRuleHash = ruleHash;
+    signature.updatedAt = timestamp;
+  });
+
+  if (shouldApplyToRows) {
+    applyAdCampaignSignatureToRows(database, {
+      storeId,
+      signatureIds: targetSignatureIds ?? new Set(candidates.map((signature) => signature.id)),
+      dateFrom: options?.applyToRowsFrom,
+      dateTo: options?.applyToRowsTo,
+    });
+  }
+};
+
 export const recalculateAdMappingsForStore = (database: DatabaseShape, storeId: string): void => {
+  recalculateAdCampaignSignaturesForStore(database, storeId);
+};
+
+export const recalculateAdMappingsForStoreLegacyRows = (database: DatabaseShape, storeId: string): void => {
   // 먼저 필요한 스토어 레벨 판매단위가 있는지 확인
   const needsStoreLevelUnit = database.adCampaignDailyCosts
     .filter((item) => item.storeId === storeId)

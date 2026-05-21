@@ -189,6 +189,7 @@ export interface AdPreviewRowItem {
 
 export interface CampaignCostListItem {
   id: string;
+  adCampaignSignatureId?: string | null;
   uploadId: string;
   reportDate: string;
   campaignName: string;
@@ -204,6 +205,10 @@ export interface CampaignCostListItem {
     | null;
   matchedRuleCount: number;
   reasonNote: string | null;
+  usageCount?: number;
+  firstSeenDate?: string | null;
+  lastSeenDate?: string | null;
+  confirmedAt?: string | null;
 }
 
 export interface CampaignMappingRuleListItem {
@@ -429,11 +434,32 @@ export interface SalesUnitsPageData {
   sources: SourceState[];
 }
 
+export type MappingListStatus = "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+
+export interface PageMeta {
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+  hasNext: boolean;
+}
+
+export interface MappingListState {
+  mappingStatus: MappingListStatus;
+  q: string;
+  page: number;
+  pageSize: number;
+}
+
 export interface MappingsPageData {
   primaryStore: StoreListItem | null;
   salesUnits: SalesUnitListItem[];
   signatures: OrderSourceSignatureListItem[];
+  signaturePage: PageMeta;
+  signatureQuery: MappingListState;
   adCosts: CampaignCostListItem[];
+  adCostPage: PageMeta;
+  adCostQuery: MappingListState;
   campaignMappings: CampaignMappingRuleListItem[];
   sources: SourceState[];
 }

@@ -111,6 +111,14 @@ export interface OrderSourceSignature {
   canonicalSalesUnitId: string | null;
   mappingStatus: MappingStatus;
   confirmedAt: string | null;
+  usageCount: number;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  sampleExternalProductId: string | null;
+  sampleOptionCode: string | null;
+  sampleOptionManageCode: string | null;
+  lastAutoMappedAt: string | null;
+  mappingRuleHash: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -222,8 +230,31 @@ export interface AdUploadPreviewRow {
   updatedAt: string;
 }
 
+export interface AdCampaignSignature {
+  id: string;
+  storeId: string;
+  channel: "NAVER_DA";
+  campaignId: string | null;
+  campaignNameSnapshot: string;
+  normalizedCampaignName: string;
+  canonicalSalesUnitId: string | null;
+  mappingReason: CampaignMappingReason;
+  matchedRuleCount: number;
+  reasonNote: string | null;
+  reasonNoteInherited: boolean;
+  confirmedAt: string | null;
+  usageCount: number;
+  firstSeenDate: string | null;
+  lastSeenDate: string | null;
+  lastAutoMappedAt: string | null;
+  mappingRuleHash: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AdCampaignDailyCost extends AdUploadPreviewRow {
   sourceUploadId: string;
+  adCampaignSignatureId: string | null;
 }
 
 export interface SalesUnitCostSetting {
@@ -406,6 +437,7 @@ export interface DatabaseShape {
   orders: OrderRecord[];
   orderItems: OrderItem[];
   campaignMappings: CampaignSalesUnitMapping[];
+  adCampaignSignatures: AdCampaignSignature[];
   adExcelUploads: AdExcelUpload[];
   adUploadPreviewRows: AdUploadPreviewRow[];
   adCampaignDailyCosts: AdCampaignDailyCost[];

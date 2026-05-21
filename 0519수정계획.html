@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>0519 수정계획 - 매핑 화면 서버 페이지네이션 완성</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --paper: #ffffff;
+      --ink: #172033;
+      --muted: #5f6b7a;
+      --line: #dbe1ea;
+      --accent: #2563eb;
+      --accent-soft: #e8f0ff;
+      --warn: #9a3412;
+      --warn-soft: #fff4e8;
+      --good: #166534;
+      --good-soft: #eaf7ef;
+      --code-bg: #111827;
+      --code-ink: #f8fafc;
+      --shadow: 0 18px 50px rgba(23, 32, 51, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family:
+        "Pretendard",
+        "Segoe UI",
+        "Apple SD Gothic Neo",
+        "Malgun Gothic",
+        Arial,
+        sans-serif;
+      line-height: 1.65;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 48px 0 80px;
+    }
+
+    header,
+    .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    header {
+      padding: 36px 38px;
+    }
+
+    .section {
+      margin-top: 20px;
+      padding: 24px 28px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 34px;
+    }
+
+    h2 {
+      margin-top: 44px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--line);
+      font-size: 24px;
+    }
+
+    h3 {
+      margin-top: 28px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 12px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 12px 0 0;
+      padding-left: 24px;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    code {
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: #edf1f7;
+      color: #16213a;
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 14px 0 0;
+      padding: 16px 18px;
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      color: inherit;
+    }
+
+    table {
+      width: 100%;
+      margin-top: 14px;
+      border-collapse: collapse;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #f1f4f9;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .lead {
+      max-width: 920px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 20px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: #174ea6;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .callout {
+      margin-top: 16px;
+      padding: 16px 18px;
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 6px;
+    }
+
+    .warning {
+      border-left-color: var(--warn);
+      background: var(--warn-soft);
+      color: #5c2a09;
+    }
+
+    .good {
+      border-left-color: var(--good);
+      background: var(--good-soft);
+      color: #0f3b20;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .box {
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcff;
+    }
+
+    .box h3 {
+      margin-top: 0;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        width: min(100% - 24px, 1120px);
+        padding-top: 24px;
+      }
+
+      header,
+      .section {
+        padding: 22px;
+      }
+
+      h1 {
+        font-size: 27px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>0519 수정계획: 매핑 화면 서버 페이지네이션 완성</h1>
+      <p class="lead">
+        0518 성능 구조 개선으로 주문/광고 원장 전체 fetch는 끊었지만, 매핑 화면에는 아직 서버 페이지네이션 UI와 서버 검색이 완성되지 않았다.
+        현재 화면은 일부 첫 페이지 묶음만 가져와 병합하므로 고유 시그니처가 200건을 넘으면 나머지 항목을 탐색할 수 없다.
+        이 문서는 다음 세션이 매핑 화면 페이지네이션을 안전하게 완성하기 위한 인수인계 문서다.
+      </p>
+      <div class="meta">
+        <span class="pill">작성일: 2026-05-19</span>
+        <span class="pill">대상 경로: C:\Users\seong\Desktop\workspace\patima-naver-ss</span>
+        <span class="pill">핵심 목표: 매핑 화면 서버 페이지네이션</span>
+        <span class="pill">주의: 원장 row 삭제 금지</span>
+      </div>
+    </header>
+
+    <h2>1. 현재 상태 요약</h2>
+    <section class="section">
+      <p>
+        0518 작업으로 매핑 구조는 원장 row 중심에서 시그니처 중심으로 이동했다.
+        주문은 <code>orderSourceSignatures</code>, 광고는 새로 도입된 <code>adCampaignSignatures</code>가 매핑 관리 대상이다.
+        <code>orderItems</code>와 <code>adCampaignDailyCosts</code>는 손익 계산을 위한 원장으로 계속 유지한다.
+      </p>
+
+      <div class="grid">
+        <div class="box">
+          <h3>이미 반영된 것</h3>
+          <ul>
+            <li>주문 동기화 후 전체 주문 아이템 재계산 대신 touched item 중심 증분 매핑을 사용한다.</li>
+            <li>주문 시그니처에 <code>usageCount</code>, <code>firstSeenAt</code>, <code>lastSeenAt</code>, sample ID 필드가 추가됐다.</li>
+            <li>광고 캠페인 시그니처 <code>AdCampaignSignature</code>가 추가됐다.</li>
+            <li>광고 수동 매핑은 시그니처에 저장되고, row에는 스냅샷으로 반영된다.</li>
+            <li>캠페인 규칙 변경 기본 경로는 과거 광고 원장 row를 바로 덮지 않고 signature만 재계산한다.</li>
+          </ul>
+        </div>
+        <div class="box">
+          <h3>아직 미완성인 것</h3>
+          <ul>
+            <li>매핑 화면의 주문/광고 목록에 서버 페이지 이동 UI가 없다.</li>
+            <li>검색어 입력이 서버 <code>q</code> 파라미터로 연결되지 않고, 현재 로딩된 배열 안에서만 검색된다.</li>
+            <li>현재 프론트는 첫 페이지 몇 묶음을 가져와 병합하므로 200건 밖 항목은 UI에서 접근할 수 없다.</li>
+            <li>전체 개수, 현재 페이지, 총 페이지, 다음/이전 페이지 상태가 화면에 표시되지 않는다.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="callout warning">
+        <strong>중요:</strong>
+        주문 원장 400건이 200건으로 삭제되거나 압축된 것이 아니다. 매핑 화면은 원장 row가 아니라 고유 시그니처 목록을 보여준다.
+        다만 고유 시그니처 자체가 200건을 넘으면 현재 UI에서는 뒤 페이지를 볼 수 없다.
+      </div>
+    </section>
+
+    <h2>2. 문제 정의</h2>
+    <section class="section">
+      <p>
+        현재 <code>apps/frontend/lib/api/services.ts</code>의 <code>getMappingsPageData</code>는 매핑 화면 초기 데이터를 만들 때
+        전체 페이지를 끝까지 가져오지 않도록 수정되어 있다. 대신 주문과 광고 각각 다음과 같은 첫 페이지만 가져온다.
+      </p>
+
+      <pre><code>// 현재 취지
+주문: ALL page 1 + UNMAPPED page 1 + CONFLICT page 1
+광고: ALL page 1 + UNMAPPED page 1 + CONFLICT page 1</code></pre>
+
+      <p>
+        이 방식은 전체 fetch를 끊는 임시 bridge로는 유효하지만, 실제 운영 화면으로는 부족하다.
+        사용자가 2페이지 이후의 시그니처를 검색하거나 수동 매핑할 수 없고, "목록이 줄었다" 또는 "일부 항목이 사라졌다"처럼 보인다.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>구분</th>
+            <th>현재 동작</th>
+            <th>문제</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>주문 시그니처</td>
+            <td><code>/order-source-signatures?page=1&pageSize=200</code> 중심</td>
+            <td>2페이지 이후 항목을 볼 UI가 없다.</td>
+          </tr>
+          <tr>
+            <td>광고 시그니처</td>
+            <td><code>/ad-campaign-signatures?page=1&pageSize=200</code> 중심</td>
+            <td>매핑 완료/미매핑/충돌 전체 탐색이 제한된다.</td>
+          </tr>
+          <tr>
+            <td>검색</td>
+            <td>프론트 배열 필터</td>
+            <td>서버에 있는 2페이지 이후 데이터는 검색되지 않는다.</td>
+          </tr>
+          <tr>
+            <td>선택</td>
+            <td>현재 로딩된 행 ID만 선택 가능</td>
+            <td>페이지 이동 시 선택 유지 정책이 정의되어 있지 않다.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <h2>3. 목표</h2>
+    <section class="section">
+      <p>
+        매핑 화면의 주문/광고 목록을 서버 페이지네이션 기반으로 전환한다.
+        전체 fetch는 다시 도입하지 않는다. 사용자가 페이지를 이동하거나 검색어/필터를 바꾸면 서버 API를 다시 호출해서 해당 페이지를 가져와야 한다.
+      </p>
+
+      <ul>
+        <li>주문 시그니처 목록은 <code>GET /order-source-signatures</code>의 <code>page</code>, <code>pageSize</code>, <code>mappingStatus</code>, <code>q</code>를 사용한다.</li>
+        <li>광고 시그니처 목록은 <code>GET /ad-campaign-signatures</code>의 <code>page</code>, <code>pageSize</code>, <code>mappingStatus</code>, <code>q</code>를 사용한다.</li>
+        <li>프론트 UI에 현재 페이지, 총 개수, 이전/다음 버튼, pageSize 선택을 추가한다.</li>
+        <li>검색어 입력은 debounce 후 URL query 또는 client state를 통해 서버 요청에 반영한다.</li>
+        <li>페이지 이동 후에도 이미 선택한 항목을 유지할지, 현재 페이지 선택만 유지할지 정책을 명확히 한다.</li>
+      </ul>
+
+      <div class="callout good">
+        <strong>완료 기준:</strong>
+        고유 주문/광고 시그니처가 200건을 넘어도 사용자가 페이지 이동과 서버 검색으로 모든 항목을 찾고 매핑할 수 있어야 한다.
+      </div>
+    </section>
+
+    <h2>4. 관련 파일</h2>
+    <section class="section">
+      <table>
+        <thead>
+          <tr>
+            <th>파일</th>
+            <th>역할</th>
+            <th>수정 필요</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>apps/frontend/lib/api/types.ts</code></td>
+            <td><code>MappingsPageData</code>, row item 타입</td>
+            <td>페이지네이션 metadata 타입 추가</td>
+          </tr>
+          <tr>
+            <td><code>apps/frontend/lib/api/services.ts</code></td>
+            <td>SSR 데이터 조합, API 호출</td>
+            <td><code>getMappingsPageData</code>가 page/filter/search 파라미터를 받도록 변경</td>
+          </tr>
+          <tr>
+            <td><code>apps/frontend/app/(main)/mappings/page.tsx</code></td>
+            <td>URL searchParams를 받아 SSR data 호출</td>
+            <td>order/ad 각각 page, pageSize, status, q 전달</td>
+          </tr>
+          <tr>
+            <td><code>apps/frontend/components/mappings/mappings-view.tsx</code></td>
+            <td>매핑 화면 UI</td>
+            <td>서버 페이지네이션 컨트롤, 서버 검색, 필터 상태 연결</td>
+          </tr>
+          <tr>
+            <td><code>apps/backend/src/order-sync.service.ts</code></td>
+            <td>주문 시그니처 목록 API 구현</td>
+            <td>이미 page/q 지원. 응답 metadata 확인</td>
+          </tr>
+          <tr>
+            <td><code>apps/backend/src/ads.service.ts</code></td>
+            <td>광고 시그니처 목록 API 구현</td>
+            <td>이미 page/q 지원. active row 필터와 mapped 항목 표시 정책 확인</td>
+          </tr>
+          <tr>
+            <td><code>apps/backend/src/app.controller.ts</code></td>
+            <td>REST endpoint</td>
+            <td>query parameter 누락 여부 확인</td>
+          </tr>
+          <tr>
+            <td><code>apps/backend/src/run-tests.ts</code></td>
+            <td>백엔드 회귀 테스트</td>
+            <td>목록 page/q/status 테스트 추가 권장</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <h2>5. 권장 데이터 구조</h2>
+    <section class="section">
+      <p>
+        프론트 <code>MappingsPageData</code>에 주문/광고 각각의 페이지 정보를 별도로 추가한다.
+        기존 <code>signatures</code>, <code>adCosts</code> 배열은 유지하되, metadata를 함께 내려서 컴포넌트가 컨트롤을 그릴 수 있게 한다.
+      </p>
+
+      <pre><code>export interface PageMeta {
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+  hasNext: boolean;
+}
+
+export interface MappingListState {
+  mappingStatus: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+  q: string;
+  page: number;
+  pageSize: number;
+}
+
+export interface MappingsPageData {
+  primaryStore: StoreListItem | null;
+  salesUnits: SalesUnitListItem[];
+  signatures: OrderSourceSignatureListItem[];
+  signaturePage: PageMeta;
+  signatureQuery: MappingListState;
+  adCosts: CampaignCostListItem[];
+  adCostPage: PageMeta;
+  adCostQuery: MappingListState;
+  campaignMappings: CampaignMappingRuleListItem[];
+  sources: SourceState[];
+}</code></pre>
+
+      <p>
+        이름은 꼭 위와 같을 필요는 없지만, 주문과 광고의 page/query 상태를 분리해야 한다.
+        두 목록은 독립적으로 페이지 이동할 수 있어야 하기 때문이다.
+      </p>
+    </section>
+
+    <h2>6. URL Query 설계</h2>
+    <section class="section">
+      <p>
+        매핑 화면은 새로고침해도 같은 목록 상태를 복원할 수 있도록 URL query를 사용하는 것을 권장한다.
+        주문과 광고 query가 충돌하지 않도록 prefix를 분리한다.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Query</th>
+            <th>의미</th>
+            <th>기본값</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>orderPage</code></td>
+            <td>주문 시그니처 현재 페이지</td>
+            <td><code>1</code></td>
+          </tr>
+          <tr>
+            <td><code>orderPageSize</code></td>
+            <td>주문 시그니처 페이지 크기</td>
+            <td><code>100</code> 또는 <code>200</code></td>
+          </tr>
+          <tr>
+            <td><code>orderStatus</code></td>
+            <td>주문 매핑 상태 필터</td>
+            <td><code>ALL</code></td>
+          </tr>
+          <tr>
+            <td><code>orderQ</code></td>
+            <td>주문 서버 검색어</td>
+            <td>빈 문자열</td>
+          </tr>
+          <tr>
+            <td><code>adPage</code></td>
+            <td>광고 시그니처 현재 페이지</td>
+            <td><code>1</code></td>
+          </tr>
+          <tr>
+            <td><code>adPageSize</code></td>
+            <td>광고 시그니처 페이지 크기</td>
+            <td><code>100</code> 또는 <code>200</code></td>
+          </tr>
+          <tr>
+            <td><code>adStatus</code></td>
+            <td>광고 매핑 상태 필터</td>
+            <td><code>ALL</code></td>
+          </tr>
+          <tr>
+            <td><code>adQ</code></td>
+            <td>광고 서버 검색어</td>
+            <td>빈 문자열</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        필터나 검색어가 바뀌면 해당 목록의 page는 <code>1</code>로 되돌리는 것이 안전하다.
+        예를 들어 <code>orderQ</code>가 바뀌면 <code>orderPage=1</code>로 변경한다.
+      </div>
+    </section>
+
+    <h2>7. 프론트 구현 계획</h2>
+    <section class="section">
+      <h3>7.1 page.tsx에서 searchParams 전달</h3>
+      <p>
+        <code>apps/frontend/app/(main)/mappings/page.tsx</code>가 현재 <code>storeId</code> 정도만 넘긴다면,
+        주문/광고 page/query 값을 파싱해서 <code>getMappingsPageData</code>에 전달하도록 바꾼다.
+      </p>
+
+      <pre><code>const data = await getMappingsPageData({
+  storeId,
+  order: {
+    page: Number(searchParams.orderPage ?? 1),
+    pageSize: Number(searchParams.orderPageSize ?? 100),
+    mappingStatus: parseMappingStatus(searchParams.orderStatus),
+    q: String(searchParams.orderQ ?? ""),
+  },
+  ad: {
+    page: Number(searchParams.adPage ?? 1),
+    pageSize: Number(searchParams.adPageSize ?? 100),
+    mappingStatus: parseMappingStatus(searchParams.adStatus),
+    q: String(searchParams.adQ ?? ""),
+  },
+});</code></pre>
+
+      <h3>7.2 services.ts에서 단일 페이지만 호출</h3>
+      <p>
+        현재 <code>getMappingsPageData</code>는 임시로 <code>ALL + UNMAPPED + CONFLICT</code> 첫 페이지를 병합한다.
+        페이지네이션 완성 후에는 이 병합을 제거하고, 사용자가 선택한 필터의 단일 페이지만 가져와야 한다.
+      </p>
+
+      <pre><code>const [signatureResponse, adCostResponse, campaignMappingResponse] = await Promise.all([
+  getOrderSourceSignatures(primaryStore.id, {
+    mappingStatus: order.mappingStatus,
+    q: order.q,
+    fetchAll: false,
+    page: order.page,
+    pageSize: order.pageSize,
+  }),
+  getAdCampaignSignatures(primaryStore.id, salesUnitResponse.data, {
+    mappingStatus: ad.mappingStatus,
+    q: ad.q,
+    page: ad.page,
+    pageSize: ad.pageSize,
+  }),
+  getCampaignMappings(primaryStore.id, salesUnitResponse.data),
+]);</code></pre>
+
+      <h3>7.3 fetchRecordPage가 metadata를 보존하도록 수정</h3>
+      <p>
+        현재 <code>fetchRecordPage</code>는 <code>response.data.items</code>만 <code>data</code>로 반환한다.
+        페이지 UI를 위해 <code>page</code>, <code>pageSize</code>, <code>totalCount</code>, <code>totalPages</code>, <code>hasNext</code>를 함께 보존해야 한다.
+      </p>
+
+      <pre><code>return {
+  ...response,
+  data: response.data.items,
+  page: {
+    page: response.data.page ?? params.page ?? 1,
+    pageSize: response.data.pageSize ?? params.pageSize ?? MAX_FRONTEND_PAGE_SIZE,
+    totalCount: response.data.totalCount ?? response.data.items.length,
+    totalPages: response.data.totalPages ?? 1,
+    hasNext: response.data.hasNext ?? false,
+  },
+};</code></pre>
+
+      <h3>7.4 MappingsView에 컨트롤 추가</h3>
+      <p>
+        주문 패널과 광고 패널 각각에 상태 필터, 검색 입력, 이전/다음 버튼, pageSize 선택을 추가한다.
+        기존 <code>showOnlyUnmappedOrders</code>, <code>showOnlyUnmappedAds</code> 체크박스는 서버 필터와 역할이 겹치므로 제거하거나
+        <code>mappingStatus</code> 선택 UI로 바꾸는 것이 좋다.
+      </p>
+
+      <ul>
+        <li>상태 필터: <code>ALL</code>, <code>UNMAPPED</code>, <code>CONFLICT</code>, <code>MAPPED</code></li>
+        <li>검색 입력: submit 또는 debounce 후 URL query 갱신</li>
+        <li>페이지 버튼: 이전/다음, 처음/끝은 선택</li>
+        <li>카운터: <code>총 N건 / P of T 페이지</code></li>
+        <li>pageSize: 50, 100, 200 중 선택</li>
+      </ul>
+    </section>
+
+    <h2>8. 백엔드 확인 사항</h2>
+    <section class="section">
+      <p>
+        백엔드는 이미 기본적인 page/q/status를 지원한다. 그래도 다음을 반드시 확인해야 한다.
+      </p>
+
+      <h3>8.1 주문 시그니처 API</h3>
+      <ul>
+        <li><code>GET /api/v1/order-source-signatures</code>가 <code>page</code>, <code>pageSize</code>, <code>mappingStatus</code>, <code>q</code>를 모두 받는다.</li>
+        <li><code>listOrderSourceSignatures</code>는 전체 filtered 목록을 만든 뒤 paginate하고, 해당 page의 enrichment만 수행한다.</li>
+        <li>응답에는 <code>items</code>뿐 아니라 <code>page</code>, <code>pageSize</code>, <code>totalCount</code>, <code>totalPages</code>, <code>hasNext</code>가 있어야 한다.</li>
+        <li><code>usageCount</code>가 기존 snapshot에서 비어 있어도 현재 page 관련 orderItems로 보정된다.</li>
+      </ul>
+
+      <h3>8.2 광고 시그니처 API</h3>
+      <ul>
+        <li><code>GET /api/v1/ad-campaign-signatures</code>가 <code>page</code>, <code>pageSize</code>, <code>mappingStatus</code>, <code>q</code>를 모두 받는다.</li>
+        <li>매핑 완료 항목도 <code>mappingStatus=ALL</code> 또는 <code>MAPPED</code>에서 조회되어야 한다.</li>
+        <li>삭제된 upload의 row는 active upload 기준 목록에서 빠져야 한다.</li>
+        <li>signature summary가 stale하지 않도록 삭제 경로에서 <code>refreshAdCampaignSignatureSummaries</code>가 호출된다.</li>
+      </ul>
+    </section>
+
+    <h2>9. 선택 유지 정책</h2>
+    <section class="section">
+      <p>
+        페이지네이션을 붙이면 선택 상태 정책을 반드시 정해야 한다.
+        기존 화면은 현재 로딩된 배열 안에서 선택 ID를 유지한다. 서버 페이지네이션에서는 다음 두 방식 중 하나를 택한다.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>방식</th>
+            <th>장점</th>
+            <th>단점</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>페이지 이동 시 선택 초기화</td>
+            <td>구현 단순, 사용자가 실수로 숨은 선택을 매핑할 위험이 작다.</td>
+            <td>여러 페이지에서 모아 선택하는 작업은 불가능하다.</td>
+          </tr>
+          <tr>
+            <td>페이지 이동 후에도 선택 유지</td>
+            <td>여러 페이지 항목을 한 번에 매핑할 수 있다.</td>
+            <td>숨겨진 선택 개수 표시와 해제 UI가 꼭 필요하다.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout warning">
+        권장 1차 구현은 "페이지/검색/필터 변경 시 선택 초기화"다.
+        기존 hidden selected UI를 유지하려면 복잡도가 올라가므로, 먼저 단순하고 안전한 정책으로 시작하는 편이 좋다.
+      </div>
+    </section>
+
+    <h2>10. 테스트 계획</h2>
+    <section class="section">
+      <table>
+        <thead>
+          <tr>
+            <th>영역</th>
+            <th>검증 내용</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>백엔드 주문 목록</td>
+            <td>시그니처 250개 생성 후 page 1/2가 서로 다른 항목을 반환하고 totalCount가 250인지 확인</td>
+          </tr>
+          <tr>
+            <td>백엔드 광고 목록</td>
+            <td>광고 시그니처 250개 생성 후 page 1/2, MAPPED/UNMAPPED/CONFLICT 필터가 정상인지 확인</td>
+          </tr>
+          <tr>
+            <td>서버 검색</td>
+            <td>2페이지에 있는 항목도 q 검색 시 page 1 결과로 찾을 수 있는지 확인</td>
+          </tr>
+          <tr>
+            <td>프론트 타입</td>
+            <td><code>MappingsPageData</code> metadata 추가 후 frontend typecheck 통과</td>
+          </tr>
+          <tr>
+            <td>매핑 저장</td>
+            <td>2페이지 항목을 선택해 주문/광고 수동 매핑 저장이 되는지 확인</td>
+          </tr>
+          <tr>
+            <td>필터 변경</td>
+            <td>상태 필터나 검색어 변경 시 page가 1로 리셋되는지 확인</td>
+          </tr>
+          <tr>
+            <td>회귀</td>
+            <td>원장 데이터인 <code>orderItems</code>, <code>adCampaignDailyCosts</code>가 삭제/축소되지 않는지 확인</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p class="small">
+        필수 실행: <code>npm.cmd run test --workspace @patima/backend</code>,
+        <code>npm.cmd run lint</code>.
+      </p>
+    </section>
+
+    <h2>11. 주의점</h2>
+    <section class="section">
+      <ul>
+        <li>
+          <strong>전체 fetch 부활 금지:</strong>
+          <code>fetchAllRecordPages</code>를 매핑 화면 기본 로딩에 다시 사용하면 0518 개선 목적이 무너진다.
+        </li>
+        <li>
+          <strong>원장 row 삭제 금지:</strong>
+          페이지네이션은 UI 조회 방식 변경일 뿐, <code>orderItems</code>나 <code>adCampaignDailyCosts</code>를 줄이는 작업이 아니다.
+        </li>
+        <li>
+          <strong>시그니처 기준 유지:</strong>
+          광고 매핑 화면은 일별 광고 row가 아니라 <code>adCampaignSignatures</code>를 보여주는 방향을 유지한다.
+        </li>
+        <li>
+          <strong>검색은 서버에서:</strong>
+          프론트 배열 필터만으로는 2페이지 이후 항목을 찾을 수 없다. 반드시 API <code>q</code>에 연결한다.
+        </li>
+        <li>
+          <strong>필터와 page 리셋:</strong>
+          검색어, 상태 필터, pageSize가 바뀌면 해당 목록 page를 1로 되돌린다.
+        </li>
+        <li>
+          <strong>선택 상태:</strong>
+          페이지 이동 시 선택을 유지한다면 숨겨진 선택을 명확히 보여주고 일괄 해제 버튼을 제공해야 한다.
+        </li>
+        <li>
+          <strong>수동 매핑 우선:</strong>
+          <code>confirmedAt</code> 있는 주문/광고 시그니처는 자동 재계산이 덮지 않아야 한다.
+        </li>
+        <li>
+          <strong>광고 과거 row 반영 주의:</strong>
+          캠페인 규칙 변경만으로 과거 <code>adCampaignDailyCosts</code> row를 일괄 수정하지 않는다.
+        </li>
+      </ul>
+    </section>
+
+    <h2>12. 구현 순서</h2>
+    <section class="section">
+      <ol>
+        <li>
+          <strong>현재 코드 확인</strong>
+          <br />
+          <code>0518수정계획.html</code>, <code>기존코드관찰.md</code>, 그리고 이 문서를 읽고 현재 0518 변경사항이 반영된 워크트리인지 확인한다.
+        </li>
+        <li>
+          <strong>타입 확장</strong>
+          <br />
+          <code>MappingsPageData</code>에 주문/광고 page metadata와 query state를 추가한다.
+        </li>
+        <li>
+          <strong>SSR query 연결</strong>
+          <br />
+          <code>app/(main)/mappings/page.tsx</code>에서 URL searchParams를 파싱해 <code>getMappingsPageData</code>에 넘긴다.
+        </li>
+        <li>
+          <strong>services.ts 병합 bridge 제거</strong>
+          <br />
+          현재의 <code>ALL + UNMAPPED + CONFLICT</code> 병합을 제거하고, 선택된 상태 필터의 단일 page만 가져온다.
+        </li>
+        <li>
+          <strong>UI 컨트롤 추가</strong>
+          <br />
+          주문/광고 패널 각각에 검색, 상태 필터, pageSize, 이전/다음 버튼, 총 건수 표시를 추가한다.
+        </li>
+        <li>
+          <strong>선택 정책 구현</strong>
+          <br />
+          1차 구현에서는 페이지/검색/필터 변경 시 선택을 초기화하는 정책을 권장한다.
+        </li>
+        <li>
+          <strong>테스트 추가</strong>
+          <br />
+          백엔드 목록 API page/q/status 테스트를 추가하고, 프론트 typecheck를 통과시킨다.
+        </li>
+        <li>
+          <strong>검증</strong>
+          <br />
+          <code>npm.cmd run test --workspace @patima/backend</code>, <code>npm.cmd run lint</code> 실행.
+        </li>
+      </ol>
+    </section>
+
+    <h2>13. 완료 기준</h2>
+    <section class="section">
+      <ul>
+        <li>매핑 화면에서 주문 시그니처 200건 이후 페이지로 이동할 수 있다.</li>
+        <li>매핑 화면에서 광고 캠페인 시그니처 200건 이후 페이지로 이동할 수 있다.</li>
+        <li>서버 검색으로 현재 로딩되지 않은 페이지의 항목도 찾을 수 있다.</li>
+        <li>상태 필터 <code>ALL</code>, <code>MAPPED</code>, <code>UNMAPPED</code>, <code>CONFLICT</code>가 주문/광고 모두 정상 동작한다.</li>
+        <li>페이지 이동/검색/필터 변경 시 선택 상태가 의도한 정책대로 정리된다.</li>
+        <li>수동 매핑 저장 후 현재 페이지 데이터가 최신 상태로 refresh된다.</li>
+        <li>기존 손익 계산 결과는 변하지 않는다.</li>
+        <li>매핑 화면 기본 진입에서 전체 페이지를 끝까지 fetch하지 않는다.</li>
+      </ul>
+
+      <div class="callout good">
+        <strong>한 줄 요약:</strong>
+        0518 작업이 "전체 fetch 중단과 시그니처 구조 도입"이었다면, 0519 작업은 "그 구조를 실제 운영 가능한 페이지네이션 UI로 완성"하는 것이다.
+      </div>
+    </section>
+  </main>
+</body>
+</html>

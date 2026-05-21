@@ -3,7 +3,7 @@ import { CampaignSalesUnitMapping, DatabaseShape, normalizeText } from "@patima/
 import { AuditLogService } from "./audit-log.service";
 import {
   normalizeCampaignPattern,
-  recalculateAdMappingsForStore,
+  recalculateAdCampaignSignaturesForStore,
 } from "./ad-mapping-engine";
 import { DatabaseService } from "./database.service";
 import {
@@ -39,7 +39,7 @@ export class CampaignMappingService implements OnModuleInit {
 
       this.databaseService.write((draft) => {
         this.seedDefaultCampaignMappingsForStore(draft, storeId);
-        recalculateAdMappingsForStore(draft, storeId);
+        recalculateAdCampaignSignaturesForStore(draft, storeId, { onlyUnconfirmed: true });
       });
     });
   }
@@ -360,13 +360,16 @@ export class CampaignMappingService implements OnModuleInit {
 
   async recalculate(storeId: string) {
     this.databaseService.write((draft) => {
-      recalculateAdMappingsForStore(draft, storeId);
+      recalculateAdCampaignSignaturesForStore(draft, storeId, { onlyUnconfirmed: true });
     });
 
     return {
       recalculatedAdRows: this.databaseService
         .getSnapshot()
         .adCampaignDailyCosts.filter((item) => item.storeId === storeId).length,
+      recalculatedAdSignatures: this.databaseService
+        .getSnapshot()
+        .adCampaignSignatures.filter((item) => item.storeId === storeId && !item.confirmedAt).length,
     };
   }
 }

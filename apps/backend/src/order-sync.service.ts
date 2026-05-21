@@ -16,7 +16,7 @@ import {
 } from "./helpers";
 import { NaverCommerceService, SyncedOrderItemInput } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
-import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
+import { recalculateOrderMappingsForTouchedItems } from "./sales-unit-auto-mapper";
 import { enrichSignatureDisplayName, type EnrichmentContext } from "./signature-enrichment";
 
 interface OrderTemplate {
@@ -236,6 +236,9 @@ export class OrderSyncService implements OnModuleInit {
       let paymentDateMissingCount = 0;
 
       this.databaseService.write((draft) => {
+        const touchedSignatureIds = new Set<string>();
+        const touchedOrderItemIds = new Set<string>();
+
         entries.forEach((entry) => {
           const product = this.upsertProduct(draft, storeId, entry);
           const existingSignature = draft.orderSourceSignatures.find(
@@ -282,11 +285,18 @@ export class OrderSyncService implements OnModuleInit {
           const existingItem = draft.orderItems.find(
             (item) => item.storeId === storeId && item.externalProductOrderId === entry.externalProductOrderId,
           );
+          const previousSignatureId = existingItem?.orderSourceSignatureId ?? null;
           if (entry.saleStatus === "UNKNOWN") {
             unknownOrderStatusCount += 1;
           }
           if (!entry.paymentDate) {
             paymentDateMissingCount += 1;
+          }
+
+          this.updateSignatureUsageSummary(draft, signature, entry, previousSignatureId, !existingItem);
+          touchedSignatureIds.add(signature.id);
+          if (previousSignatureId && previousSignatureId !== signature.id) {
+            touchedSignatureIds.add(previousSignatureId);
           }
 
           const payload: OrderItem = {
@@ -336,10 +346,15 @@ export class OrderSyncService implements OnModuleInit {
           } else {
             draft.orderItems.push(payload);
           }
+          touchedOrderItemIds.add(payload.id);
           orderItemsUpserted += 1;
         });
 
-        recalculateOrderMappingsForStore(draft, storeId);
+        recalculateOrderMappingsForTouchedItems(draft, {
+          storeId,
+          signatureIds: touchedSignatureIds,
+          orderItemIds: touchedOrderItemIds,
+        });
 
         const targetStore = ensureStoreExists(draft, storeId);
         targetStore.lastOrderSyncAt = nowIso();
@@ -453,23 +468,7 @@ export class OrderSyncService implements OnModuleInit {
   }) {
     const keyword = query.q ? normalizeText(query.q) : null;
     const snapshot = this.databaseService.getSnapshot();
-    const usageMap = new Map<string, number>();
-    // 시그니처별 대표 externalProductId/optionCode 수집 (UI에서 ID매핑/텍스트매핑 구분용)
-    const signatureExternalProductIdMap = new Map<string, string>();
-    const signatureOptionCodeMap = new Map<string, string>();
-    snapshot.orderItems
-      .filter((item) => item.storeId === query.storeId && item.orderSourceSignatureId)
-      .forEach((item) => {
-        usageMap.set(item.orderSourceSignatureId!, (usageMap.get(item.orderSourceSignatureId!) ?? 0) + 1);
-        // 첫 번째로 발견된 값을 대표값으로 사용
-        if (item.externalProductId && !signatureExternalProductIdMap.has(item.orderSourceSignatureId!)) {
-          signatureExternalProductIdMap.set(item.orderSourceSignatureId!, item.externalProductId);
-        }
-        if (item.optionCode && !signatureOptionCodeMap.has(item.orderSourceSignatureId!)) {
-          signatureOptionCodeMap.set(item.orderSourceSignatureId!, item.optionCode);
-        }
-      });
-
+    const salesUnitsById = new Map(snapshot.canonicalSalesUnits.map((item) => [item.id, item]));
     const filteredSignatures = snapshot.orderSourceSignatures
       .filter((item) => item.storeId === query.storeId)
       .filter((item) =>
@@ -477,23 +476,51 @@ export class OrderSyncService implements OnModuleInit {
           ? getSignatureMappingStatus(item) === query.mappingStatus
           : true,
       )
-      .filter((item) =>
-        keyword
-          ? normalizeText(item.rawProductNameSnapshot).includes(keyword) ||
-            normalizeText(item.rawOptionInfoSnapshot ?? "").includes(keyword) ||
-            normalizeText(item.sourceSignature).includes(keyword)
-          : true,
-      )
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      .filter((item) => {
+        if (!keyword) {
+          return true;
+        }
 
-    // Precompute context to avoid N+1 queries during enrichment
-    // Build map of signature ID -> related order items
+        const salesUnitDisplayName = item.canonicalSalesUnitId
+          ? salesUnitsById.get(item.canonicalSalesUnitId)?.displayName
+          : null;
+        return (
+          normalizeText(item.rawProductNameSnapshot).includes(keyword) ||
+          normalizeText(item.rawOptionInfoSnapshot ?? "").includes(keyword) ||
+          normalizeText(item.sourceSignature).includes(keyword) ||
+          normalizeText(salesUnitDisplayName).includes(keyword)
+        );
+      })
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const pageResult = paginate(filteredSignatures, query.page, query.pageSize);
+    const pageSignatureIds = new Set(pageResult.items.map((item) => item.id));
+
+    // Precompute context to avoid N+1 queries during enrichment.
+    // Also rebuild page-level usage as a compatibility guard for already-running
+    // snapshots that have not passed through normalizeSnapshot after the summary
+    // fields were introduced.
     const signatureItemsMap = new Map<string, typeof snapshot.orderItems>();
-    filteredSignatures.forEach((sig) => {
-      const relatedItems = snapshot.orderItems.filter(
-        (item) => item.orderSourceSignatureId === sig.id,
-      );
-      signatureItemsMap.set(sig.id, relatedItems);
+    const pageUsageMap = new Map<string, number>();
+    const pageExternalProductIdMap = new Map<string, string>();
+    const pageOptionCodeMap = new Map<string, string>();
+    const pageOptionManageCodeMap = new Map<string, string>();
+    snapshot.orderItems.forEach((item) => {
+      if (!item.orderSourceSignatureId || !pageSignatureIds.has(item.orderSourceSignatureId)) {
+        return;
+      }
+      const relatedItems = signatureItemsMap.get(item.orderSourceSignatureId) ?? [];
+      relatedItems.push(item);
+      signatureItemsMap.set(item.orderSourceSignatureId, relatedItems);
+      pageUsageMap.set(item.orderSourceSignatureId, (pageUsageMap.get(item.orderSourceSignatureId) ?? 0) + 1);
+      if (item.externalProductId && !pageExternalProductIdMap.has(item.orderSourceSignatureId)) {
+        pageExternalProductIdMap.set(item.orderSourceSignatureId, item.externalProductId);
+      }
+      if (item.optionCode && !pageOptionCodeMap.has(item.orderSourceSignatureId)) {
+        pageOptionCodeMap.set(item.orderSourceSignatureId, item.optionCode);
+      }
+      if (item.optionManageCode && !pageOptionManageCodeMap.has(item.orderSourceSignatureId)) {
+        pageOptionManageCodeMap.set(item.orderSourceSignatureId, item.optionManageCode);
+      }
     });
 
     // Build map of (externalProductId:storeId) -> product info
@@ -506,7 +533,7 @@ export class OrderSyncService implements OnModuleInit {
     const enrichmentContext = { signatureItemsMap, productsByIdMap };
 
     const items = await Promise.all(
-      filteredSignatures.map(async (item) => {
+      pageResult.items.map(async (item) => {
         const salesUnit = snapshot.canonicalSalesUnits.find((entry) => entry.id === item.canonicalSalesUnitId);
         const enriched = await enrichSignatureDisplayName(snapshot, item, enrichmentContext);
         return {
@@ -517,9 +544,10 @@ export class OrderSyncService implements OnModuleInit {
           mappingStatus: getSignatureMappingStatus(item),
           canonicalSalesUnitId: item.canonicalSalesUnitId,
           canonicalDisplayName: salesUnit?.displayName ?? null,
-          usageCount: usageMap.get(item.id) ?? 0,
-          externalProductId: signatureExternalProductIdMap.get(item.id) ?? null,
-          optionCode: signatureOptionCodeMap.get(item.id) ?? null,
+          usageCount: Math.max(item.usageCount ?? 0, pageUsageMap.get(item.id) ?? 0),
+          externalProductId: item.sampleExternalProductId ?? pageExternalProductIdMap.get(item.id) ?? null,
+          optionCode: item.sampleOptionCode ?? pageOptionCodeMap.get(item.id) ?? null,
+          optionManageCode: item.sampleOptionManageCode ?? pageOptionManageCodeMap.get(item.id) ?? null,
           fallbackProductName: enriched.fallbackProductName,
           fallbackProductNameSource: enriched.fallbackProductNameSource,
           storeSlug: null,
@@ -527,7 +555,53 @@ export class OrderSyncService implements OnModuleInit {
       })
     );
 
-    return formatApiSuccess(paginate(items, query.page, query.pageSize));
+    return formatApiSuccess({
+      ...pageResult,
+      items,
+    });
+  }
+
+  private updateSignatureUsageSummary(
+    draft: ReturnType<DatabaseService["getSnapshot"]>,
+    signature: OrderSourceSignature,
+    entry: SyncedOrderItemInput,
+    previousSignatureId: string | null,
+    isNewItem: boolean,
+  ): void {
+    const seenAt = entry.paymentDate ?? entry.orderDate ?? nowIso();
+    const shouldIncrement = isNewItem || previousSignatureId !== signature.id;
+
+    if (previousSignatureId && previousSignatureId !== signature.id) {
+      const previousSignature = draft.orderSourceSignatures.find((item) => item.id === previousSignatureId);
+      if (previousSignature) {
+        previousSignature.usageCount = Math.max(0, (previousSignature.usageCount ?? 0) - 1);
+        previousSignature.updatedAt = nowIso();
+      }
+    }
+
+    if (shouldIncrement) {
+      signature.usageCount = (signature.usageCount ?? 0) + 1;
+      if (!signature.firstSeenAt || seenAt < signature.firstSeenAt) {
+        signature.firstSeenAt = seenAt;
+      }
+    }
+
+    if (!signature.firstSeenAt) {
+      signature.firstSeenAt = seenAt;
+    }
+    if (!signature.lastSeenAt || seenAt > signature.lastSeenAt) {
+      signature.lastSeenAt = seenAt;
+    }
+    if (entry.externalProductId && !signature.sampleExternalProductId) {
+      signature.sampleExternalProductId = entry.externalProductId;
+    }
+    if (entry.optionCode && !signature.sampleOptionCode) {
+      signature.sampleOptionCode = entry.optionCode;
+    }
+    if (entry.optionManageCode && !signature.sampleOptionManageCode) {
+      signature.sampleOptionManageCode = entry.optionManageCode;
+    }
+    signature.updatedAt = nowIso();
   }
 
   private upsertProduct(
@@ -586,6 +660,14 @@ export class OrderSyncService implements OnModuleInit {
       existing.rawProductNameSnapshot = rawProductName;
       existing.rawOptionInfoSnapshot = rawOptionInfo;
       existing.sourceSignature = rawToSourceSignature(rawProductName, rawOptionInfo);
+      existing.usageCount = existing.usageCount ?? 0;
+      existing.firstSeenAt = existing.firstSeenAt ?? existing.createdAt ?? null;
+      existing.lastSeenAt = existing.lastSeenAt ?? existing.updatedAt ?? null;
+      existing.sampleExternalProductId = existing.sampleExternalProductId ?? null;
+      existing.sampleOptionCode = existing.sampleOptionCode ?? null;
+      existing.sampleOptionManageCode = existing.sampleOptionManageCode ?? null;
+      existing.lastAutoMappedAt = existing.lastAutoMappedAt ?? null;
+      existing.mappingRuleHash = existing.mappingRuleHash ?? null;
       existing.updatedAt = nowIso();
       return existing;
     }
@@ -601,6 +683,14 @@ export class OrderSyncService implements OnModuleInit {
       canonicalSalesUnitId: null,
       mappingStatus: "UNMAPPED",
       confirmedAt: null,
+      usageCount: 0,
+      firstSeenAt: null,
+      lastSeenAt: null,
+      sampleExternalProductId: null,
+      sampleOptionCode: null,
+      sampleOptionManageCode: null,
+      lastAutoMappedAt: null,
+      mappingRuleHash: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };

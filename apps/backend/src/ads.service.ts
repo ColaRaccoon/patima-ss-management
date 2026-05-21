@@ -9,10 +9,13 @@ import {
 import * as XLSX from "xlsx";
 import { AuditLogService } from "./audit-log.service";
 import {
-  evaluateAdMapping,
-  getAdMappingOverride,
+  applyAdCampaignSignatureToRows,
+  ensureAdCampaignSignaturesForStore,
   getOverrideSnapshotHash,
   getRuleSnapshotHash,
+  recalculateAdCampaignSignaturesForStore,
+  refreshAdCampaignSignatureSummaries,
+  upsertAdCampaignSignature,
 } from "./ad-mapping-engine";
 import { DatabaseService } from "./database.service";
 import {
@@ -40,6 +43,17 @@ export const AD_UPLOAD_REQUIRED_HEADERS = [
 ];
 
 const WEEKDAYS = new Set(["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]);
+
+const toDisplayMappingReasonAlias = (value: string | null | undefined) => {
+  switch (value) {
+    case "NO_RULE":
+      return "NO_RULE_MATCH";
+    case "MULTIPLE_RULES":
+      return "MULTIPLE_RULE_MATCHES";
+    default:
+      return value ?? "";
+  }
+};
 
 @Injectable()
 export class AdsService implements OnModuleInit {
@@ -139,49 +153,55 @@ export class AdsService implements OnModuleInit {
       updatedAt: nowIso(),
     };
 
-    const confirmedRows: AdCampaignDailyCost[] = campaigns.map((campaign) => {
-      const normalizedCampaignName = normalizeText(campaign.campaignName);
-      const inheritedOverride = this.findInheritedOverride(
-        activeConfirmedRows,
-        campaign.campaignId,
-        normalizedCampaignName,
-      );
-      const mapping = evaluateAdMapping(
-        snapshot,
-        storeId,
-        normalizedCampaignName,
-        inheritedOverride ? getAdMappingOverride(inheritedOverride) : null,
-      );
-      return {
-        id: createId(),
-        uploadId: upload.id,
-        sourceUploadId: upload.id,
-        storeId,
-        reportDate,
-        campaignId: campaign.campaignId,
-        campaignName: campaign.campaignName,
-        normalizedCampaignName,
-        weekday: campaign.weekday,
-        adType: campaign.adType,
-        status: campaign.status,
-        totalCost: campaign.totalCost,
-        impressions: campaign.impressions,
-        clicks: campaign.clicks,
-        totalConversions: campaign.totalConversions,
-        totalConversionSales: campaign.totalConversionSales,
-        matchedRuleCount: mapping.matchedRuleCount,
-        canonicalSalesUnitId: mapping.canonicalSalesUnitId,
-        mappingReason: mapping.mappingReason,
-        reasonNote: mapping.reasonNote,
-        reasonNoteInherited: mapping.reasonNoteInherited,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-      };
-    });
+    const confirmedRows: AdCampaignDailyCost[] = [];
 
     this.databaseService.write((draft) => {
+      const touchedSignatureIds = new Set<string>();
       draft.adExcelUploads.push(upload);
-      draft.adCampaignDailyCosts.push(...confirmedRows);
+      campaigns.forEach((campaign) => {
+        const normalizedCampaignName = normalizeText(campaign.campaignName);
+        const signature = upsertAdCampaignSignature(draft, {
+          storeId,
+          campaignId: campaign.campaignId,
+          campaignName: campaign.campaignName,
+          normalizedCampaignName,
+          reportDate,
+        });
+        touchedSignatureIds.add(signature.id);
+        const confirmed: AdCampaignDailyCost = {
+          id: createId(),
+          uploadId: upload.id,
+          sourceUploadId: upload.id,
+          adCampaignSignatureId: signature.id,
+          storeId,
+          reportDate,
+          campaignId: campaign.campaignId,
+          campaignName: campaign.campaignName,
+          normalizedCampaignName,
+          weekday: campaign.weekday,
+          adType: campaign.adType,
+          status: campaign.status,
+          totalCost: campaign.totalCost,
+          impressions: campaign.impressions,
+          clicks: campaign.clicks,
+          totalConversions: campaign.totalConversions,
+          totalConversionSales: campaign.totalConversionSales,
+          matchedRuleCount: signature.matchedRuleCount,
+          canonicalSalesUnitId: signature.canonicalSalesUnitId,
+          mappingReason: signature.mappingReason,
+          reasonNote: signature.reasonNote,
+          reasonNoteInherited: signature.reasonNoteInherited,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        };
+        confirmedRows.push(confirmed);
+        draft.adCampaignDailyCosts.push(confirmed);
+      });
+      recalculateAdCampaignSignaturesForStore(draft, storeId, {
+        signatureIds: touchedSignatureIds,
+        applyToRowsFrom: reportDate,
+        applyToRowsTo: reportDate,
+      });
     });
 
     this.auditLogService.record({
@@ -277,8 +297,17 @@ export class AdsService implements OnModuleInit {
     const wasActive = upload.isActive;
 
     this.databaseService.write((draft) => {
+      const affectedSignatureIds = new Set(
+        draft.adCampaignDailyCosts
+          .filter((item) => item.sourceUploadId === upload.id && item.adCampaignSignatureId)
+          .map((item) => item.adCampaignSignatureId!),
+      );
       draft.adUploadPreviewRows = draft.adUploadPreviewRows.filter((item) => item.uploadId !== upload.id);
       draft.adCampaignDailyCosts = draft.adCampaignDailyCosts.filter((item) => item.sourceUploadId !== upload.id);
+      refreshAdCampaignSignatureSummaries(draft, {
+        storeId: upload.storeId,
+        signatureIds: affectedSignatureIds,
+      });
 
       const target = draft.adExcelUploads.find((item) => item.id === upload.id)!;
       target.state = "DELETED";
@@ -398,13 +427,28 @@ export class AdsService implements OnModuleInit {
     );
 
     this.databaseService.write((draft) => {
+      const touchedSignatureIds = new Set<string>();
       draft.adCampaignDailyCosts = draft.adCampaignDailyCosts.filter((item) => item.sourceUploadId !== upload.id);
       previewRows.forEach((row) => {
+        const signature = upsertAdCampaignSignature(draft, {
+          storeId: upload.storeId,
+          campaignId: row.campaignId,
+          campaignName: row.campaignName,
+          normalizedCampaignName: row.normalizedCampaignName,
+          reportDate: row.reportDate,
+        });
+        touchedSignatureIds.add(signature.id);
         const confirmed: AdCampaignDailyCost = {
           ...row,
           sourceUploadId: upload.id,
+          adCampaignSignatureId: signature.id,
         };
         draft.adCampaignDailyCosts.push(confirmed);
+      });
+      recalculateAdCampaignSignaturesForStore(draft, upload.storeId, {
+        signatureIds: touchedSignatureIds,
+        applyToRowsFrom: upload.reportDate,
+        applyToRowsTo: upload.reportDate,
       });
 
       const target = draft.adExcelUploads.find((item) => item.id === upload.id)!;
@@ -460,6 +504,105 @@ export class AdsService implements OnModuleInit {
         status: repairMojibakeText(item.status),
         reasonNote: repairMojibakeText(item.reasonNote),
       }));
+
+    return formatApiSuccess(paginate(items, query.page, query.pageSize));
+  }
+
+  listAdCampaignSignatures(query: {
+    storeId: string;
+    dateFrom?: string;
+    dateTo?: string;
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+    q?: string;
+    page?: number;
+    pageSize?: number;
+  }) {
+    const snapshot = this.databaseService.getSnapshot();
+    const activeUploadIds = getActiveConfirmedUploadIds(snapshot, query.storeId);
+    const keyword = query.q ? normalizeText(query.q) : null;
+    const rowsBySignatureId = new Map<string, AdCampaignDailyCost[]>();
+    const salesUnitsById = new Map(snapshot.canonicalSalesUnits.map((item) => [item.id, item]));
+
+    snapshot.adCampaignDailyCosts
+      .filter((row) => row.storeId === query.storeId && activeUploadIds.has(row.sourceUploadId))
+      .filter((row) => (query.dateFrom ? row.reportDate >= query.dateFrom : true))
+      .filter((row) => (query.dateTo ? row.reportDate <= query.dateTo : true))
+      .forEach((row) => {
+        if (!row.adCampaignSignatureId) {
+          return;
+        }
+        const rows = rowsBySignatureId.get(row.adCampaignSignatureId) ?? [];
+        rows.push(row);
+        rowsBySignatureId.set(row.adCampaignSignatureId, rows);
+      });
+
+    const signatures = snapshot.adCampaignSignatures
+      .filter((signature) => signature.storeId === query.storeId)
+      .filter((signature) => rowsBySignatureId.has(signature.id))
+      .filter((signature) =>
+        query.mappingStatus && query.mappingStatus !== "ALL"
+          ? getAdMappingStatus(signature) === query.mappingStatus
+          : true,
+      )
+      .filter((signature) => {
+        if (!keyword) {
+          return true;
+        }
+
+        const rows = rowsBySignatureId.get(signature.id) ?? [];
+        const salesUnitDisplayName = signature.canonicalSalesUnitId
+          ? salesUnitsById.get(signature.canonicalSalesUnitId)?.displayName
+          : null;
+        const reasonNote = repairMojibakeText(signature.reasonNote);
+        const mappingReasonAlias = toDisplayMappingReasonAlias(signature.mappingReason);
+        return (
+          normalizeText(signature.campaignNameSnapshot).includes(keyword) ||
+          normalizeText(repairMojibakeText(signature.campaignNameSnapshot)).includes(keyword) ||
+          normalizeText(signature.normalizedCampaignName).includes(keyword) ||
+          normalizeText(signature.campaignId ?? "").includes(keyword) ||
+          normalizeText(salesUnitDisplayName).includes(keyword) ||
+          normalizeText(signature.mappingReason).includes(keyword) ||
+          normalizeText(mappingReasonAlias).includes(keyword) ||
+          normalizeText(reasonNote).includes(keyword) ||
+          normalizeText(signature.firstSeenDate).includes(keyword) ||
+          normalizeText(signature.lastSeenDate).includes(keyword) ||
+          rows.some((row) => normalizeText(row.reportDate).includes(keyword))
+        );
+      })
+      .sort((left, right) =>
+        (right.lastSeenDate ?? right.updatedAt).localeCompare(left.lastSeenDate ?? left.updatedAt),
+      );
+
+    const items = signatures.map((signature) => {
+      const rows = rowsBySignatureId.get(signature.id) ?? [];
+      const latestRow = rows
+        .slice()
+        .sort((left, right) =>
+          `${right.reportDate}:${right.updatedAt}`.localeCompare(`${left.reportDate}:${left.updatedAt}`),
+        )[0];
+
+      return {
+        id: signature.id,
+        adCampaignSignatureId: signature.id,
+        uploadId: latestRow?.sourceUploadId ?? signature.id,
+        sourceUploadId: latestRow?.sourceUploadId ?? signature.id,
+        storeId: signature.storeId,
+        reportDate: signature.lastSeenDate ?? latestRow?.reportDate ?? "",
+        campaignId: signature.campaignId ?? latestRow?.campaignId ?? "",
+        campaignName: repairMojibakeText(signature.campaignNameSnapshot),
+        normalizedCampaignName: signature.normalizedCampaignName,
+        totalCost: rows.reduce((sum, row) => sum + row.totalCost, 0),
+        matchedRuleCount: signature.matchedRuleCount,
+        canonicalSalesUnitId: signature.canonicalSalesUnitId,
+        mappingReason: signature.mappingReason,
+        reasonNote: repairMojibakeText(signature.reasonNote),
+        reasonNoteInherited: signature.reasonNoteInherited,
+        usageCount: signature.usageCount ?? rows.length,
+        firstSeenDate: signature.firstSeenDate,
+        lastSeenDate: signature.lastSeenDate,
+        confirmedAt: signature.confirmedAt,
+      };
+    });
 
     return formatApiSuccess(paginate(items, query.page, query.pageSize));
   }
@@ -523,21 +666,26 @@ export class AdsService implements OnModuleInit {
   }
 
   private setIntentionalUnmappedInternal(adCostIds: string[], payload: { reasonNote: string }) {
-    const { dedupedIds, storeId } = this.resolveAdCostBatch(adCostIds);
+    const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds);
     this.storeService.ensureWritable(storeId);
-    const targetIds = new Set(dedupedIds);
     const timestamp = nowIso();
     this.databaseService.write((draft) => {
-      draft.adCampaignDailyCosts.forEach((item) => {
-        if (!targetIds.has(item.id)) {
+      const targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
+      draft.adCampaignSignatures.forEach((signature) => {
+        if (!targetSignatureIds.has(signature.id)) {
           return;
         }
-        item.canonicalSalesUnitId = null;
-        item.matchedRuleCount = 0;
-        item.mappingReason = "INTENTIONALLY_UNMAPPED";
-        item.reasonNote = payload.reasonNote;
-        item.reasonNoteInherited = false;
-        item.updatedAt = timestamp;
+        signature.canonicalSalesUnitId = null;
+        signature.matchedRuleCount = 0;
+        signature.mappingReason = "INTENTIONALLY_UNMAPPED";
+        signature.reasonNote = payload.reasonNote;
+        signature.reasonNoteInherited = false;
+        signature.confirmedAt = timestamp;
+        signature.updatedAt = timestamp;
+      });
+      applyAdCampaignSignatureToRows(draft, {
+        storeId,
+        signatureIds: targetSignatureIds,
       });
     });
 
@@ -546,7 +694,7 @@ export class AdsService implements OnModuleInit {
 
   private saveManualMappingsInternal(adCostIds: string[], payload: { canonicalSalesUnitId: string }) {
     const snapshot = this.databaseService.getSnapshot();
-    const { dedupedIds, storeId, adCosts } = this.resolveAdCostBatch(adCostIds, snapshot);
+    const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds, snapshot);
     const salesUnit = snapshot.canonicalSalesUnits.find(
       (item) => item.id === payload.canonicalSalesUnitId,
     );
@@ -574,28 +722,25 @@ export class AdsService implements OnModuleInit {
       });
     }
 
-    if (adCosts.some((item) => item.storeId !== storeId)) {
-      throw new BadRequestException({
-        success: false,
-        message: "같은 스토어의 광고 row만 함께 수정할 수 있습니다.",
-        errors: [{ field: "adCostIds", reason: "CROSS_STORE_REFERENCE" }],
-      });
-    }
-
     this.storeService.ensureWritable(storeId);
-    const targetIds = new Set(dedupedIds);
     const timestamp = nowIso();
     this.databaseService.write((draft) => {
-      draft.adCampaignDailyCosts.forEach((item) => {
-        if (!targetIds.has(item.id)) {
+      const targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
+      draft.adCampaignSignatures.forEach((signature) => {
+        if (!targetSignatureIds.has(signature.id)) {
           return;
         }
-        item.canonicalSalesUnitId = payload.canonicalSalesUnitId;
-        item.matchedRuleCount = 0;
-        item.mappingReason = "MANUAL_MAPPED";
-        item.reasonNote = null;
-        item.reasonNoteInherited = false;
-        item.updatedAt = timestamp;
+        signature.canonicalSalesUnitId = payload.canonicalSalesUnitId;
+        signature.matchedRuleCount = 0;
+        signature.mappingReason = "MANUAL_MAPPED";
+        signature.reasonNote = null;
+        signature.reasonNoteInherited = false;
+        signature.confirmedAt = timestamp;
+        signature.updatedAt = timestamp;
+      });
+      applyAdCampaignSignatureToRows(draft, {
+        storeId,
+        signatureIds: targetSignatureIds,
       });
     });
 
@@ -604,41 +749,33 @@ export class AdsService implements OnModuleInit {
 
   private recalculateMappingsInternal(adCostIds: string[]) {
     const snapshot = this.databaseService.getSnapshot();
-    const { dedupedIds, storeId, adCosts } = this.resolveAdCostBatch(adCostIds, snapshot);
+    const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds, snapshot);
     this.storeService.ensureWritable(storeId);
-    const targetIds = new Set(dedupedIds);
-    const mappings = adCosts.map((item) => ({
-      adCostId: item.id,
-      ...evaluateAdMapping(snapshot, item.storeId, item.normalizedCampaignName),
-    }));
-    const mappingById = new Map(mappings.map((item) => [item.adCostId, item]));
-    const timestamp = nowIso();
+    let targetSignatureIds = new Set<string>();
     this.databaseService.write((draft) => {
-      draft.adCampaignDailyCosts.forEach((item) => {
-        if (!targetIds.has(item.id)) {
-          return;
-        }
-        const mapping = mappingById.get(item.id);
-        if (!mapping) {
-          return;
-        }
-        item.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
-        item.matchedRuleCount = mapping.matchedRuleCount;
-        item.mappingReason = mapping.mappingReason;
-        item.reasonNote = mapping.reasonNote;
-        item.reasonNoteInherited = mapping.reasonNoteInherited;
-        item.updatedAt = timestamp;
+      targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
+      recalculateAdCampaignSignaturesForStore(draft, storeId, {
+        signatureIds: targetSignatureIds,
+        applyToRows: true,
       });
+    });
+    const nextSnapshot = this.databaseService.getSnapshot();
+    const signaturesById = new Map(nextSnapshot.adCampaignSignatures.map((signature) => [signature.id, signature]));
+    const rowsById = new Map(nextSnapshot.adCampaignDailyCosts.map((row) => [row.id, row]));
+    const mappings = dedupedIds.map((id) => {
+      const row = rowsById.get(id);
+      const signature = signaturesById.get(row?.adCampaignSignatureId ?? id);
+      return {
+        adCostId: id,
+        canonicalSalesUnitId: signature?.canonicalSalesUnitId ?? row?.canonicalSalesUnitId ?? null,
+        mappingReason: signature?.mappingReason ?? row?.mappingReason ?? "NO_RULE",
+        matchedRuleCount: signature?.matchedRuleCount ?? row?.matchedRuleCount ?? 0,
+      };
     });
 
     return {
       adCostIds: dedupedIds,
-      mappings: mappings.map((item) => ({
-        adCostId: item.adCostId,
-        canonicalSalesUnitId: item.canonicalSalesUnitId,
-        mappingReason: item.mappingReason,
-        matchedRuleCount: item.matchedRuleCount,
-      })),
+      mappings,
     };
   }
 
@@ -678,6 +815,72 @@ export class AdsService implements OnModuleInit {
       storeId: storeIds[0],
       adCosts,
     };
+  }
+
+  private resolveAdSignatureBatch(ids: string[], snapshot = this.databaseService.getSnapshot()) {
+    const dedupedIds = Array.from(new Set(ids.filter(Boolean)));
+    if (!dedupedIds.length) {
+      throw new BadRequestException({
+        success: false,
+        message: "수정할 광고 캠페인을 하나 이상 선택해 주세요.",
+        errors: [{ field: "adCostIds", reason: "INVALID_VALUE" }],
+      });
+    }
+
+    const rowsById = new Map(snapshot.adCampaignDailyCosts.map((row) => [row.id, row]));
+    const signaturesById = new Map(snapshot.adCampaignSignatures.map((signature) => [signature.id, signature]));
+    const storeIds = new Set<string>();
+
+    dedupedIds.forEach((id) => {
+      const row = rowsById.get(id);
+      const signature = signaturesById.get(id);
+      if (!row && !signature) {
+        throw new NotFoundException({
+          success: false,
+          message: "광고 캠페인을 찾을 수 없습니다.",
+          errors: [{ field: "adCostIds", reason: "MANUAL_OVERRIDE_NOT_FOUND" }],
+        });
+      }
+      if (row) {
+        storeIds.add(row.storeId);
+      }
+      if (signature) {
+        storeIds.add(signature.storeId);
+      }
+    });
+
+    if (storeIds.size !== 1) {
+      throw new BadRequestException({
+        success: false,
+        message: "같은 스토어의 광고 캠페인만 함께 수정할 수 있습니다.",
+        errors: [{ field: "adCostIds", reason: "CROSS_STORE_REFERENCE" }],
+      });
+    }
+
+    return {
+      dedupedIds,
+      storeId: Array.from(storeIds)[0],
+    };
+  }
+
+  private materializeAdCampaignSignatureIds(
+    draft: DatabaseShape,
+    storeId: string,
+    ids: string[],
+  ): Set<string> {
+    const directSignatureIds = new Set(
+      ids.filter((id) => draft.adCampaignSignatures.some((signature) => signature.id === id)),
+    );
+    const rowIds = ids.filter((id) => draft.adCampaignDailyCosts.some((row) => row.id === id));
+    const materializedFromRows = ensureAdCampaignSignaturesForStore(draft, storeId, rowIds);
+
+    draft.adCampaignDailyCosts.forEach((row) => {
+      if (row.storeId === storeId && rowIds.includes(row.id) && row.adCampaignSignatureId) {
+        materializedFromRows.add(row.adCampaignSignatureId);
+      }
+    });
+
+    return new Set([...directSignatureIds, ...materializedFromRows]);
   }
 
   private parseCampaignRows(rows: string[][], header: string[]) {
@@ -737,22 +940,6 @@ export class AdsService implements OnModuleInit {
           activeUploadIds.has(item.sourceUploadId),
       )
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  }
-
-  private findInheritedOverride(
-    activeConfirmedRows: AdCampaignDailyCost[],
-    campaignId: string,
-    normalizedCampaignName: string,
-  ) {
-    const matchedByCampaignId = activeConfirmedRows.find((item) => item.campaignId === campaignId);
-    if (matchedByCampaignId) {
-      return matchedByCampaignId;
-    }
-
-    const matchedByName = activeConfirmedRows.filter(
-      (item) => item.normalizedCampaignName === normalizedCampaignName,
-    );
-    return matchedByName.length === 1 ? matchedByName[0] : null;
   }
 
   private assertNoDuplicateCampaignIds(campaignIds: string[], reason: string) {

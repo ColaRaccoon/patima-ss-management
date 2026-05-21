@@ -34,6 +34,8 @@ import type {
   DailyFakePurchaseResponse,
   DailySalesUnitDetail,
   DashboardPageData,
+  MappingListState,
+  MappingListStatus,
   MappingsPageData,
   OperationsPageData,
   OperationDetail,
@@ -42,6 +44,7 @@ import type {
   OrdersPageFilters,
   OrderListItem,
   OrderSourceSignatureListItem,
+  PageMeta,
   ProfitsPageData,
   SalesUnitsPageData,
   SalesUnitListItem,
@@ -83,6 +86,7 @@ const collectSources = (
   }));
 
 const MAX_FRONTEND_PAGE_SIZE = 200;
+const DEFAULT_MAPPING_PAGE_SIZE = 100;
 const USE_AD_UPLOADS_MOCK_FALLBACK = false;
 const USE_PROFITS_MOCK_FALLBACK = false;
 
@@ -179,6 +183,92 @@ async function fetchAllRecordPages<T>(params: {
     ...baseResponse!,
     data: collected,
   };
+}
+
+async function fetchRecordPage<T>(params: {
+  label: string;
+  path: string;
+  query: Record<string, string | number | boolean | null | undefined>;
+  page?: number;
+  pageSize?: number;
+  fallback?: T[];
+}) {
+  const requestedPage = params.page ?? 1;
+  const requestedPageSize = params.pageSize ?? MAX_FRONTEND_PAGE_SIZE;
+  const response = await fetchApi<{
+    items: T[];
+    page?: number;
+    pageSize?: number;
+    hasNext?: boolean;
+    totalPages?: number;
+    totalCount?: number;
+  }>({
+    label: params.label,
+    path: withQuery(params.path, {
+      ...params.query,
+      page: requestedPage,
+      pageSize: requestedPageSize,
+    }),
+    ...("fallback" in params
+      ? {
+          fallback: { items: params.fallback ?? [] },
+        }
+      : {}),
+  });
+
+  const page = normalizePageMeta(response.data, requestedPage, requestedPageSize);
+
+  return {
+    ...response,
+    data: response.data.items,
+    page,
+  };
+}
+
+function normalizePageMeta<T>(
+  response: {
+    items: T[];
+    page?: number;
+    pageSize?: number;
+    totalCount?: number;
+    totalPages?: number;
+    hasNext?: boolean;
+  },
+  fallbackPage: number,
+  fallbackPageSize: number,
+): PageMeta {
+  const page = Number(response.page ?? fallbackPage);
+  const pageSize = Number(response.pageSize ?? fallbackPageSize);
+  const totalCount = Number(response.totalCount ?? response.items.length);
+  const totalPages = Number(response.totalPages ?? Math.max(1, Math.ceil(totalCount / Math.max(1, pageSize))));
+
+  return {
+    page: Number.isFinite(page) && page > 0 ? page : 1,
+    pageSize: Number.isFinite(pageSize) && pageSize > 0 ? pageSize : fallbackPageSize,
+    totalCount: Number.isFinite(totalCount) && totalCount >= 0 ? totalCount : response.items.length,
+    totalPages: Number.isFinite(totalPages) && totalPages > 0 ? totalPages : 1,
+    hasNext: response.hasNext ?? page < totalPages,
+  };
+}
+
+function normalizeMappingListState(input?: Partial<MappingListState>): MappingListState {
+  const mappingStatus = normalizeMappingStatus(input?.mappingStatus);
+  const requestedPage = Number(input?.page ?? 1);
+  const requestedPageSize = Number(input?.pageSize ?? DEFAULT_MAPPING_PAGE_SIZE);
+
+  return {
+    mappingStatus,
+    q: input?.q?.trim() ?? "",
+    page: Number.isFinite(requestedPage) && requestedPage > 0 ? Math.floor(requestedPage) : 1,
+    pageSize:
+      Number.isFinite(requestedPageSize) && requestedPageSize > 0
+        ? Math.min(MAX_FRONTEND_PAGE_SIZE, Math.floor(requestedPageSize))
+        : DEFAULT_MAPPING_PAGE_SIZE,
+  };
+}
+
+function normalizeMappingStatus(value?: string): MappingListStatus {
+  return value === "MAPPED" || value === "UNMAPPED" || value === "CONFLICT" ? value : "ALL";
 }
 
 function normalizeOrdersPageFilters(
@@ -461,19 +551,45 @@ async function getOrderItems(storeId: string, filters: OrdersPageFilters) {
 
 async function getOrderSourceSignatures(
   storeId: string,
-  filters?: Pick<OrdersPageFilters, "mappingStatus" | "productName" | "optionInfo">,
+  filters?: Partial<Pick<OrdersPageFilters, "mappingStatus" | "productName" | "optionInfo">> & {
+    q?: string;
+    fetchAll?: boolean;
+    page?: number;
+    pageSize?: number;
+  },
 ) {
-  const response = await fetchAllRecordPages<OrderSourceSignatureListItem>({
+  const request = {
     label: "Order signatures",
     path: "/order-source-signatures",
     query: {
       storeId,
       mappingStatus: filters?.mappingStatus ?? "ALL",
-      q: [filters?.productName, filters?.optionInfo].filter(Boolean).join(" ") || undefined,
+      q: (filters?.q ?? [filters?.productName, filters?.optionInfo].filter(Boolean).join(" ")) || undefined,
     },
     fallback: mockSignatures,
-  });
-  return { ...response, data: response.data };
+  };
+  if (filters?.fetchAll === false) {
+    const response = await fetchRecordPage<OrderSourceSignatureListItem>({
+      ...request,
+      page: filters.page ?? 1,
+      pageSize: filters.pageSize ?? MAX_FRONTEND_PAGE_SIZE,
+    });
+
+    return { ...response, data: response.data };
+  }
+
+  const response = await fetchAllRecordPages<OrderSourceSignatureListItem>(request);
+  return {
+    ...response,
+    data: response.data,
+    page: {
+      page: 1,
+      pageSize: response.data.length || MAX_FRONTEND_PAGE_SIZE,
+      totalCount: response.data.length,
+      totalPages: 1,
+      hasNext: false,
+    },
+  };
 }
 
 async function getSalesUnits(storeId: string, useFallback = true) {
@@ -603,6 +719,61 @@ async function getAdCosts(
       mappingReason,
       matchedRuleCount: Number(item.matchedRuleCount ?? 0),
       reasonNote: item.reasonNote ? String(item.reasonNote) : null,
+    } satisfies CampaignCostListItem;
+  });
+
+  return { ...response, data: items };
+}
+
+async function getAdCampaignSignatures(
+  storeId: string,
+  salesUnits: SalesUnitListItem[],
+  options?: {
+    dateFrom?: string;
+    dateTo?: string;
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+    q?: string;
+    page?: number;
+    pageSize?: number;
+  },
+) {
+  const response = await fetchRecordPage<Record<string, unknown>>({
+    label: "Ad campaign signatures",
+    path: "/ad-campaign-signatures",
+    query: {
+      storeId,
+      dateFrom: options?.dateFrom,
+      dateTo: options?.dateTo,
+      mappingStatus: options?.mappingStatus ?? "ALL",
+      q: options?.q || undefined,
+    },
+    page: options?.page ?? 1,
+    pageSize: options?.pageSize ?? MAX_FRONTEND_PAGE_SIZE,
+    fallback: mockAdCosts as unknown as Array<Record<string, unknown>>,
+  });
+
+  const items = response.data.map((item) => {
+    const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
+    const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
+    const mappingStatus = toAdMappingStatus(canonicalSalesUnitId, mappingReason);
+    return {
+      id: String(item.adCampaignSignatureId ?? item.id),
+      adCampaignSignatureId: item.adCampaignSignatureId ? String(item.adCampaignSignatureId) : String(item.id),
+      uploadId: String(item.sourceUploadId ?? item.uploadId ?? item.id ?? ""),
+      reportDate: String(item.lastSeenDate ?? item.reportDate ?? ""),
+      campaignName: String(item.campaignName ?? item.campaignNameSnapshot ?? ""),
+      totalCost: Number(item.totalCost ?? 0),
+      canonicalSalesUnitId,
+      canonicalDisplayName:
+        salesUnits.find((salesUnit) => salesUnit.id === canonicalSalesUnitId)?.displayName ?? null,
+      mappingStatus,
+      mappingReason,
+      matchedRuleCount: Number(item.matchedRuleCount ?? 0),
+      reasonNote: item.reasonNote ? String(item.reasonNote) : null,
+      usageCount: Number(item.usageCount ?? 0),
+      firstSeenDate: item.firstSeenDate ? String(item.firstSeenDate) : null,
+      lastSeenDate: item.lastSeenDate ? String(item.lastSeenDate) : null,
+      confirmedAt: item.confirmedAt ? String(item.confirmedAt) : null,
     } satisfies CampaignCostListItem;
   });
 
@@ -831,16 +1002,38 @@ export async function getSalesUnitsPageData(params?: {
 
 export async function getMappingsPageData(params?: {
   storeId?: string;
+  order?: Partial<MappingListState>;
+  ad?: Partial<MappingListState>;
 }): Promise<MappingsPageData> {
   const storeResponse = await getStores();
   const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
+  const signatureQuery = normalizeMappingListState(params?.order);
+  const adCostQuery = normalizeMappingListState(params?.ad);
+  const emptySignaturePage: PageMeta = {
+    page: signatureQuery.page,
+    pageSize: signatureQuery.pageSize,
+    totalCount: 0,
+    totalPages: 1,
+    hasNext: false,
+  };
+  const emptyAdCostPage: PageMeta = {
+    page: adCostQuery.page,
+    pageSize: adCostQuery.pageSize,
+    totalCount: 0,
+    totalPages: 1,
+    hasNext: false,
+  };
 
   if (!primaryStore) {
     return {
       primaryStore: null,
       salesUnits: [],
       signatures: [],
+      signaturePage: emptySignaturePage,
+      signatureQuery,
       adCosts: [],
+      adCostPage: emptyAdCostPage,
+      adCostQuery,
       campaignMappings: [],
       sources: collectSources(storeResponse),
     };
@@ -849,11 +1042,18 @@ export async function getMappingsPageData(params?: {
   const salesUnitResponse = await getSalesUnits(primaryStore.id);
   const [signatureResponse, adCostResponse, campaignMappingResponse] = await Promise.all([
     getOrderSourceSignatures(primaryStore.id, {
-      mappingStatus: "ALL",
-      productName: "",
-      optionInfo: "",
+      mappingStatus: signatureQuery.mappingStatus,
+      q: signatureQuery.q,
+      fetchAll: false,
+      page: signatureQuery.page,
+      pageSize: signatureQuery.pageSize,
     }),
-    getAdCosts(primaryStore.id, salesUnitResponse.data),
+    getAdCampaignSignatures(primaryStore.id, salesUnitResponse.data, {
+      mappingStatus: adCostQuery.mappingStatus,
+      q: adCostQuery.q,
+      page: adCostQuery.page,
+      pageSize: adCostQuery.pageSize,
+    }),
     getCampaignMappings(primaryStore.id, salesUnitResponse.data),
   ]);
 
@@ -861,7 +1061,19 @@ export async function getMappingsPageData(params?: {
     primaryStore,
     salesUnits: salesUnitResponse.data,
     signatures: signatureResponse.data,
+    signaturePage: signatureResponse.page,
+    signatureQuery: {
+      ...signatureQuery,
+      page: signatureResponse.page.page,
+      pageSize: signatureResponse.page.pageSize,
+    },
     adCosts: adCostResponse.data,
+    adCostPage: adCostResponse.page,
+    adCostQuery: {
+      ...adCostQuery,
+      page: adCostResponse.page.page,
+      pageSize: adCostResponse.page.pageSize,
+    },
     campaignMappings: campaignMappingResponse.data,
     sources: collectSources(
       storeResponse,

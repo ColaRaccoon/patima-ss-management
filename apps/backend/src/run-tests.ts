@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import { createSourceSignature, normalizeText, DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import * as XLSX from "xlsx";
-import { evaluateAdMapping, getAdMappingOverride } from "./ad-mapping-engine";
+import {
+  evaluateAdMapping,
+  getAdMappingOverride,
+  recalculateAdCampaignSignaturesForStore,
+} from "./ad-mapping-engine";
 import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
+import { DatabaseService } from "./database.service";
 import { FakePurchaseService } from "./fake-purchase.service";
 import {
   calculateDashboardSummary,
@@ -25,12 +30,25 @@ import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
 import { OperationService } from "./operation.service";
 import { ProfitService } from "./profit.service";
-import { recalculateOrderMappingsForStore, resolveOrderSignatureAutoMapping } from "./sales-unit-auto-mapper";
+import {
+  recalculateOrderMappingsForStore,
+  recalculateOrderMappingsForTouchedItems,
+  resolveOrderSignatureAutoMapping,
+} from "./sales-unit-auto-mapper";
 import { isMeaningfulName, extractNameFromOptionInfo, enrichSignatureDisplayName } from "./signature-enrichment";
 
 const run = (name: string, fn: () => void) => {
   fn();
   console.log(`PASS ${name}`);
+};
+
+const pendingAsyncTests: Promise<void>[] = [];
+const runAsync = (name: string, fn: () => Promise<void>) => {
+  pendingAsyncTests.push(
+    fn().then(() => {
+      console.log(`PASS ${name}`);
+    }),
+  );
 };
 
 const createSalesUnit = (id: string, displayName: string, matchAliases: string[]) =>
@@ -237,7 +255,7 @@ const createOrderSyncServiceHarness = (params?: {
     } as never,
   );
 
-  return { orderSyncService, enqueueCalls, retryExecutors };
+  return { databaseService, orderSyncService, enqueueCalls, retryExecutors };
 };
 
 const createOrderSourceSignature = (id: string, productName: string, storeId = "store-1") =>
@@ -252,6 +270,14 @@ const createOrderSourceSignature = (id: string, productName: string, storeId = "
     canonicalSalesUnitId: null,
     mappingStatus: "UNMAPPED",
     confirmedAt: null,
+    usageCount: 0,
+    firstSeenAt: null,
+    lastSeenAt: null,
+    sampleExternalProductId: null,
+    sampleOptionCode: null,
+    sampleOptionManageCode: null,
+    lastAutoMappedAt: null,
+    mappingRuleHash: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }) as never;
@@ -344,6 +370,38 @@ const createConfirmedUpload = (params: { uploadId: string; reportDate: string; i
     previewExpiresAt: null,
     state: "CONFIRMED",
     isActive: params.isActive ?? true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }) as never;
+
+const createAdCampaignSignature = (params: {
+  id: string;
+  campaignId: string;
+  campaignName: string;
+  canonicalSalesUnitId?: string | null;
+  mappingReason?: "RULE_MATCHED" | "MANUAL_MAPPED" | "NO_RULE" | "MULTIPLE_RULES" | "INTENTIONALLY_UNMAPPED";
+  reasonNote?: string | null;
+  firstSeenDate?: string | null;
+  lastSeenDate?: string | null;
+}) =>
+  ({
+    id: params.id,
+    storeId: "store-1",
+    channel: "NAVER_DA",
+    campaignId: params.campaignId,
+    campaignNameSnapshot: params.campaignName,
+    normalizedCampaignName: normalizeText(params.campaignName),
+    canonicalSalesUnitId: params.canonicalSalesUnitId ?? null,
+    mappingReason: params.mappingReason ?? (params.canonicalSalesUnitId ? "RULE_MATCHED" : "NO_RULE"),
+    matchedRuleCount: params.canonicalSalesUnitId ? 1 : 0,
+    reasonNote: params.reasonNote ?? null,
+    reasonNoteInherited: false,
+    confirmedAt: params.canonicalSalesUnitId || params.reasonNote ? new Date().toISOString() : null,
+    usageCount: 1,
+    firstSeenDate: params.firstSeenDate ?? null,
+    lastSeenDate: params.lastSeenDate ?? null,
+    lastAutoMappedAt: null,
+    mappingRuleHash: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }) as never;
@@ -884,6 +942,80 @@ run("recalculateOrderMappingsForStore marks ambiguous alias matches as conflict"
   assert.equal(database.orderItems[0].canonicalSalesUnitId, null);
 });
 
+run("recalculateOrderMappingsForTouchedItems updates only touched order items", () => {
+  const database = createEmptyDatabase();
+  const touchedUnit = createSalesUnit("sales-1", "Touched Unit", []) as Record<string, unknown>;
+  const untouchedUnit = createSalesUnit("sales-2", "Untouched Unit", []) as Record<string, unknown>;
+  database.canonicalSalesUnits.push(
+    {
+      ...touchedUnit,
+      linkedProductIds: ["prod-1"],
+    } as never,
+    {
+      ...untouchedUnit,
+      linkedProductIds: ["prod-2"],
+    } as never,
+  );
+  database.orderSourceSignatures.push(
+    createOrderSourceSignature("sig-1", "touched product"),
+    createOrderSourceSignature("sig-2", "untouched product"),
+  );
+  const createOrderItem = (id: string, signatureId: string, productId: string) =>
+    ({
+      id,
+      storeId: "store-1",
+      orderId: `order-${id}`,
+      orderSourceSignatureId: signatureId,
+      canonicalSalesUnitId: null,
+      externalProductOrderId: `external-${id}`,
+      externalProductId: productId,
+      optionCode: null,
+      packageNumber: null,
+      rawProductName: id,
+      rawOptionInfo: null,
+      normalizedProductName: normalizeText(id),
+      normalizedOptionInfo: "",
+      sourceSignature: createSourceSignature(id, null),
+      quantity: 1,
+      productPaymentAmount: 10000,
+      totalProductAmount: null,
+      deliveryFeeAmount: null,
+      paymentCommission: null,
+      knowledgeShoppingSellingInterlockCommission: null,
+      saleCommission: null,
+      channelCommission: null,
+      orderDate: "2026-04-01",
+      paymentDate: "2026-04-01",
+      saleStatus: "SALE",
+      orderStatus: "DELIVERED",
+      isCanceled: false,
+      isReturned: false,
+      rawPayload: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }) as never;
+  const conflictingSameSignatureItem = createOrderItem("item-3", "sig-1", "prod-2") as Record<string, unknown>;
+  conflictingSameSignatureItem.canonicalSalesUnitId = "sales-2";
+  database.orderItems.push(
+    createOrderItem("item-1", "sig-1", "prod-1"),
+    createOrderItem("item-2", "sig-2", "prod-2"),
+    conflictingSameSignatureItem as never,
+  );
+
+  recalculateOrderMappingsForTouchedItems(database, {
+    storeId: "store-1",
+    signatureIds: new Set(["sig-1"]),
+    orderItemIds: new Set(["item-1"]),
+  });
+
+  assert.equal(database.orderItems.find((item) => item.id === "item-1")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(database.orderItems.find((item) => item.id === "item-2")?.canonicalSalesUnitId, null);
+  assert.equal(database.orderItems.find((item) => item.id === "item-3")?.canonicalSalesUnitId, "sales-2");
+  assert.equal(database.orderSourceSignatures.find((item) => item.id === "sig-1")?.mappingStatus, "CONFLICT");
+  assert.equal(database.orderSourceSignatures.find((item) => item.id === "sig-1")?.canonicalSalesUnitId, null);
+  assert.equal(database.orderSourceSignatures.find((item) => item.id === "sig-2")?.canonicalSalesUnitId, null);
+});
+
 run("OrderMappingService saveMappings deduplicates signatures without recalculation", () => {
   const { databaseService, orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
 
@@ -984,6 +1116,33 @@ run("OrderMappingService createAndMapMany skips order recalculation during sales
   assert.equal(createCalls[0]?.options?.skipOrderRecalculation, true);
 });
 
+runAsync("OrderSyncService listOrderSourceSignatures searches canonical sales unit display name", async () => {
+  const { databaseService, orderSyncService } = createOrderSyncServiceHarness({
+    stores: [createStoreRecord("store-1", "Main Store")],
+    configuredStoreIds: ["store-1"],
+  });
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-needle", "Needle Unit", []));
+    draft.orderSourceSignatures.push(
+      Object.assign(createOrderSourceSignature("sig-needle", "Hidden Product") as Record<string, unknown>, {
+        canonicalSalesUnitId: "sales-needle",
+        mappingStatus: "MAPPED",
+      }) as never,
+      createOrderSourceSignature("sig-other", "Other Product"),
+    );
+  });
+
+  const result = await orderSyncService.listOrderSourceSignatures({
+    storeId: "store-1",
+    q: "Needle Unit",
+  });
+
+  assert.equal(result.data.totalCount, 1);
+  assert.equal(result.data.items[0].id, "sig-needle");
+  assert.equal(result.data.items[0].canonicalDisplayName, "Needle Unit");
+});
+
 run("evaluateAdMapping falls back to alias matching without a campaign rule", () => {
   const database = createEmptyDatabase();
   database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Display Only", ["kneebrace"]));
@@ -1005,6 +1164,102 @@ run("evaluateAdMapping returns conflict when multiple aliases match", () => {
 
   assert.equal(result.canonicalSalesUnitId, null);
   assert.equal(result.mappingReason, "MULTIPLE_RULES");
+});
+
+run("recalculateAdCampaignSignaturesForStore without row apply leaves ad cost rows unchanged", () => {
+  const database = createEmptyDatabase();
+  const originalUpdatedAt = "2026-04-01T00:00:00.000Z";
+  database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Launch Unit", ["launch"]));
+  database.campaignMappings.push({
+    id: "campaign-rule-1",
+    storeId: "store-1",
+    channel: "NAVER_DA",
+    canonicalSalesUnitId: "sales-1",
+    campaignPattern: "launch",
+    normalizedCampaignPattern: normalizeText("launch"),
+    isActive: true,
+    deactivatedAt: null,
+    createdAt: originalUpdatedAt,
+    updatedAt: originalUpdatedAt,
+  });
+  database.adCampaignSignatures.push({
+    id: "ad-signature-1",
+    storeId: "store-1",
+    channel: "NAVER_DA",
+    campaignId: "cmp-1",
+    campaignNameSnapshot: "launch campaign",
+    normalizedCampaignName: normalizeText("launch campaign"),
+    canonicalSalesUnitId: null,
+    mappingReason: "NO_RULE",
+    matchedRuleCount: 0,
+    reasonNote: "일치하는 규칙이 없습니다.",
+    reasonNoteInherited: false,
+    confirmedAt: null,
+    usageCount: 1,
+    firstSeenDate: "2026-04-01",
+    lastSeenDate: "2026-04-01",
+    lastAutoMappedAt: null,
+    mappingRuleHash: null,
+    createdAt: originalUpdatedAt,
+    updatedAt: originalUpdatedAt,
+  });
+  const row = createConfirmedUploadRow({
+    uploadId: "upload-1",
+    reportDate: "2026-04-01",
+    campaignId: "cmp-1",
+    campaignName: "launch campaign",
+    canonicalSalesUnitId: null,
+    totalCost: 100,
+  }) as Record<string, unknown>;
+  row.adCampaignSignatureId = "ad-signature-1";
+  row.updatedAt = originalUpdatedAt;
+  database.adCampaignDailyCosts.push(row as never);
+
+  recalculateAdCampaignSignaturesForStore(database, "store-1", { onlyUnconfirmed: true });
+
+  assert.equal(database.adCampaignSignatures[0].canonicalSalesUnitId, "sales-1");
+  assert.equal(database.adCampaignSignatures[0].mappingReason, "RULE_MATCHED");
+  assert.equal(database.adCampaignDailyCosts[0].canonicalSalesUnitId, null);
+  assert.equal(database.adCampaignDailyCosts[0].mappingReason, "NO_RULE");
+  assert.equal(database.adCampaignDailyCosts[0].updatedAt, originalUpdatedAt);
+});
+
+run("DatabaseService normalizeSnapshot keeps conflicting manual ad rows as signature conflict", () => {
+  const database = createEmptyDatabase();
+  database.adCampaignDailyCosts.push(
+    createConfirmedUploadRow({
+      uploadId: "upload-1",
+      reportDate: "2026-04-01",
+      campaignId: "cmp-conflict",
+      campaignName: "manual conflict",
+      canonicalSalesUnitId: "sales-1",
+      totalCost: 100,
+      mappingReason: "MANUAL_MAPPED",
+    }),
+    createConfirmedUploadRow({
+      uploadId: "upload-2",
+      reportDate: "2026-04-02",
+      campaignId: "cmp-conflict",
+      campaignName: "manual conflict",
+      canonicalSalesUnitId: "sales-2",
+      totalCost: 100,
+      mappingReason: "MANUAL_MAPPED",
+    }),
+  );
+
+  const normalized = (
+    new DatabaseService() as unknown as {
+      normalizeSnapshot(snapshot: typeof database): typeof database;
+    }
+  ).normalizeSnapshot(database);
+  const signature = normalized.adCampaignSignatures.find(
+    (item: { campaignId: string | null }) => item.campaignId === "cmp-conflict",
+  )!;
+
+  assert.equal(signature.mappingReason, "MULTIPLE_RULES");
+  assert.equal(signature.canonicalSalesUnitId, null);
+  assert.equal(signature.confirmedAt, null);
+  assert.equal(new Set(normalized.adCampaignDailyCosts.map((item) => item.adCampaignSignatureId)).size, 1);
 });
 
 run("calculateDashboardSummary excludes conflict order revenue and conflict ad cost from totals", () => {
@@ -1629,16 +1884,37 @@ run("AdsService deleteUpload deactivates the upload and removes related ad rows"
 
   databaseService.write((draft) => {
     draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-delete", reportDate: date, isActive: true }));
-    draft.adCampaignDailyCosts.push(
-      createConfirmedUploadRow({
-        uploadId: "upload-delete",
-        reportDate: date,
-        campaignId: "cmp-delete",
-        campaignName: "duplicate launch",
-        canonicalSalesUnitId: "sales-1",
-        totalCost: 45,
-      }),
-    );
+    draft.adCampaignSignatures.push({
+      id: "ad-signature-delete",
+      storeId: "store-1",
+      channel: "NAVER_DA",
+      campaignId: "cmp-delete",
+      campaignNameSnapshot: "duplicate launch",
+      normalizedCampaignName: normalizeText("duplicate launch"),
+      canonicalSalesUnitId: "sales-1",
+      mappingReason: "RULE_MATCHED",
+      matchedRuleCount: 1,
+      reasonNote: null,
+      reasonNoteInherited: false,
+      confirmedAt: null,
+      usageCount: 1,
+      firstSeenDate: date,
+      lastSeenDate: date,
+      lastAutoMappedAt: null,
+      mappingRuleHash: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const row = createConfirmedUploadRow({
+      uploadId: "upload-delete",
+      reportDate: date,
+      campaignId: "cmp-delete",
+      campaignName: "duplicate launch",
+      canonicalSalesUnitId: "sales-1",
+      totalCost: 45,
+    }) as Record<string, unknown>;
+    row.adCampaignSignatureId = "ad-signature-delete";
+    draft.adCampaignDailyCosts.push(row as never);
   });
 
   const result = adsService.deleteUpload("upload-delete");
@@ -1651,7 +1927,104 @@ run("AdsService deleteUpload deactivates the upload and removes related ad rows"
   assert.equal(upload?.state, "DELETED");
   assert.equal(upload?.isActive, false);
   assert.equal(snapshot.adCampaignDailyCosts.some((item: { sourceUploadId: string }) => item.sourceUploadId === "upload-delete"), false);
+  assert.equal(snapshot.adCampaignSignatures.find((item: { id: string }) => item.id === "ad-signature-delete")?.usageCount, 0);
+  assert.equal(snapshot.adCampaignSignatures.find((item: { id: string }) => item.id === "ad-signature-delete")?.firstSeenDate, null);
+  assert.equal(snapshot.adCampaignSignatures.find((item: { id: string }) => item.id === "ad-signature-delete")?.lastSeenDate, null);
   assert.equal(calculateDashboardSummary(snapshot, "store-1", date).totalAdCost, 0);
+});
+
+run("AdsService listAdCampaignSignatures excludes stale signatures and searches extended fields", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-needle", "Needle Unit", []));
+    draft.adExcelUploads.push(
+      createConfirmedUpload({ uploadId: "upload-active", reportDate: "2026-04-03" }),
+      createConfirmedUpload({ uploadId: "upload-inactive", reportDate: "2026-04-02", isActive: false }),
+    );
+    draft.adCampaignSignatures.push(
+      createAdCampaignSignature({
+        id: "ad-signature-active",
+        campaignId: "cmp-active",
+        campaignName: "active launch",
+        canonicalSalesUnitId: "sales-needle",
+        mappingReason: "INTENTIONALLY_UNMAPPED",
+        reasonNote: "budget hold",
+        firstSeenDate: "2026-04-01",
+        lastSeenDate: "2026-04-03",
+      }),
+      createAdCampaignSignature({
+        id: "ad-signature-stale",
+        campaignId: "cmp-stale",
+        campaignName: "stale launch",
+        firstSeenDate: "2026-04-02",
+        lastSeenDate: "2026-04-02",
+      }),
+      createAdCampaignSignature({
+        id: "ad-signature-no-rule",
+        campaignId: "cmp-no-rule",
+        campaignName: "no rule launch",
+        mappingReason: "NO_RULE",
+        firstSeenDate: "2026-04-03",
+        lastSeenDate: "2026-04-03",
+      }),
+    );
+    draft.adCampaignDailyCosts.push(
+      Object.assign(
+        createConfirmedUploadRow({
+          uploadId: "upload-active",
+          reportDate: "2026-04-03",
+          campaignId: "cmp-active",
+          campaignName: "active launch",
+          canonicalSalesUnitId: null,
+          totalCost: 120,
+        }),
+        { adCampaignSignatureId: "ad-signature-active" },
+      ) as never,
+      Object.assign(
+        createConfirmedUploadRow({
+          uploadId: "upload-inactive",
+          reportDate: "2026-04-02",
+          campaignId: "cmp-stale",
+          campaignName: "stale launch",
+          canonicalSalesUnitId: null,
+          totalCost: 80,
+        }),
+        { adCampaignSignatureId: "ad-signature-stale" },
+      ) as never,
+      Object.assign(
+        createConfirmedUploadRow({
+          uploadId: "upload-active",
+          reportDate: "2026-04-03",
+          campaignId: "cmp-no-rule",
+          campaignName: "no rule launch",
+          canonicalSalesUnitId: null,
+          totalCost: 40,
+          mappingReason: "NO_RULE",
+        }),
+        { adCampaignSignatureId: "ad-signature-no-rule" },
+      ) as never,
+    );
+  });
+
+  const defaultResult = adsService.listAdCampaignSignatures({ storeId: "store-1" });
+  assert.equal(defaultResult.data.totalCount, 2);
+  assert.deepEqual(
+    new Set(defaultResult.data.items.map((item: { id: string }) => item.id)),
+    new Set(["ad-signature-active", "ad-signature-no-rule"]),
+  );
+
+  ["Needle Unit", "budget hold", "intentional", "2026-04-03"].forEach((q) => {
+    const result = adsService.listAdCampaignSignatures({ storeId: "store-1", q });
+    assert.equal(
+      result.data.items.some((item: { id: string }) => item.id === "ad-signature-active"),
+      true,
+    );
+  });
+
+  const reasonAliasResult = adsService.listAdCampaignSignatures({ storeId: "store-1", q: "NO_RULE_MATCH" });
+  assert.equal(reasonAliasResult.data.totalCount, 1);
+  assert.equal(reasonAliasResult.data.items[0].id, "ad-signature-no-rule");
 });
 
 run("AdsService saveManualMappings applies one sales unit to multiple rows", () => {
@@ -1692,6 +2065,90 @@ run("AdsService saveManualMappings applies one sales unit to multiple rows", () 
     assert.equal(item.matchedRuleCount, 0);
     assert.equal(item.reasonNote, null);
     assert.equal(item.reasonNoteInherited, false);
+  });
+});
+
+run("AdsService stores manual mappings on campaign signatures and later uploads inherit them", () => {
+  const { databaseService, adsService } = createAdsServiceHarness();
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(
+      createSalesUnit("sales-1", "Manual Unit", ["manual"]),
+      createSalesUnit("sales-2", "Rule Unit", ["rule"]),
+    );
+  });
+
+  adsService.previewUpload(
+    "store-1",
+    "2026-04-03",
+    createAdUploadFile("2026-04-03", [
+      { campaignId: "cmp-signature", campaignName: "brand launch", totalCost: 120 },
+    ]),
+  );
+
+  const firstSnapshot = databaseService.getSnapshot();
+  const firstRow = firstSnapshot.adCampaignDailyCosts.find(
+    (item: { campaignId: string }) => item.campaignId === "cmp-signature",
+  )!;
+
+  adsService.saveManualMappings([firstRow.id], { canonicalSalesUnitId: "sales-1" });
+  const manualSnapshot = databaseService.getSnapshot();
+  const signature = manualSnapshot.adCampaignSignatures.find(
+    (item: { campaignId: string | null }) => item.campaignId === "cmp-signature",
+  )!;
+
+  assert.equal(signature.canonicalSalesUnitId, "sales-1");
+  assert.equal(signature.mappingReason, "MANUAL_MAPPED");
+  assert.ok(signature.confirmedAt);
+  assert.equal(
+    manualSnapshot.adCampaignDailyCosts.find((item: { id: string }) => item.id === firstRow.id)?.adCampaignSignatureId,
+    signature.id,
+  );
+
+  databaseService.write((draft) => {
+    draft.campaignMappings.push({
+      id: "campaign-rule-1",
+      storeId: "store-1",
+      channel: "NAVER_DA",
+      canonicalSalesUnitId: "sales-2",
+      campaignPattern: "brand",
+      normalizedCampaignPattern: normalizeText("brand"),
+      isActive: true,
+      deactivatedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  });
+
+  adsService.recalculateMappings([signature.id]);
+  assert.equal(
+    databaseService.getSnapshot().adCampaignSignatures.find((item: { id: string }) => item.id === signature.id)
+      ?.canonicalSalesUnitId,
+    "sales-1",
+  );
+
+  adsService.previewUpload(
+    "store-1",
+    "2026-04-04",
+    createAdUploadFile("2026-04-04", [
+      { campaignId: "cmp-signature", campaignName: "brand launch", totalCost: 80 },
+    ]),
+  );
+
+  const finalSnapshot = databaseService.getSnapshot();
+  const rows = finalSnapshot.adCampaignDailyCosts.filter(
+    (item: { campaignId: string }) => item.campaignId === "cmp-signature",
+  );
+  const finalSignature = finalSnapshot.adCampaignSignatures.find(
+    (item: { id: string }) => item.id === signature.id,
+  )!;
+
+  assert.equal(rows.length, 2);
+  assert.equal(new Set(rows.map((item: { adCampaignSignatureId: string | null }) => item.adCampaignSignatureId)).size, 1);
+  assert.equal(finalSignature.usageCount, 2);
+  rows.forEach((item: { canonicalSalesUnitId: string | null; mappingReason: string }) => {
+    assert.equal(item.canonicalSalesUnitId, "sales-1");
+    assert.equal(item.mappingReason, "MANUAL_MAPPED");
   });
 });
 
@@ -1851,7 +2308,7 @@ run("enrichSignatureDisplayName returns snapshot when meaningful", async () => {
     confirmedAt: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  };
+  } as never;
 
   const result = await enrichSignatureDisplayName(database, signature);
   assert.equal(result.fallbackProductName, "러닝깔창");
@@ -1873,7 +2330,7 @@ run("enrichSignatureDisplayName falls back to orderItem rawProductName", async (
     confirmedAt: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  };
+  } as never;
   database.orderItems.push({
     id: "item-1",
     orderId: "order-1",
@@ -1929,7 +2386,7 @@ run("enrichSignatureDisplayName extracts from option info pattern", async () => 
     confirmedAt: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  };
+  } as never;
 
   const result = await enrichSignatureDisplayName(database, signature);
   assert.equal(result.fallbackProductName, "러닝깔창");
@@ -1951,7 +2408,7 @@ run("enrichSignatureDisplayName matches product by externalProductId", async () 
     confirmedAt: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  };
+  } as never;
   database.orderItems.push({
     id: "item-1",
     orderId: "order-1",
@@ -2019,7 +2476,7 @@ run("enrichSignatureDisplayName returns null when all fallbacks fail", async () 
     confirmedAt: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  };
+  } as never;
 
   const result = await enrichSignatureDisplayName(database, signature);
   assert.equal(result.fallbackProductName, null);
@@ -2042,7 +2499,7 @@ run("getSignatureIndex caches index by database reference", () => {
       confirmedAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    },
+    } as never,
     {
       id: "sig-2",
       storeId: "store-1",
@@ -2056,7 +2513,7 @@ run("getSignatureIndex caches index by database reference", () => {
       confirmedAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    },
+    } as never,
   ];
 
   // First call builds the index
@@ -2090,7 +2547,7 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
       confirmedAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    },
+    } as never,
   ];
 
   const index1 = getSignatureIndex(database1);
@@ -2112,7 +2569,7 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
       confirmedAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    },
+    } as never,
     {
       id: "sig-b",
       storeId: "store-1",
@@ -2126,7 +2583,7 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
       confirmedAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    },
+    } as never,
   ];
 
   // New database reference should build new index
@@ -2142,4 +2599,6 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
   assert.equal(index1Again.size, 1);
 });
 
-console.log("All backend checks passed.");
+void Promise.all(pendingAsyncTests).then(() => {
+  console.log("All backend checks passed.");
+});
