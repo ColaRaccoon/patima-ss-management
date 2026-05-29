@@ -20,6 +20,7 @@ import { AdsService } from "./ads.service";
 import { CampaignMappingService } from "./campaign-mapping.service";
 import { CostService } from "./cost.service";
 import { CredentialService } from "./credential.service";
+import { DatabaseService } from "./database.service";
 import { FakePurchaseService } from "./fake-purchase.service";
 import { MappingSeedService } from "./mapping-seed.service";
 import { OrderMappingService } from "./order-mapping.service";
@@ -62,11 +63,12 @@ export class AppController {
     private readonly profitService: ProfitService,
     private readonly operationService: OperationService,
     private readonly mappingSeedService: MappingSeedService,
+    private readonly databaseService: DatabaseService,
   ) {}
 
   @Get("health")
   health() {
-    return formatApiSuccess({ ok: true });
+    return formatApiSuccess({ ok: true, persistence: this.databaseService.getPersistenceStatus() });
   }
 
   @Get("stores")
@@ -218,8 +220,8 @@ export class AppController {
   }
 
   @Post("mapping-seed/:storeId")
-  generateInitialMappingSeed(@Param("storeId") storeId: string) {
-    const result = this.mappingSeedService.generateInitialMappings(storeId);
+  async generateInitialMappingSeed(@Param("storeId") storeId: string) {
+    const result = await this.mappingSeedService.generateInitialMappings(storeId);
     return formatApiSuccess(result);
   }
 
@@ -526,8 +528,8 @@ export class AppController {
   }
 
   @Delete("sales-unit-cost-snapshots/:snapshotId")
-  deleteCostSnapshot(@Param("snapshotId") snapshotId: string) {
-    const result = this.costService.deleteSnapshot(snapshotId);
+  async deleteCostSnapshot(@Param("snapshotId") snapshotId: string) {
+    const result = await this.costService.deleteSnapshot(snapshotId);
     return formatApiSuccess(result);
   }
 
@@ -540,11 +542,11 @@ export class AppController {
   }
 
   @Put("daily-fake-purchases")
-  upsertDailyFakePurchase(
+  async upsertDailyFakePurchase(
     @Body() body: { storeId: string; date: string; amount?: number | string | null },
   ) {
     return formatApiSuccess(
-      this.fakePurchaseService.upsert({
+      await this.fakePurchaseService.upsert({
         storeId: body.storeId,
         date: body.date,
         amount: normalizeFakePurchaseAmount(body.amount),

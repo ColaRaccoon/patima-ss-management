@@ -53,7 +53,7 @@ export class MappingSeedService {
     private readonly auditLogService: AuditLogService,
   ) {}
 
-  generateInitialMappings(storeId: string): MappingSeedResult {
+  async generateInitialMappings(storeId: string): Promise<MappingSeedResult> {
     this.storeService.ensureWritable(storeId);
     ensureStoreExists(this.databaseService.getSnapshot(), storeId);
 
@@ -73,7 +73,7 @@ export class MappingSeedService {
     // Step 0: 기존 자동 생성 판매단위 초기화 (멱등성 보장)
     //         수동 확인(confirmedAt)된 시그니처의 매핑은 보존
     // ──────────────────────────────────────────────
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const beforeCount = draft.canonicalSalesUnits.length;
       draft.canonicalSalesUnits = draft.canonicalSalesUnits.filter(
         (unit) => unit.storeId !== storeId,
@@ -194,7 +194,7 @@ export class MappingSeedService {
       details: [],
     };
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       // 2-A: 일반 상품 처리 (externalProductId 기반)
       regularGroups.forEach((group) => {
         const displayName = this.extractProductDisplayName(group.bestRawProductName);
@@ -292,18 +292,17 @@ export class MappingSeedService {
       // Recalculate mappings for the store
       recalculateOrderMappingsForStore(draft, storeId);
       recalculateAdMappingsForStore(draft, storeId);
-    });
 
-    result.totalProcessed = regularGroups.size + bundledGroups.size;
-
-    this.auditLogService.record({
-      storeId,
-      domain: "MAPPING_SEED",
-      action: "GENERATE_INITIAL_MAPPINGS",
-      targetId: null,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: { regularCount: regularGroups.size, bundledCount: bundledGroups.size },
-      afterJson: result,
+      result.totalProcessed = regularGroups.size + bundledGroups.size;
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "MAPPING_SEED",
+        action: "GENERATE_INITIAL_MAPPINGS",
+        targetId: null,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: { regularCount: regularGroups.size, bundledCount: bundledGroups.size },
+        afterJson: result,
+      });
     });
 
     return result;

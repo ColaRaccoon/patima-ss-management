@@ -71,7 +71,7 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  previewUpload(storeId: string, reportDate: string, file: Express.Multer.File) {
+  async previewUpload(storeId: string, reportDate: string, file: Express.Multer.File) {
     this.storeService.ensureWritable(storeId);
     const originalFileName = repairMojibakeText(file?.originalname);
     if (!file || !/\.xlsx$/i.test(originalFileName)) {
@@ -155,7 +155,7 @@ export class AdsService implements OnModuleInit {
 
     const confirmedRows: AdCampaignDailyCost[] = [];
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const touchedSignatureIds = new Set<string>();
       draft.adExcelUploads.push(upload);
       campaigns.forEach((campaign) => {
@@ -202,16 +202,15 @@ export class AdsService implements OnModuleInit {
         applyToRowsFrom: reportDate,
         applyToRowsTo: reportDate,
       });
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "AD_UPLOAD",
-      action: "CREATE",
-      targetId: upload.id,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: null,
-      afterJson: { reportDate, originalFileName, confirmedRowCount: confirmedRows.length },
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "AD_UPLOAD",
+        action: "CREATE",
+        targetId: upload.id,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: null,
+        afterJson: { reportDate, originalFileName, confirmedRowCount: confirmedRows.length },
+      });
     });
 
     return formatApiSuccess({
@@ -270,7 +269,7 @@ export class AdsService implements OnModuleInit {
     return formatApiSuccess(paginate(items, page, pageSize));
   }
 
-  deleteUpload(uploadId: string) {
+  async deleteUpload(uploadId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const upload = snapshot.adExcelUploads.find((item) => item.id === uploadId);
     if (!upload) {
@@ -296,7 +295,7 @@ export class AdsService implements OnModuleInit {
     const previousState = upload.state;
     const wasActive = upload.isActive;
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const affectedSignatureIds = new Set(
         draft.adCampaignDailyCosts
           .filter((item) => item.sourceUploadId === upload.id && item.adCampaignSignatureId)
@@ -313,24 +312,23 @@ export class AdsService implements OnModuleInit {
       target.state = "DELETED";
       target.isActive = false;
       target.updatedAt = nowIso();
-    });
-
-    this.auditLogService.record({
-      storeId: upload.storeId,
-      domain: "AD_UPLOAD",
-      action: "DELETE",
-      targetId: upload.id,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: {
-        state: previousState,
-        isActive: wasActive,
-        previewRowCount,
-        adCostCount,
-      },
-      afterJson: {
-        state: "DELETED",
-        isActive: false,
-      },
+      this.auditLogService.appendToDraft(draft, {
+        storeId: upload.storeId,
+        domain: "AD_UPLOAD",
+        action: "DELETE",
+        targetId: upload.id,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: {
+          state: previousState,
+          isActive: wasActive,
+          previewRowCount,
+          adCostCount,
+        },
+        afterJson: {
+          state: "DELETED",
+          isActive: false,
+        },
+      });
     });
 
     return formatApiSuccess({
@@ -341,7 +339,7 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  enqueueConfirm(uploadId: string) {
+  async enqueueConfirm(uploadId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const upload = snapshot.adExcelUploads.find((item) => item.id === uploadId);
     if (!upload) {
@@ -352,7 +350,7 @@ export class AdsService implements OnModuleInit {
       });
     }
 
-    const operation = this.operationService.enqueue(
+    const operation = await this.operationService.enqueue(
       upload.storeId,
       "AD_UPLOAD_CONFIRM",
       { uploadId },
@@ -426,7 +424,7 @@ export class AdsService implements OnModuleInit {
       "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
     );
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const touchedSignatureIds = new Set<string>();
       draft.adCampaignDailyCosts = draft.adCampaignDailyCosts.filter((item) => item.sourceUploadId !== upload.id);
       previewRows.forEach((row) => {
@@ -455,19 +453,18 @@ export class AdsService implements OnModuleInit {
       target.state = "CONFIRMED";
       target.isActive = true;
       target.updatedAt = nowIso();
-    });
-
-    this.auditLogService.record({
-      storeId: upload.storeId,
-      domain: "AD_UPLOAD",
-      action: "UPDATE",
-      targetId: upload.id,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: null,
-      afterJson: {
-        reportDate: upload.reportDate,
-        confirmedRowCount: previewRows.length,
-      },
+      this.auditLogService.appendToDraft(draft, {
+        storeId: upload.storeId,
+        domain: "AD_UPLOAD",
+        action: "UPDATE",
+        targetId: upload.id,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: null,
+        afterJson: {
+          reportDate: upload.reportDate,
+          confirmedRowCount: previewRows.length,
+        },
+      });
     });
 
     return {
@@ -607,8 +604,8 @@ export class AdsService implements OnModuleInit {
     return formatApiSuccess(paginate(items, query.page, query.pageSize));
   }
 
-  setIntentionalUnmapped(adCostId: string, payload: { reasonNote: string }) {
-    this.setIntentionalUnmappedInternal([adCostId], payload);
+  async setIntentionalUnmapped(adCostId: string, payload: { reasonNote: string }) {
+    await this.setIntentionalUnmappedInternal([adCostId], payload);
 
     return formatApiSuccess({
       adCostId,
@@ -617,8 +614,8 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  setIntentionalUnmappedMany(adCostIds: string[], payload: { reasonNote: string }) {
-    const result = this.setIntentionalUnmappedInternal(adCostIds, payload);
+  async setIntentionalUnmappedMany(adCostIds: string[], payload: { reasonNote: string }) {
+    const result = await this.setIntentionalUnmappedInternal(adCostIds, payload);
     return formatApiSuccess({
       adCostIds: result.adCostIds,
       updatedCount: result.adCostIds.length,
@@ -627,8 +624,8 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  saveManualMapping(adCostId: string, payload: { canonicalSalesUnitId: string }) {
-    this.saveManualMappingsInternal([adCostId], payload);
+  async saveManualMapping(adCostId: string, payload: { canonicalSalesUnitId: string }) {
+    await this.saveManualMappingsInternal([adCostId], payload);
     return formatApiSuccess({
       adCostId,
       canonicalSalesUnitId: payload.canonicalSalesUnitId,
@@ -636,8 +633,8 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  saveManualMappings(adCostIds: string[], payload: { canonicalSalesUnitId: string }) {
-    const result = this.saveManualMappingsInternal(adCostIds, payload);
+  async saveManualMappings(adCostIds: string[], payload: { canonicalSalesUnitId: string }) {
+    const result = await this.saveManualMappingsInternal(adCostIds, payload);
     return formatApiSuccess({
       adCostIds: result.adCostIds,
       canonicalSalesUnitId: payload.canonicalSalesUnitId,
@@ -646,8 +643,8 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  recalculateMapping(adCostId: string) {
-    const result = this.recalculateMappingsInternal([adCostId]);
+  async recalculateMapping(adCostId: string) {
+    const result = await this.recalculateMappingsInternal([adCostId]);
     return formatApiSuccess({
       adCostId,
       canonicalSalesUnitId: result.mappings[0]?.canonicalSalesUnitId ?? null,
@@ -656,8 +653,8 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  recalculateMappings(adCostIds: string[]) {
-    const result = this.recalculateMappingsInternal(adCostIds);
+  async recalculateMappings(adCostIds: string[]) {
+    const result = await this.recalculateMappingsInternal(adCostIds);
     return formatApiSuccess({
       adCostIds: result.adCostIds,
       updatedCount: result.adCostIds.length,
@@ -665,11 +662,11 @@ export class AdsService implements OnModuleInit {
     });
   }
 
-  private setIntentionalUnmappedInternal(adCostIds: string[], payload: { reasonNote: string }) {
+  private async setIntentionalUnmappedInternal(adCostIds: string[], payload: { reasonNote: string }) {
     const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds);
     this.storeService.ensureWritable(storeId);
     const timestamp = nowIso();
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
       draft.adCampaignSignatures.forEach((signature) => {
         if (!targetSignatureIds.has(signature.id)) {
@@ -692,7 +689,7 @@ export class AdsService implements OnModuleInit {
     return { adCostIds: dedupedIds };
   }
 
-  private saveManualMappingsInternal(adCostIds: string[], payload: { canonicalSalesUnitId: string }) {
+  private async saveManualMappingsInternal(adCostIds: string[], payload: { canonicalSalesUnitId: string }) {
     const snapshot = this.databaseService.getSnapshot();
     const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds, snapshot);
     const salesUnit = snapshot.canonicalSalesUnits.find(
@@ -724,7 +721,7 @@ export class AdsService implements OnModuleInit {
 
     this.storeService.ensureWritable(storeId);
     const timestamp = nowIso();
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
       draft.adCampaignSignatures.forEach((signature) => {
         if (!targetSignatureIds.has(signature.id)) {
@@ -747,12 +744,12 @@ export class AdsService implements OnModuleInit {
     return { adCostIds: dedupedIds };
   }
 
-  private recalculateMappingsInternal(adCostIds: string[]) {
+  private async recalculateMappingsInternal(adCostIds: string[]) {
     const snapshot = this.databaseService.getSnapshot();
     const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds, snapshot);
     this.storeService.ensureWritable(storeId);
     let targetSignatureIds = new Set<string>();
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
       recalculateAdCampaignSignaturesForStore(draft, storeId, {
         signatureIds: targetSignatureIds,

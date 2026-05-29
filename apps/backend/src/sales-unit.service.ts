@@ -43,7 +43,7 @@ export class SalesUnitService {
    * 스토어 전체 광고비 판매단위를 확인하고 없으면 자동 생성
    * 스토어당 1개만 존재해야 함
    */
-  ensureStoreLevelSalesUnit(storeId: string): string {
+  async ensureStoreLevelSalesUnit(storeId: string): Promise<string> {
     const snapshot = this.databaseService.getSnapshot();
     const store = snapshot.stores.find((s) => s.id === storeId);
     if (!store) {
@@ -80,18 +80,17 @@ export class SalesUnitService {
       updatedAt: nowIso(),
     };
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       draft.canonicalSalesUnits.push(newUnit);
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "SALES_UNIT",
-      action: "CREATE_STORE_LEVEL",
-      targetId: newUnit.id,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: null,
-      afterJson: newUnit,
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "SALES_UNIT",
+        action: "CREATE_STORE_LEVEL",
+        targetId: newUnit.id,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: null,
+        afterJson: newUnit,
+      });
     });
 
     return newUnit.id;
@@ -115,7 +114,7 @@ export class SalesUnitService {
     return formatApiSuccess(paginate(items, page, pageSize));
   }
 
-  create(payload: SalesUnitPayload, options?: SalesUnitCreateOptions) {
+  async create(payload: SalesUnitPayload, options?: SalesUnitCreateOptions) {
     this.storeService.ensureWritable(payload.storeId);
     const displayName = payload.displayName.trim();
     const matchAliases = sanitizeMatchAliases(payload.matchAliases ?? []);
@@ -143,7 +142,7 @@ export class SalesUnitService {
     this.ensureUnique(created);
     assertGroupInvariants(created);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       ensureStoreExists(draft, payload.storeId);
       draft.canonicalSalesUnits.push(created);
       if (!options?.skipOrderRecalculation) {
@@ -152,22 +151,21 @@ export class SalesUnitService {
       if (!options?.skipAdRecalculation) {
         recalculateAdMappingsForStore(draft, payload.storeId);
       }
-    });
-
-    this.auditLogService.record({
-      storeId: payload.storeId,
-      domain: "SALES_UNIT",
-      action: "CREATE",
-      targetId: created.id,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: null,
-      afterJson: created,
+      this.auditLogService.appendToDraft(draft, {
+        storeId: payload.storeId,
+        domain: "SALES_UNIT",
+        action: "CREATE",
+        targetId: created.id,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: null,
+        afterJson: created,
+      });
     });
 
     return formatApiSuccess(created);
   }
 
-  update(salesUnitId: string, payload: Omit<SalesUnitPayload, "storeId">) {
+  async update(salesUnitId: string, payload: Omit<SalesUnitPayload, "storeId">) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.canonicalSalesUnits.find((item) => item.id === salesUnitId);
     if (!existing) {
@@ -196,27 +194,26 @@ export class SalesUnitService {
     this.ensureUnique(updated, salesUnitId);
     assertGroupInvariants(updated);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.canonicalSalesUnits.find((item) => item.id === salesUnitId)!;
       Object.assign(target, updated);
       recalculateOrderMappingsForStore(draft, existing.storeId);
       recalculateAdMappingsForStore(draft, existing.storeId);
-    });
-
-    this.auditLogService.record({
-      storeId: existing.storeId,
-      domain: "SALES_UNIT",
-      action: "UPDATE",
-      targetId: salesUnitId,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: existing,
-      afterJson: updated,
+      this.auditLogService.appendToDraft(draft, {
+        storeId: existing.storeId,
+        domain: "SALES_UNIT",
+        action: "UPDATE",
+        targetId: salesUnitId,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: existing,
+        afterJson: updated,
+      });
     });
 
     return formatApiSuccess(updated);
   }
 
-  deactivate(salesUnitId: string) {
+  async deactivate(salesUnitId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.canonicalSalesUnits.find((item) => item.id === salesUnitId);
     if (!existing) {
@@ -228,7 +225,7 @@ export class SalesUnitService {
     }
     this.storeService.ensureWritable(existing.storeId);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.canonicalSalesUnits.find((item) => item.id === salesUnitId)!;
       target.isActive = false;
       target.deactivatedAt = nowIso();
@@ -250,7 +247,7 @@ export class SalesUnitService {
     });
   }
 
-  activate(salesUnitId: string) {
+  async activate(salesUnitId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.canonicalSalesUnits.find((item) => item.id === salesUnitId);
     if (!existing) {
@@ -262,7 +259,7 @@ export class SalesUnitService {
     }
     this.storeService.ensureWritable(existing.storeId);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.canonicalSalesUnits.find((item) => item.id === salesUnitId)!;
       target.isActive = true;
       target.deactivatedAt = null;
@@ -380,7 +377,16 @@ export class SalesUnitService {
 
     assertGroupInvariants(groupUnit);
 
-    this.databaseService.write((draft) => {
+    return this.createSalesUnitGroupCommitted(storeId, groupId, groupUnit, childSalesUnitIds);
+  }
+
+  private async createSalesUnitGroupCommitted(
+    storeId: string,
+    groupId: string,
+    groupUnit: CanonicalSalesUnit,
+    childSalesUnitIds: string[],
+  ) {
+    await this.databaseService.writeCommitted((draft) => {
       ensureStoreExists(draft, storeId);
       draft.canonicalSalesUnits.push(groupUnit);
 
@@ -406,16 +412,15 @@ export class SalesUnitService {
 
       // 광고 다시 계산
       recalculateAdMappingsForStore(draft, storeId);
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "SALES_UNIT",
-      action: "SALES_UNIT_GROUP_CREATED",
-      targetId: groupId,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: null,
-      afterJson: groupUnit,
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "SALES_UNIT",
+        action: "SALES_UNIT_GROUP_CREATED",
+        targetId: groupId,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: null,
+        afterJson: groupUnit,
+      });
     });
 
     return formatApiSuccess(groupUnit);
@@ -424,7 +429,7 @@ export class SalesUnitService {
   /**
    * 기존 그룹에 자식 추가
    */
-  attachChildToGroup(storeId: string, groupId: string, childId: string) {
+  async attachChildToGroup(storeId: string, groupId: string, childId: string) {
     this.storeService.ensureWritable(storeId);
     const snapshot = this.databaseService.getSnapshot();
 
@@ -488,7 +493,7 @@ export class SalesUnitService {
 
     const before = { ...child };
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const targetChild = draft.canonicalSalesUnits.find((u) => u.id === childId)!;
       targetChild.parentSalesUnitId = groupId;
       targetChild.updatedAt = nowIso();
@@ -503,16 +508,15 @@ export class SalesUnitService {
       });
 
       recalculateAdMappingsForStore(draft, storeId);
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "SALES_UNIT",
-      action: "SALES_UNIT_GROUP_CHILD_ATTACHED",
-      targetId: groupId,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: before,
-      afterJson: { ...child, parentSalesUnitId: groupId },
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "SALES_UNIT",
+        action: "SALES_UNIT_GROUP_CHILD_ATTACHED",
+        targetId: groupId,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: before,
+        afterJson: { ...child, parentSalesUnitId: groupId },
+      });
     });
 
     return formatApiSuccess({ groupId, childId });
@@ -521,7 +525,7 @@ export class SalesUnitService {
   /**
    * 자식을 그룹에서 제거
    */
-  detachChildFromGroup(storeId: string, childId: string) {
+  async detachChildFromGroup(storeId: string, childId: string) {
     this.storeService.ensureWritable(storeId);
     const snapshot = this.databaseService.getSnapshot();
 
@@ -553,21 +557,20 @@ export class SalesUnitService {
     const before = { ...child };
     const parentId = child.parentSalesUnitId;
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const targetChild = draft.canonicalSalesUnits.find((u) => u.id === childId)!;
       targetChild.parentSalesUnitId = null;
       targetChild.updatedAt = nowIso();
       // 광고 매핑은 건드리지 않음 (그룹에 남음)
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "SALES_UNIT",
-      action: "SALES_UNIT_GROUP_CHILD_DETACHED",
-      targetId: parentId,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: before,
-      afterJson: { ...child, parentSalesUnitId: null },
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "SALES_UNIT",
+        action: "SALES_UNIT_GROUP_CHILD_DETACHED",
+        targetId: parentId,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: before,
+        afterJson: { ...child, parentSalesUnitId: null },
+      });
     });
 
     return formatApiSuccess({ childId, parentId });
@@ -576,7 +579,7 @@ export class SalesUnitService {
   /**
    * 그룹 해체
    */
-  dissolveGroup(storeId: string, groupId: string) {
+  async dissolveGroup(storeId: string, groupId: string) {
     this.storeService.ensureWritable(storeId);
     const snapshot = this.databaseService.getSnapshot();
 
@@ -605,7 +608,7 @@ export class SalesUnitService {
       });
     }
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       // 자식들의 parentSalesUnitId 복구
       draft.canonicalSalesUnits
         .filter((u) => u.parentSalesUnitId === groupId)
@@ -639,16 +642,15 @@ export class SalesUnitService {
       targetGroup.isActive = false;
       targetGroup.deactivatedAt = nowIso();
       targetGroup.updatedAt = nowIso();
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "SALES_UNIT",
-      action: "SALES_UNIT_GROUP_DISSOLVED",
-      targetId: groupId,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: group,
-      afterJson: { ...group, isActive: false, deactivatedAt: nowIso() },
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "SALES_UNIT",
+        action: "SALES_UNIT_GROUP_DISSOLVED",
+        targetId: groupId,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: group,
+        afterJson: { ...group, isActive: false, deactivatedAt: nowIso() },
+      });
     });
 
     return formatApiSuccess({ groupId });

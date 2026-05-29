@@ -27,21 +27,21 @@ export class CampaignMappingService implements OnModuleInit {
     private readonly salesUnitService: SalesUnitService,
   ) {}
 
-  onModuleInit(): void {
+  async onModuleInit(): Promise<void> {
     this.operationService.registerRetryExecutor("RECALCULATE_AD_MAPPING", async (operation) =>
       this.recalculate(operation.storeId),
     );
 
     const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
-    storeIds.forEach((storeId) => {
+    for (const storeId of storeIds) {
       // 먼저 스토어 레벨 판매단위 확인/생성 (write 외부에서 호출)
-      this.salesUnitService.ensureStoreLevelSalesUnit(storeId);
+      await this.salesUnitService.ensureStoreLevelSalesUnit(storeId);
 
-      this.databaseService.write((draft) => {
+      await this.databaseService.writeCommitted((draft) => {
         this.seedDefaultCampaignMappingsForStore(draft, storeId);
         recalculateAdCampaignSignaturesForStore(draft, storeId, { onlyUnconfirmed: true });
       });
-    });
+    }
   }
 
   /**
@@ -147,7 +147,7 @@ export class CampaignMappingService implements OnModuleInit {
     return formatApiSuccess(paginate(items, page, pageSize));
   }
 
-  create(payload: { storeId: string; canonicalSalesUnitId: string; campaignPattern: string }) {
+  async create(payload: { storeId: string; canonicalSalesUnitId: string; campaignPattern: string }) {
     this.storeService.ensureWritable(payload.storeId);
     const snapshot = this.databaseService.getSnapshot();
     let salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === payload.canonicalSalesUnitId);
@@ -197,7 +197,7 @@ export class CampaignMappingService implements OnModuleInit {
     }
 
     let mapping: CampaignSalesUnitMapping;
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const inactive = draft.campaignMappings.find(
         (item) => item.storeId === payload.storeId && item.normalizedCampaignPattern === normalized,
       );
@@ -225,7 +225,7 @@ export class CampaignMappingService implements OnModuleInit {
       }
     });
 
-    const operation = this.operationService.enqueue(
+    const operation = await this.operationService.enqueue(
       payload.storeId,
       "RECALCULATE_AD_MAPPING",
       { storeId: payload.storeId, reason: "AD_MAPPING_CHANGED" },
@@ -238,7 +238,7 @@ export class CampaignMappingService implements OnModuleInit {
     });
   }
 
-  update(mappingId: string, payload: { canonicalSalesUnitId: string; campaignPattern: string }) {
+  async update(mappingId: string, payload: { canonicalSalesUnitId: string; campaignPattern: string }) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.campaignMappings.find((item) => item.id === mappingId);
     if (!existing) {
@@ -269,7 +269,7 @@ export class CampaignMappingService implements OnModuleInit {
       });
     }
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.campaignMappings.find((item) => item.id === mappingId)!;
       target.campaignPattern = payload.campaignPattern;
       target.normalizedCampaignPattern = normalizeCampaignPattern(payload.campaignPattern);
@@ -277,7 +277,7 @@ export class CampaignMappingService implements OnModuleInit {
       target.updatedAt = nowIso();
     });
 
-    const operation = this.operationService.enqueue(
+    const operation = await this.operationService.enqueue(
       existing.storeId,
       "RECALCULATE_AD_MAPPING",
       { storeId: existing.storeId, reason: "AD_MAPPING_CHANGED" },
@@ -290,7 +290,7 @@ export class CampaignMappingService implements OnModuleInit {
     });
   }
 
-  deactivate(mappingId: string) {
+  async deactivate(mappingId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.campaignMappings.find((item) => item.id === mappingId);
     if (!existing) {
@@ -302,14 +302,14 @@ export class CampaignMappingService implements OnModuleInit {
     }
     this.storeService.ensureWritable(existing.storeId);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.campaignMappings.find((item) => item.id === mappingId)!;
       target.isActive = false;
       target.deactivatedAt = nowIso();
       target.updatedAt = nowIso();
     });
 
-    const operation = this.operationService.enqueue(
+    const operation = await this.operationService.enqueue(
       existing.storeId,
       "RECALCULATE_AD_MAPPING",
       { storeId: existing.storeId, reason: "AD_MAPPING_CHANGED" },
@@ -324,7 +324,7 @@ export class CampaignMappingService implements OnModuleInit {
     });
   }
 
-  activate(mappingId: string) {
+  async activate(mappingId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.campaignMappings.find((item) => item.id === mappingId);
     if (!existing) {
@@ -336,14 +336,14 @@ export class CampaignMappingService implements OnModuleInit {
     }
     this.storeService.ensureWritable(existing.storeId);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.campaignMappings.find((item) => item.id === mappingId)!;
       target.isActive = true;
       target.deactivatedAt = null;
       target.updatedAt = nowIso();
     });
 
-    const operation = this.operationService.enqueue(
+    const operation = await this.operationService.enqueue(
       existing.storeId,
       "RECALCULATE_AD_MAPPING",
       { storeId: existing.storeId, reason: "AD_MAPPING_CHANGED" },
@@ -359,7 +359,7 @@ export class CampaignMappingService implements OnModuleInit {
   }
 
   async recalculate(storeId: string) {
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       recalculateAdCampaignSignaturesForStore(draft, storeId, { onlyUnconfirmed: true });
     });
 

@@ -19,21 +19,21 @@ export class OrderMappingService implements OnModuleInit {
     private readonly salesUnitService: SalesUnitService,
   ) {}
 
-  onModuleInit(): void {
+  async onModuleInit(): Promise<void> {
     this.operationService.registerRetryExecutor("RECALCULATE_ORDER_MAPPING", async (operation) => {
       return this.recalculate(operation.storeId);
     });
 
     const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
-    storeIds.forEach((storeId) => {
-      this.databaseService.write((draft) => {
+    for (const storeId of storeIds) {
+      await this.databaseService.writeCommitted((draft) => {
         recalculateOrderMappingsForStore(draft, storeId);
       });
-    });
+    }
   }
 
-  saveMapping(signatureId: string, payload: { canonicalSalesUnitId: string }) {
-    const result = this.saveMappingsInternal([signatureId], payload);
+  async saveMapping(signatureId: string, payload: { canonicalSalesUnitId: string }) {
+    const result = await this.saveMappingsInternal([signatureId], payload);
     return formatApiSuccess({
       signatureId,
       canonicalSalesUnitId: payload.canonicalSalesUnitId,
@@ -41,9 +41,9 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  enqueueRecalculate(storeId: string) {
+  async enqueueRecalculate(storeId: string) {
     this.storeService.ensureWritable(storeId);
-    const operation = this.operationService.enqueue(
+    const operation = await this.operationService.enqueue(
       storeId,
       "RECALCULATE_ORDER_MAPPING",
       { storeId, reason: "MANUAL_RECALCULATE_ORDER_MAPPING" },
@@ -58,8 +58,8 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  saveMappings(signatureIds: string[], payload: { canonicalSalesUnitId: string }) {
-    const result = this.saveMappingsInternal(signatureIds, payload);
+  async saveMappings(signatureIds: string[], payload: { canonicalSalesUnitId: string }) {
+    const result = await this.saveMappingsInternal(signatureIds, payload);
     return formatApiSuccess({
       signatureIds: result.signatureIds,
       canonicalSalesUnitId: payload.canonicalSalesUnitId,
@@ -68,8 +68,8 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  createAndMap(signatureId: string, payload: { displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null }) {
-    const result = this.createAndMapMany([signatureId], payload);
+  async createAndMap(signatureId: string, payload: { displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null }) {
+    const result = await this.createAndMapMany([signatureId], payload);
     return formatApiSuccess({
       signatureId,
       canonicalSalesUnitId: result.data.canonicalSalesUnitId,
@@ -77,9 +77,9 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  createAndMapMany(signatureIds: string[], payload: { displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null }) {
+  async createAndMapMany(signatureIds: string[], payload: { displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null }) {
     const { storeId } = this.resolveSignatureBatch(signatureIds);
-    const createdResponse = this.salesUnitService.create({
+    const createdResponse = await this.salesUnitService.create({
       storeId,
       displayName: payload.displayName,
       matchAliases: payload.matchAliases,
@@ -88,7 +88,7 @@ export class OrderMappingService implements OnModuleInit {
       memo: payload.memo,
     }, { skipOrderRecalculation: true });
     const created = createdResponse.data;
-    const result = this.saveMappingsInternal(signatureIds, { canonicalSalesUnitId: created.id });
+    const result = await this.saveMappingsInternal(signatureIds, { canonicalSalesUnitId: created.id });
     return formatApiSuccess({
       signatureIds: result.signatureIds,
       canonicalSalesUnitId: created.id,
@@ -98,7 +98,7 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  private saveMappingsInternal(signatureIds: string[], payload: { canonicalSalesUnitId: string }) {
+  private async saveMappingsInternal(signatureIds: string[], payload: { canonicalSalesUnitId: string }) {
     const { snapshot, storeId, dedupedIds } = this.resolveSignatureBatch(signatureIds);
     this.storeService.ensureWritable(storeId);
 
@@ -129,7 +129,7 @@ export class OrderMappingService implements OnModuleInit {
 
     const targetIds = new Set(dedupedIds);
     const timestamp = nowIso();
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       draft.orderSourceSignatures.forEach((item) => {
         if (!targetIds.has(item.id)) {
           return;
@@ -194,7 +194,7 @@ export class OrderMappingService implements OnModuleInit {
   }
 
   async recalculate(storeId: string) {
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       recalculateOrderMappingsForStore(draft, storeId);
     });
 

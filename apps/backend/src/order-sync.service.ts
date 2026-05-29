@@ -16,6 +16,13 @@ import {
 } from "./helpers";
 import { NaverCommerceService, SyncedOrderItemInput } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
+import {
+  getKstRetentionCutoffDate,
+  getOrderRawPayloadRetentionDays,
+  getSyncedOrderItemRetentionDate,
+  pruneExpiredOrderRawPayloads,
+  shouldRetainOrderRawPayload,
+} from "./raw-payload-retention";
 import { recalculateOrderMappingsForTouchedItems } from "./sales-unit-auto-mapper";
 import { enrichSignatureDisplayName, type EnrichmentContext } from "./signature-enrichment";
 
@@ -94,11 +101,11 @@ export class OrderSyncService implements OnModuleInit {
     });
   }
 
-  enqueueSync(storeId: string, dateFrom?: string, dateTo?: string) {
+  async enqueueSync(storeId: string, dateFrom?: string, dateTo?: string) {
     const { dateFrom: normalizedDateFrom, dateTo: normalizedDateTo, rangeMode } =
       ensureKstDateRange(dateFrom, dateTo);
     ensureStoreExists(this.databaseService.getSnapshot(), storeId);
-    const operation = this.operationService.enqueue(
+    const operation = await this.operationService.enqueue(
       storeId,
       "ORDER_SYNC",
       {
@@ -117,7 +124,7 @@ export class OrderSyncService implements OnModuleInit {
     });
   }
 
-  enqueueSyncAll(dateFrom?: string, dateTo?: string) {
+  async enqueueSyncAll(dateFrom?: string, dateTo?: string) {
     const { dateFrom: normalizedDateFrom, dateTo: normalizedDateTo, rangeMode } =
       ensureKstDateRange(dateFrom, dateTo);
     const snapshot = this.databaseService.getSnapshot();
@@ -135,14 +142,14 @@ export class OrderSyncService implements OnModuleInit {
       reason: "NAVER_CREDENTIALS_NOT_CONFIGURED" | "ORDER_SYNC_ALREADY_IN_FLIGHT";
     }> = [];
 
-    activeStores.forEach((store) => {
+    for (const store of activeStores) {
       if (this.operationService.hasInFlightOperation(store.id, "ORDER_SYNC")) {
         skippedStores.push({
           storeId: store.id,
           storeName: store.name,
           reason: "ORDER_SYNC_ALREADY_IN_FLIGHT",
         });
-        return;
+        continue;
       }
 
       if (!this.naverCommerceService.getResolvedConfiguration(store.id)) {
@@ -151,10 +158,10 @@ export class OrderSyncService implements OnModuleInit {
           storeName: store.name,
           reason: "NAVER_CREDENTIALS_NOT_CONFIGURED",
         });
-        return;
+        continue;
       }
 
-      const operation = this.operationService.enqueue(
+      const operation = await this.operationService.enqueue(
         store.id,
         "ORDER_SYNC",
         {
@@ -181,7 +188,7 @@ export class OrderSyncService implements OnModuleInit {
         operationType: "ORDER_SYNC",
         status: operation.status,
       });
-    });
+    }
 
     if (operations.length === 0 && skippedStores.length === 0) {
       throw new BadRequestException({
@@ -228,18 +235,30 @@ export class OrderSyncService implements OnModuleInit {
         : null;
       const entries = liveEntries ?? this.generateMockItems(dateFrom, dateTo);
       const syncSource = liveEnabled ? "NAVER_LIVE" : "MOCK_FALLBACK";
+      const rawPayloadRetentionDays = getOrderRawPayloadRetentionDays();
+      const rawPayloadRetentionCutoffDate = getKstRetentionCutoffDate(rawPayloadRetentionDays);
 
       let ordersUpserted = 0;
       let orderItemsUpserted = 0;
       let orderSourceSignaturesCreated = 0;
       let unknownOrderStatusCount = 0;
       let paymentDateMissingCount = 0;
+      let rawPayloadPrunedOrderCount = 0;
+      let rawPayloadPrunedOrderItemCount = 0;
 
-      this.databaseService.write((draft) => {
+      await this.databaseService.writeCommitted((draft) => {
         const touchedSignatureIds = new Set<string>();
         const touchedOrderItemIds = new Set<string>();
 
         entries.forEach((entry) => {
+          const rawPayloadReferenceDate = getSyncedOrderItemRetentionDate(entry);
+          const retainedRawPayload = shouldRetainOrderRawPayload(
+            rawPayloadReferenceDate,
+            rawPayloadRetentionCutoffDate,
+            rawPayloadRetentionDays,
+          )
+            ? entry.rawPayload
+            : null;
           const product = this.upsertProduct(draft, storeId, entry);
           const existingSignature = draft.orderSourceSignatures.find(
             (item) =>
@@ -261,7 +280,7 @@ export class OrderSyncService implements OnModuleInit {
             existingOrder.orderDatetime = entry.orderDateTime;
             existingOrder.paymentDatetime = entry.paymentDateTime;
             existingOrder.orderStatus = entry.rawStatus;
-            existingOrder.rawPayload = entry.rawPayload;
+            existingOrder.rawPayload = retainedRawPayload;
             existingOrder.syncedAt = nowIso();
             existingOrder.updatedAt = nowIso();
             orderRecord = existingOrder;
@@ -273,7 +292,7 @@ export class OrderSyncService implements OnModuleInit {
               orderDatetime: entry.orderDateTime,
               paymentDatetime: entry.paymentDateTime,
               orderStatus: entry.rawStatus,
-              rawPayload: entry.rawPayload,
+              rawPayload: retainedRawPayload,
               syncedAt: nowIso(),
               createdAt: nowIso(),
               updatedAt: nowIso(),
@@ -331,7 +350,7 @@ export class OrderSyncService implements OnModuleInit {
             isCanceled:
               entry.saleStatus === "CANCELED" || entry.saleStatus === "CANCEL_REQUESTED",
             isReturned: entry.saleStatus === "RETURNED",
-            rawPayload: entry.rawPayload,
+            rawPayload: retainedRawPayload,
             createdAt: existingItem?.createdAt ?? nowIso(),
             updatedAt: nowIso(),
           };
@@ -350,6 +369,15 @@ export class OrderSyncService implements OnModuleInit {
           orderItemsUpserted += 1;
         });
 
+        const pruneResult = pruneExpiredOrderRawPayloads(
+          draft,
+          storeId,
+          rawPayloadRetentionCutoffDate,
+          rawPayloadRetentionDays,
+        );
+        rawPayloadPrunedOrderCount = pruneResult.prunedOrderCount;
+        rawPayloadPrunedOrderItemCount = pruneResult.prunedOrderItemCount;
+
         recalculateOrderMappingsForTouchedItems(draft, {
           storeId,
           signatureIds: touchedSignatureIds,
@@ -360,6 +388,15 @@ export class OrderSyncService implements OnModuleInit {
         targetStore.lastOrderSyncAt = nowIso();
         targetStore.lastOrderSyncStatus = "SUCCEEDED";
         targetStore.updatedAt = nowIso();
+        this.auditLogService.appendToDraft(draft, {
+          storeId,
+          domain: "ORDER_SYNC",
+          action: "RUN",
+          targetId: null,
+          actorIdentifier: "LOCALHOST_ADMIN",
+          beforeJson: null,
+          afterJson: { dateFrom, dateTo, rangeMode, syncSource },
+        });
       });
 
       const result = {
@@ -370,39 +407,32 @@ export class OrderSyncService implements OnModuleInit {
         unknownOrderStatusCount,
         paymentDateMissingCount,
         syncedItemCount: entries.length,
+        rawPayloadRetentionDays,
+        rawPayloadRetentionCutoffDate,
+        rawPayloadPrunedOrderCount,
+        rawPayloadPrunedOrderItemCount,
       };
-
-      this.auditLogService.record({
-        storeId,
-        domain: "ORDER_SYNC",
-        action: "RUN",
-        targetId: null,
-        actorIdentifier: "LOCALHOST_ADMIN",
-        beforeJson: null,
-        afterJson: { dateFrom, dateTo, rangeMode, syncSource },
-      });
 
       return result;
     } catch (error) {
-      this.databaseService.write((draft) => {
+      await this.databaseService.writeCommitted((draft) => {
         const targetStore = ensureStoreExists(draft, storeId);
         targetStore.lastOrderSyncStatus = "FAILED";
         targetStore.updatedAt = nowIso();
-      });
-
-      this.auditLogService.record({
-        storeId,
-        domain: "ORDER_SYNC",
-        action: "RUN_FAILED",
-        targetId: null,
-        actorIdentifier: "LOCALHOST_ADMIN",
-        beforeJson: null,
-        afterJson: {
-          dateFrom,
-          dateTo,
-          rangeMode,
-          message: error instanceof Error ? error.message : String(error),
-        },
+        this.auditLogService.appendToDraft(draft, {
+          storeId,
+          domain: "ORDER_SYNC",
+          action: "RUN_FAILED",
+          targetId: null,
+          actorIdentifier: "LOCALHOST_ADMIN",
+          beforeJson: null,
+          afterJson: {
+            dateFrom,
+            dateTo,
+            rangeMode,
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
       });
 
       throw error;

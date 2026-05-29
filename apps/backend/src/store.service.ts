@@ -26,7 +26,7 @@ export class StoreService {
     return formatApiSuccess(this.databaseService.getSnapshot().stores);
   }
 
-  create(payload: StorePayload) {
+  async create(payload: StorePayload) {
     const platformType = payload.platformType ?? "NAVER_SMARTSTORE";
     if (!payload.name || !payload.sellerAccountId || !payload.channelNo) {
       throw new BadRequestException({
@@ -70,17 +70,17 @@ export class StoreService {
       updatedAt: nowIso(),
     };
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       draft.stores.push(created);
-    });
-    this.auditLogService.record({
-      storeId: created.id,
-      domain: "STORE",
-      action: "CREATE",
-      targetId: created.id,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: null,
-      afterJson: created,
+      this.auditLogService.appendToDraft(draft, {
+        storeId: created.id,
+        domain: "STORE",
+        action: "CREATE",
+        targetId: created.id,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: null,
+        afterJson: created,
+      });
     });
 
     return formatApiSuccess({
@@ -94,7 +94,7 @@ export class StoreService {
     });
   }
 
-  update(storeId: string, payload: StorePayload) {
+  async update(storeId: string, payload: StorePayload) {
     this.ensureWritable(storeId);
     const previous = ensureStoreExists(this.databaseService.getSnapshot(), storeId);
 
@@ -128,7 +128,7 @@ export class StoreService {
     }
 
     let updated!: Store;
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const store = ensureStoreExists(draft, storeId);
       store.name = payload.name;
       store.sellerAccountId = payload.sellerAccountId;
@@ -139,16 +139,15 @@ export class StoreService {
       }
       store.updatedAt = nowIso();
       updated = { ...store };
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "STORE",
-      action: "UPDATE",
-      targetId: storeId,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: previous,
-      afterJson: updated,
+      this.auditLogService.appendToDraft(draft, {
+        storeId,
+        domain: "STORE",
+        action: "UPDATE",
+        targetId: storeId,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: previous,
+        afterJson: updated,
+      });
     });
 
     return formatApiSuccess({
@@ -162,10 +161,10 @@ export class StoreService {
     });
   }
 
-  setPrimary(storeId: string) {
+  async setPrimary(storeId: string) {
     this.ensureWritable(storeId);
     let previousPrimaryStoreId: string | null = null;
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       ensureStoreExists(draft, storeId);
       draft.stores.forEach((store) => {
         if (store.isPrimary && store.id !== storeId) {
@@ -183,10 +182,10 @@ export class StoreService {
     });
   }
 
-  deactivate(storeId: string) {
+  async deactivate(storeId: string) {
     this.ensureWritable(storeId);
     let updated!: Store;
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const store = ensureStoreExists(draft, storeId);
       store.isActive = false;
       store.deactivatedAt = nowIso();
@@ -201,7 +200,7 @@ export class StoreService {
     });
   }
 
-  activate(storeId: string) {
+  async activate(storeId: string) {
     ensureStoreExists(this.databaseService.getSnapshot(), storeId);
     if (this.operationService.hasRunningOperation(storeId)) {
       throw new BadRequestException({
@@ -212,7 +211,7 @@ export class StoreService {
     }
 
     let updated!: Store;
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const store = ensureStoreExists(draft, storeId);
       store.isActive = true;
       store.deactivatedAt = null;

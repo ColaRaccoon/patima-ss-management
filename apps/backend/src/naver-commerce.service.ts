@@ -840,18 +840,18 @@ export class NaverCommerceService {
       accessToken: parsed.body.access_token,
       expiresAt,
     });
-    this.recordTokenIssuedAt(credential.credentialId, expiresAt);
+    await this.recordTokenIssuedAt(credential.credentialId, expiresAt);
     return parsed.body.access_token;
   }
 
-  private recordTokenIssuedAt(credentialId: string | null, expiresAt: number) {
+  private async recordTokenIssuedAt(credentialId: string | null, expiresAt: number) {
     if (!credentialId) {
       return;
     }
 
     const issuedAtIso = new Date().toISOString();
     const expiresAtIso = new Date(expiresAt).toISOString();
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const credential = draft.commerceCredentials.find((item) => item.id === credentialId);
       if (!credential) {
         return;

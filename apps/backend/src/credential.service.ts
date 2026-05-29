@@ -30,9 +30,17 @@ export class CredentialService {
     }
 
     const encrypted = this.cryptoService.encrypt(payload.clientSecret);
+    return this.upsertCommitted(storeId, payload, encrypted);
+  }
+
+  private async upsertCommitted(
+    storeId: string,
+    payload: { clientId: string; clientSecret: string; accessType?: "SELLER" },
+    encrypted: string,
+  ) {
     let credentialId = "";
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       ensureStoreExists(draft, storeId);
       const existing = draft.commerceCredentials.find(
         (item) => item.storeId === storeId,
@@ -44,36 +52,35 @@ export class CredentialService {
         existing.isEnabled = true;
         existing.updatedAt = nowIso();
         credentialId = existing.id;
-        return;
+      } else {
+        const created = {
+          id: createId(),
+          storeId,
+          clientId: payload.clientId,
+          clientSecretEncrypted: encrypted,
+          accessType: payload.accessType ?? "SELLER",
+          isEnabled: true,
+          lastTokenIssuedAt: null,
+          lastTokenExpiresAt: null,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        };
+        draft.commerceCredentials.push(created);
+        credentialId = created.id;
       }
 
-      const created = {
-        id: createId(),
+      this.auditLogService.appendToDraft(draft, {
         storeId,
-        clientId: payload.clientId,
-        clientSecretEncrypted: encrypted,
-        accessType: payload.accessType ?? "SELLER",
-        isEnabled: true,
-        lastTokenIssuedAt: null,
-        lastTokenExpiresAt: null,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-      };
-      draft.commerceCredentials.push(created);
-      credentialId = created.id;
-    });
-
-    this.auditLogService.record({
-      storeId,
-      domain: "COMMERCE_CREDENTIALS",
-      action: "UPDATE",
-      targetId: credentialId,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: null,
-      afterJson: {
-        maskedClientId: `${payload.clientId.slice(0, 8)}****`,
-        accessType: payload.accessType ?? "SELLER",
-      },
+        domain: "COMMERCE_CREDENTIALS",
+        action: "UPDATE",
+        targetId: credentialId,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: null,
+        afterJson: {
+          maskedClientId: `${payload.clientId.slice(0, 8)}****`,
+          accessType: payload.accessType ?? "SELLER",
+        },
+      });
     });
 
     return formatApiSuccess({
@@ -119,16 +126,40 @@ export class CredentialService {
     this.storeService.ensureWritable(storeId);
     const testedAt = nowIso();
 
+    let result: Awaited<ReturnType<NaverCommerceService["testConnection"]>>;
     try {
-      const result = await this.naverCommerceService.testConnection(storeId);
-      this.databaseService.write((draft) => {
+      result = await this.naverCommerceService.testConnection(storeId);
+    } catch (error) {
+      await this.databaseService.writeCommitted((draft) => {
         const store = ensureStoreExists(draft, storeId);
-        store.credentialConnectionStatus = "SUCCEEDED";
+        store.credentialConnectionStatus = "FAILED";
         store.lastCredentialTestAt = testedAt;
         store.updatedAt = testedAt;
+
+        this.auditLogService.appendToDraft(draft, {
+          storeId,
+          domain: "COMMERCE_CREDENTIALS",
+          action: "TEST_FAILED",
+          targetId: null,
+          actorIdentifier: "LOCALHOST_ADMIN",
+          beforeJson: null,
+          afterJson: {
+            connectionStatus: "FAILED",
+            error: error instanceof Error ? error.message : "UNKNOWN",
+          },
+        });
       });
 
-      this.auditLogService.record({
+      throw error;
+    }
+
+    await this.databaseService.writeCommitted((draft) => {
+      const store = ensureStoreExists(draft, storeId);
+      store.credentialConnectionStatus = "SUCCEEDED";
+      store.lastCredentialTestAt = testedAt;
+      store.updatedAt = testedAt;
+
+      this.auditLogService.appendToDraft(draft, {
         storeId,
         domain: "COMMERCE_CREDENTIALS",
         action: "TEST",
@@ -142,35 +173,13 @@ export class CredentialService {
           channelName: result.channelName,
         },
       });
+    });
 
-      return formatApiSuccess({
-        storeId,
-        connectionStatus: "SUCCEEDED",
-        testedAt,
-        ...result,
-      });
-    } catch (error) {
-      this.databaseService.write((draft) => {
-        const store = ensureStoreExists(draft, storeId);
-        store.credentialConnectionStatus = "FAILED";
-        store.lastCredentialTestAt = testedAt;
-        store.updatedAt = testedAt;
-      });
-
-      this.auditLogService.record({
-        storeId,
-        domain: "COMMERCE_CREDENTIALS",
-        action: "TEST_FAILED",
-        targetId: null,
-        actorIdentifier: "LOCALHOST_ADMIN",
-        beforeJson: null,
-        afterJson: {
-          connectionStatus: "FAILED",
-          error: error instanceof Error ? error.message : "UNKNOWN",
-        },
-      });
-
-      throw error;
-    }
+    return formatApiSuccess({
+      storeId,
+      connectionStatus: "SUCCEEDED",
+      testedAt,
+      ...result,
+    });
   }
 }

@@ -56,7 +56,7 @@ export class CostService {
     return formatApiSuccess(items);
   }
 
-  create(payload: {
+  async create(payload: {
     storeId: string;
     canonicalSalesUnitId: string;
     unitCost: number;
@@ -133,7 +133,7 @@ export class CostService {
       updatedAt: nowIso(),
     };
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const previous = draft.salesUnitCostSettings.find((item) => item.id === previousRow?.id);
       if (previous && !previous.effectiveTo) {
         previous.effectiveTo = this.minusOneDay(payload.effectiveFrom);
@@ -151,7 +151,7 @@ export class CostService {
     });
   }
 
-  update(costSettingId: string, payload: { unitCost: number; feeRate: number | null; otherCost: number; effectiveFrom: string }) {
+  async update(costSettingId: string, payload: { unitCost: number; feeRate: number | null; otherCost: number; effectiveFrom: string }) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.salesUnitCostSettings.find((item) => item.id === costSettingId);
     if (!existing) {
@@ -179,7 +179,7 @@ export class CostService {
     }
     this.validateValues(payload.unitCost, payload.otherCost, payload.feeRate);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.salesUnitCostSettings.find((item) => item.id === costSettingId)!;
       target.unitCost = payload.unitCost;
       target.feeRate = payload.feeRate;
@@ -196,7 +196,7 @@ export class CostService {
     });
   }
 
-  close(costSettingId: string, payload: { effectiveTo: string }) {
+  async close(costSettingId: string, payload: { effectiveTo: string }) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.salesUnitCostSettings.find((item) => item.id === costSettingId);
     if (!existing) {
@@ -215,7 +215,7 @@ export class CostService {
       });
     }
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.salesUnitCostSettings.find((item) => item.id === costSettingId)!;
       target.effectiveTo = payload.effectiveTo;
       target.updatedAt = nowIso();
@@ -228,7 +228,7 @@ export class CostService {
     });
   }
 
-  deactivate(costSettingId: string) {
+  async deactivate(costSettingId: string) {
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.salesUnitCostSettings.find((item) => item.id === costSettingId);
     if (!existing) {
@@ -255,7 +255,7 @@ export class CostService {
       });
     }
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const target = draft.salesUnitCostSettings.find((item) => item.id === costSettingId)!;
       target.isActive = false;
       target.deactivatedAt = nowIso();
@@ -456,7 +456,7 @@ export class CostService {
 
     const snapshotId = createId();
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       for (const parsedRow of parsedRows) {
         const { salesUnitId, displayName, matchAliases, linkedProductIds, linkedOptionCodes, linkedManageCodes, memo, unitCost, feeRate, otherCost } =
           parsedRow;
@@ -569,7 +569,7 @@ export class CostService {
       });
 
       // 감사 로그 기록
-      this.auditLogService.record({
+      this.auditLogService.appendToDraft(draft, {
         storeId,
         domain: "COST_SNAPSHOT",
         action: replacedSnapshotInfo ? "REPLACE" : "CREATE",
@@ -728,7 +728,7 @@ export class CostService {
   /**
    * 스냅샷 삭제
    */
-  deleteSnapshot(snapshotId: string): { success: true; message: string } {
+  async deleteSnapshot(snapshotId: string): Promise<{ success: true; message: string }> {
     const snapshot = this.databaseService.getSnapshot();
     const targetSnapshot = snapshot.salesUnitCostSnapshots.find((s) => s.id === snapshotId);
 
@@ -742,14 +742,14 @@ export class CostService {
 
     this.storeService.ensureWritable(targetSnapshot.storeId);
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       // 스냅샷 삭제
       draft.salesUnitCostSnapshots = draft.salesUnitCostSnapshots.filter((s) => s.id !== snapshotId);
       // entries 삭제
       draft.salesUnitCostSnapshotEntries = draft.salesUnitCostSnapshotEntries.filter((e) => e.snapshotId !== snapshotId);
 
       // 감사 로그
-      this.auditLogService.record({
+      this.auditLogService.appendToDraft(draft, {
         storeId: targetSnapshot.storeId,
         domain: "COST_SNAPSHOT",
         action: "DELETE",

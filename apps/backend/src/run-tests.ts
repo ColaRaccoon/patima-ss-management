@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createSourceSignature, normalizeText, DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import * as XLSX from "xlsx";
 import {
@@ -7,7 +10,7 @@ import {
   recalculateAdCampaignSignaturesForStore,
 } from "./ad-mapping-engine";
 import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
-import { DatabaseService } from "./database.service";
+import { DatabaseService, POSTGRES_UPSERT_BATCH_SIZE, hashPayload, stableStringify } from "./database.service";
 import { FakePurchaseService } from "./fake-purchase.service";
 import {
   calculateDashboardSummary,
@@ -26,10 +29,16 @@ import {
 } from "./helpers";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { NaverCommerceService, createNaverClientSecretSign } from "./naver-commerce.service";
+import type { SyncedOrderItemInput } from "./naver-commerce.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
 import { OperationService } from "./operation.service";
 import { ProfitService } from "./profit.service";
+import {
+  DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS,
+  getKstRetentionCutoffDate,
+  getOrderRawPayloadRetentionDays,
+} from "./raw-payload-retention";
 import {
   recalculateOrderMappingsForStore,
   recalculateOrderMappingsForTouchedItems,
@@ -43,12 +52,13 @@ const run = (name: string, fn: () => void) => {
 };
 
 const pendingAsyncTests: Promise<void>[] = [];
+let asyncTestChain = Promise.resolve();
 const runAsync = (name: string, fn: () => Promise<void>) => {
-  pendingAsyncTests.push(
-    fn().then(() => {
-      console.log(`PASS ${name}`);
-    }),
-  );
+  const testPromise = asyncTestChain.then(fn).then(() => {
+    console.log(`PASS ${name}`);
+  });
+  asyncTestChain = testPromise;
+  pendingAsyncTests.push(testPromise);
 };
 
 const createSalesUnit = (id: string, displayName: string, matchAliases: string[]) =>
@@ -80,6 +90,30 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
     this.database = draft;
     return result;
   },
+  async writeCommitted(mutator: (draft: typeof database) => unknown) {
+    return this.write(mutator);
+  },
+});
+
+const createAuditLogServiceDouble = (auditCalls: Array<Record<string, unknown>> = []) => ({
+  record(params: Record<string, unknown>) {
+    auditCalls.push(params);
+    return params;
+  },
+  async recordCommitted(params: Record<string, unknown>) {
+    auditCalls.push(params);
+    return params;
+  },
+  appendToDraft(draft: { auditLogs?: unknown[] }, params: Record<string, unknown>) {
+    auditCalls.push(params);
+    draft.auditLogs?.push({
+      id: `audit-test-${auditCalls.length}`,
+      actorType: "LOCALHOST_ADMIN",
+      createdAt: new Date().toISOString(),
+      ...params,
+    });
+    return params;
+  },
 });
 
 const createAdsServiceHarness = () => {
@@ -95,9 +129,7 @@ const createAdsServiceHarness = () => {
         throw new Error("enqueue not used in tests");
       },
     } as never,
-    {
-      record: () => null,
-    } as never,
+    createAuditLogServiceDouble() as never,
   );
 
   return { databaseService, adsService };
@@ -143,12 +175,7 @@ const createFakePurchaseServiceHarness = () => {
         }
       },
     } as never,
-    {
-      record: (params: Record<string, unknown>) => {
-        auditCalls.push(params);
-        return params;
-      },
-    } as never,
+    createAuditLogServiceDouble(auditCalls) as never,
   );
 
   databaseService.write((draft) => {
@@ -199,6 +226,7 @@ const createOrderSyncServiceHarness = (params?: {
   stores?: ReturnType<typeof createStoreRecord>[];
   configuredStoreIds?: string[];
   inFlightStoreIds?: string[];
+  liveOrderItems?: SyncedOrderItemInput[];
 }) => {
   const databaseService = createMemoryDatabaseService();
   const enqueueCalls: Array<{
@@ -245,17 +273,65 @@ const createOrderSyncServiceHarness = (params?: {
   const orderSyncService = new OrderSyncService(
     databaseService as never,
     operationService as never,
-    { record: () => null } as never,
+    createAuditLogServiceDouble() as never,
     {
       getResolvedConfiguration: (storeId: string) =>
         configuredStoreIds.has(storeId) ? { store: { id: storeId }, credential: {} } : null,
       fetchOrderItems: () => {
-        throw new Error("fetchOrderItems not used in enqueue tests");
+        if (params?.liveOrderItems) {
+          return params.liveOrderItems;
+        }
+        throw new Error("fetchOrderItems not configured for this test");
       },
     } as never,
   );
 
   return { databaseService, orderSyncService, enqueueCalls, retryExecutors };
+};
+
+const createSyncedOrderItemInput = (params: {
+  externalOrderId: string;
+  externalProductOrderId: string;
+  date: string;
+  paymentDate?: string | null;
+  rawPayload?: Record<string, unknown>;
+  rawProductName?: string;
+  optionCode?: string | null;
+  optionManageCode?: string;
+  paymentCommission?: number | null;
+  deliveryFeeAmount?: number | null;
+  productPaymentAmount?: number;
+  totalProductAmount?: number | null;
+}): SyncedOrderItemInput => {
+  const productPaymentAmount = params.productPaymentAmount ?? 10000;
+  const paymentDate = params.paymentDate === undefined ? params.date : params.paymentDate;
+  return {
+    externalOrderId: params.externalOrderId,
+    externalProductOrderId: params.externalProductOrderId,
+    externalProductId: `product-${params.externalProductOrderId}`,
+    rawProductName: params.rawProductName ?? "Retention Test Product",
+    rawOptionInfo: "Color: Black",
+    optionCode: params.optionCode ?? "OPT-RETENTION",
+    optionManageCode: params.optionManageCode,
+    quantity: 1,
+    productPaymentAmount,
+    totalProductAmount: params.totalProductAmount ?? productPaymentAmount,
+    deliveryFeeAmount: params.deliveryFeeAmount ?? 3000,
+    paymentCommission: params.paymentCommission ?? 150,
+    knowledgeShoppingSellingInterlockCommission: 80,
+    saleCommission: 0,
+    channelCommission: 0,
+    orderDate: params.date,
+    paymentDate,
+    orderDateTime: `${params.date}T09:00:00+09:00`,
+    paymentDateTime: paymentDate ? `${paymentDate}T09:30:00+09:00` : null,
+    productOrderStatus: "DELIVERED",
+    claimStatus: null,
+    rawStatus: "DELIVERED",
+    saleStatus: "SALE",
+    packageNumber: `PKG-${params.externalOrderId}`,
+    rawPayload: params.rawPayload ?? { source: params.externalProductOrderId },
+  };
 };
 
 const createOrderSourceSignature = (id: string, productName: string, storeId = "store-1") =>
@@ -455,9 +531,9 @@ run("NaverCommerceService prefers productOption over optionCode for readable opt
   );
 });
 
-run("OrderSyncService enqueueSyncAll targets active configured stores and skips missing credentials", () => {
+runAsync("OrderSyncService enqueueSyncAll targets active configured stores and skips missing credentials", async () => {
   const { orderSyncService, enqueueCalls } = createOrderSyncServiceHarness();
-  const result = orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
+  const result = await orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
 
   assert.equal(result.data.dateFrom, "2026-05-10");
   assert.equal(result.data.dateTo, "2026-05-10");
@@ -473,7 +549,7 @@ run("OrderSyncService enqueueSyncAll targets active configured stores and skips 
   assert.equal(enqueueCalls[0].requestJson.requestedByBatch, true);
 });
 
-run("OrderSyncService enqueueSyncAll skips stores with in-flight ORDER_SYNC", () => {
+runAsync("OrderSyncService enqueueSyncAll skips stores with in-flight ORDER_SYNC", async () => {
   const { orderSyncService, enqueueCalls } = createOrderSyncServiceHarness({
     stores: [
       createStoreRecord("store-live", "Live Store"),
@@ -482,7 +558,7 @@ run("OrderSyncService enqueueSyncAll skips stores with in-flight ORDER_SYNC", ()
     configuredStoreIds: ["store-live", "store-live-2"],
     inFlightStoreIds: ["store-live"],
   });
-  const result = orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
+  const result = await orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
 
   assert.equal(result.data.targetStoreCount, 1);
   assert.equal(result.data.skippedStoreCount, 1);
@@ -492,7 +568,7 @@ run("OrderSyncService enqueueSyncAll skips stores with in-flight ORDER_SYNC", ()
   assert.equal(enqueueCalls.length, 1);
 });
 
-run("OrderSyncService retry executor preserves requireLiveCredential", () => {
+runAsync("OrderSyncService retry executor preserves requireLiveCredential", async () => {
   const { orderSyncService, retryExecutors } = createOrderSyncServiceHarness();
   let capturedOptions: { requireLiveCredential?: boolean } | undefined;
   orderSyncService.performSync = ((
@@ -503,13 +579,13 @@ run("OrderSyncService retry executor preserves requireLiveCredential", () => {
     options?: { requireLiveCredential?: boolean },
   ) => {
     capturedOptions = options;
-    return {};
+    return Promise.resolve({});
   }) as never;
 
   orderSyncService.onModuleInit();
   const retryExecutor = retryExecutors.get("ORDER_SYNC");
   assert.ok(retryExecutor);
-  retryExecutor({
+  await retryExecutor({
     storeId: "store-live",
     requestJson: {
       dateFrom: "2026-05-10",
@@ -522,17 +598,326 @@ run("OrderSyncService retry executor preserves requireLiveCredential", () => {
   assert.equal(capturedOptions?.requireLiveCredential, true);
 });
 
-run("OrderSyncService enqueueSyncAll rejects manual ranges over 30 days", () => {
+runAsync("OrderSyncService enqueueSyncAll rejects manual ranges over 30 days", async () => {
   const { orderSyncService } = createOrderSyncServiceHarness();
 
-  assert.throws(() => orderSyncService.enqueueSyncAll("2026-01-01", "2026-02-01"));
+  await assert.rejects(() => orderSyncService.enqueueSyncAll("2026-01-01", "2026-02-01"));
+});
+
+run("ORDER_RAW_PAYLOAD_RETENTION_DAYS accepts only non-negative integers", () => {
+  const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+  try {
+    process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "0";
+    assert.equal(getOrderRawPayloadRetentionDays(), 0);
+    process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "30";
+    assert.equal(getOrderRawPayloadRetentionDays(), 30);
+    process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "1.5";
+    assert.equal(getOrderRawPayloadRetentionDays(), DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS);
+    process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "-1";
+    assert.equal(getOrderRawPayloadRetentionDays(), DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS);
+    process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "invalid";
+    assert.equal(getOrderRawPayloadRetentionDays(), DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS);
+  } finally {
+    if (original === undefined) {
+      delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+    } else {
+      process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = original;
+    }
+  }
+});
+
+runAsync("OrderSyncService retains recent rawPayloads and prunes only expired store-scoped payloads", async () => {
+  const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+  process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "1";
+  const recentDate = getKstRetentionCutoffDate(0);
+  const oldDate = getKstRetentionCutoffDate(2);
+  const cutoffDate = getKstRetentionCutoffDate(1);
+  const { databaseService, orderSyncService } = createOrderSyncServiceHarness({
+    stores: [createStoreRecord("store-1", "Main Store"), createStoreRecord("store-2", "Other Store")],
+    configuredStoreIds: ["store-1"],
+    liveOrderItems: [
+      createSyncedOrderItemInput({
+        externalOrderId: "order-sync-old",
+        externalProductOrderId: "item-sync-old",
+        date: oldDate,
+        rawPayload: { retain: "old-sync" },
+        optionCode: "OPT-OLD",
+        optionManageCode: "MNG-OLD",
+        paymentCommission: 456,
+        deliveryFeeAmount: 3210,
+        productPaymentAmount: 12345,
+      }),
+      createSyncedOrderItemInput({
+        externalOrderId: "order-sync-recent",
+        externalProductOrderId: "item-sync-recent",
+        date: recentDate,
+        rawPayload: { retain: "recent-sync" },
+      }),
+    ],
+  });
+
+  try {
+    databaseService.write((draft) => {
+      draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Retention Unit", []));
+      draft.salesUnitCostSnapshots.push({
+        id: "cost-snapshot-1",
+        storeId: "store-1",
+        effectiveFrom: oldDate,
+        sourceFileName: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      draft.salesUnitCostSnapshotEntries.push({
+        id: "cost-entry-1",
+        snapshotId: "cost-snapshot-1",
+        storeId: "store-1",
+        canonicalSalesUnitId: "sales-1",
+        unitCost: 1000,
+        feeRate: 0.1,
+        otherCost: 100,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      draft.orders.push(
+        {
+          id: "prune-order-old",
+          storeId: "store-1",
+          externalOrderId: "external-prune-order-old",
+          orderDatetime: `${oldDate}T08:00:00+09:00`,
+          paymentDatetime: `${oldDate}T08:30:00+09:00`,
+          orderStatus: "DELIVERED",
+          rawPayload: { old: true },
+          syncedAt: `${oldDate}T09:00:00+09:00`,
+          createdAt: `${oldDate}T09:00:00+09:00`,
+          updatedAt: `${oldDate}T09:00:00+09:00`,
+        },
+        {
+          id: "keep-order-recent",
+          storeId: "store-1",
+          externalOrderId: "external-keep-order-recent",
+          orderDatetime: `${recentDate}T08:00:00+09:00`,
+          paymentDatetime: `${recentDate}T08:30:00+09:00`,
+          orderStatus: "DELIVERED",
+          rawPayload: { recent: true },
+          syncedAt: `${recentDate}T09:00:00+09:00`,
+          createdAt: `${recentDate}T09:00:00+09:00`,
+          updatedAt: `${recentDate}T09:00:00+09:00`,
+        },
+        {
+          id: "other-store-order-old",
+          storeId: "store-2",
+          externalOrderId: "external-other-store-order-old",
+          orderDatetime: `${oldDate}T08:00:00+09:00`,
+          paymentDatetime: `${oldDate}T08:30:00+09:00`,
+          orderStatus: "DELIVERED",
+          rawPayload: { otherStore: true },
+          syncedAt: `${oldDate}T09:00:00+09:00`,
+          createdAt: `${oldDate}T09:00:00+09:00`,
+          updatedAt: `${oldDate}T09:00:00+09:00`,
+        },
+      );
+      draft.orderItems.push(
+        {
+          id: "prune-item-old",
+          orderId: "prune-order-old",
+          storeId: "store-1",
+          productId: null,
+          orderSourceSignatureId: null,
+          canonicalSalesUnitId: "sales-1",
+          externalProductOrderId: "external-prune-item-old",
+          externalProductId: "product-prune",
+          optionCode: "OPT-KEEP",
+          optionManageCode: "MNG-KEEP",
+          packageNumber: "PKG-KEEP",
+          rawProductName: "Retention Unit",
+          rawOptionInfo: "Color: Black",
+          normalizedProductName: normalizeText("Retention Unit"),
+          normalizedOptionInfo: normalizeText("Color: Black"),
+          sourceSignature: createSourceSignature("Retention Unit", "Color: Black"),
+          quantity: 2,
+          productPaymentAmount: 20000,
+          totalProductAmount: 20000,
+          deliveryFeeAmount: 3000,
+          paymentCommission: 500,
+          knowledgeShoppingSellingInterlockCommission: 200,
+          saleCommission: 0,
+          channelCommission: 0,
+          orderDate: oldDate,
+          paymentDate: oldDate,
+          saleStatus: "SALE",
+          orderStatus: "DELIVERED",
+          isCanceled: false,
+          isReturned: false,
+          rawPayload: { oldItem: true },
+          createdAt: `${oldDate}T09:00:00+09:00`,
+          updatedAt: `${oldDate}T09:00:00+09:00`,
+        },
+        {
+          id: "already-null-item-old",
+          orderId: "prune-order-old",
+          storeId: "store-1",
+          productId: null,
+          orderSourceSignatureId: null,
+          canonicalSalesUnitId: null,
+          externalProductOrderId: "external-already-null-item-old",
+          externalProductId: null,
+          optionCode: "OPT-NULL",
+          packageNumber: null,
+          rawProductName: "Already Null",
+          rawOptionInfo: null,
+          normalizedProductName: normalizeText("Already Null"),
+          normalizedOptionInfo: "",
+          sourceSignature: createSourceSignature("Already Null", null),
+          quantity: 1,
+          productPaymentAmount: 100,
+          totalProductAmount: 100,
+          deliveryFeeAmount: 0,
+          paymentCommission: 0,
+          knowledgeShoppingSellingInterlockCommission: 0,
+          saleCommission: 0,
+          channelCommission: 0,
+          orderDate: oldDate,
+          paymentDate: oldDate,
+          saleStatus: "SALE",
+          orderStatus: "DELIVERED",
+          isCanceled: false,
+          isReturned: false,
+          rawPayload: null,
+          createdAt: `${oldDate}T09:00:00+09:00`,
+          updatedAt: `${oldDate}T09:00:00+09:00`,
+        },
+        {
+          id: "other-store-item-old",
+          orderId: "other-store-order-old",
+          storeId: "store-2",
+          productId: null,
+          orderSourceSignatureId: null,
+          canonicalSalesUnitId: null,
+          externalProductOrderId: "external-other-store-item-old",
+          externalProductId: null,
+          optionCode: "OPT-OTHER",
+          packageNumber: null,
+          rawProductName: "Other Store",
+          rawOptionInfo: null,
+          normalizedProductName: normalizeText("Other Store"),
+          normalizedOptionInfo: "",
+          sourceSignature: createSourceSignature("Other Store", null),
+          quantity: 1,
+          productPaymentAmount: 100,
+          totalProductAmount: 100,
+          deliveryFeeAmount: 0,
+          paymentCommission: 0,
+          knowledgeShoppingSellingInterlockCommission: 0,
+          saleCommission: 0,
+          channelCommission: 0,
+          orderDate: oldDate,
+          paymentDate: oldDate,
+          saleStatus: "SALE",
+          orderStatus: "DELIVERED",
+          isCanceled: false,
+          isReturned: false,
+          rawPayload: { otherStore: true },
+          createdAt: `${oldDate}T09:00:00+09:00`,
+          updatedAt: `${oldDate}T09:00:00+09:00`,
+        },
+      );
+    });
+
+    const result = await orderSyncService.performSync("store-1", oldDate, recentDate, "MANUAL");
+    const snapshot = databaseService.getSnapshot();
+    const syncedOldItem = snapshot.orderItems.find((item: { externalProductOrderId: string }) =>
+      item.externalProductOrderId === "item-sync-old"
+    )!;
+    const syncedRecentItem = snapshot.orderItems.find((item: { externalProductOrderId: string }) =>
+      item.externalProductOrderId === "item-sync-recent"
+    )!;
+
+    assert.equal(result.rawPayloadRetentionDays, 1);
+    assert.equal(result.rawPayloadRetentionCutoffDate, cutoffDate);
+    assert.equal(result.rawPayloadPrunedOrderCount, 1);
+    assert.equal(result.rawPayloadPrunedOrderItemCount, 1);
+    assert.equal(snapshot.orders.find((item: { id: string }) => item.id === "prune-order-old")?.rawPayload, null);
+    assert.deepEqual(snapshot.orders.find((item: { id: string }) => item.id === "keep-order-recent")?.rawPayload, {
+      recent: true,
+    });
+    assert.deepEqual(snapshot.orders.find((item: { id: string }) => item.id === "other-store-order-old")?.rawPayload, {
+      otherStore: true,
+    });
+    assert.equal(snapshot.orderItems.find((item: { id: string }) => item.id === "prune-item-old")?.rawPayload, null);
+    assert.deepEqual(snapshot.orderItems.find((item: { id: string }) => item.id === "other-store-item-old")?.rawPayload, {
+      otherStore: true,
+    });
+    assert.equal(syncedOldItem.rawPayload, null);
+    assert.deepEqual(syncedRecentItem.rawPayload, { retain: "recent-sync" });
+    assert.equal(syncedOldItem.optionCode, "OPT-OLD");
+    assert.equal(syncedOldItem.optionManageCode, "MNG-OLD");
+    assert.equal(syncedOldItem.productPaymentAmount, 12345);
+    assert.equal(syncedOldItem.deliveryFeeAmount, 3210);
+    assert.equal(syncedOldItem.paymentCommission, 456);
+
+    const listResult = orderSyncService.listOrderItems({ storeId: "store-1", dateFrom: oldDate, dateTo: oldDate });
+    assert.equal(
+      listResult.data.items.some((item: { id: string }) => item.id === "prune-item-old"),
+      true,
+    );
+    const profitRows = calculateDailyProfitRows(snapshot, "store-1", oldDate, oldDate);
+    assert.equal(profitRows[0].totalProductRevenue, 20000);
+    assert.equal(profitRows[0].totalDeliveryFeeAmount, 3000);
+  } finally {
+    if (original === undefined) {
+      delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+    } else {
+      process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = original;
+    }
+  }
+});
+
+runAsync("OrderSyncService does not save new rawPayloads when retention days is zero", async () => {
+  const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+  process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "0";
+  const today = getKstRetentionCutoffDate(0);
+  const { databaseService, orderSyncService } = createOrderSyncServiceHarness({
+    stores: [createStoreRecord("store-1", "Main Store")],
+    configuredStoreIds: ["store-1"],
+    liveOrderItems: [
+      createSyncedOrderItemInput({
+        externalOrderId: "order-zero-retention",
+        externalProductOrderId: "item-zero-retention",
+        date: today,
+        rawPayload: { shouldBeRemoved: true },
+      }),
+    ],
+  });
+
+  try {
+    const result = await orderSyncService.performSync("store-1", today, today, "MANUAL");
+    const snapshot = databaseService.getSnapshot();
+    assert.equal(result.rawPayloadRetentionDays, 0);
+    assert.equal(
+      snapshot.orders.find((item: { externalOrderId: string }) => item.externalOrderId === "order-zero-retention")
+        ?.rawPayload,
+      null,
+    );
+    assert.equal(
+      snapshot.orderItems.find((item: { externalProductOrderId: string }) =>
+        item.externalProductOrderId === "item-zero-retention"
+      )?.rawPayload,
+      null,
+    );
+  } finally {
+    if (original === undefined) {
+      delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+    } else {
+      process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = original;
+    }
+  }
 });
 
 run("OperationService hasInFlightOperation checks queued and running operations by type", () => {
   const databaseService = createMemoryDatabaseService();
   const operationService = new OperationService(
     databaseService as never,
-    { record: () => null } as never,
+    createAuditLogServiceDouble() as never,
   );
 
   databaseService.write((draft) => {
@@ -767,7 +1152,7 @@ run("calculateStoreDeliverySummary keeps positive delivery margin without clampi
   assert.equal(summary.deliveryMargin, 6500);
 });
 
-run("FakePurchaseService stores daily amounts by store and date with audit history", () => {
+runAsync("FakePurchaseService stores daily amounts by store and date with audit history", async () => {
   const { databaseService, fakePurchaseService, auditCalls } = createFakePurchaseServiceHarness();
 
   assert.deepEqual(fakePurchaseService.get("store-1", "2026-04-02"), {
@@ -776,7 +1161,7 @@ run("FakePurchaseService stores daily amounts by store and date with audit histo
     updatedAt: null,
   });
 
-  const created = fakePurchaseService.upsert({
+  const created = await fakePurchaseService.upsert({
     storeId: "store-1",
     date: "2026-04-02",
     amount: 12000,
@@ -789,7 +1174,7 @@ run("FakePurchaseService stores daily amounts by store and date with audit histo
     updatedAt: created.updatedAt,
   });
 
-  const updated = fakePurchaseService.upsert({
+  const updated = await fakePurchaseService.upsert({
     storeId: "store-1",
     date: "2026-04-02",
     amount: 0,
@@ -1016,7 +1401,7 @@ run("recalculateOrderMappingsForTouchedItems updates only touched order items", 
   assert.equal(database.orderSourceSignatures.find((item) => item.id === "sig-2")?.canonicalSalesUnitId, null);
 });
 
-run("OrderMappingService saveMappings deduplicates signatures without recalculation", () => {
+runAsync("OrderMappingService saveMappings deduplicates signatures without recalculation", async () => {
   const { databaseService, orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
 
   databaseService.write((draft) => {
@@ -1043,7 +1428,7 @@ run("OrderMappingService saveMappings deduplicates signatures without recalculat
     );
   });
 
-  const result = orderMappingService.saveMappings(["sig-1", "sig-1", "sig-2"], {
+  const result = await orderMappingService.saveMappings(["sig-1", "sig-1", "sig-2"], {
     canonicalSalesUnitId: "sales-1",
   });
   const snapshot = databaseService.getSnapshot();
@@ -1063,10 +1448,10 @@ run("OrderMappingService saveMappings deduplicates signatures without recalculat
   assert.equal(second?.mappingStatus, "MAPPED");
 });
 
-run("OrderMappingService enqueueRecalculate starts one order mapping recalculation", () => {
+runAsync("OrderMappingService enqueueRecalculate starts one order mapping recalculation", async () => {
   const { orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
 
-  const result = orderMappingService.enqueueRecalculate("store-1");
+  const result = await orderMappingService.enqueueRecalculate("store-1");
 
   assert.equal(result.data.operationId, "operation-1");
   assert.equal(enqueueCalls.length, 1);
@@ -1074,7 +1459,7 @@ run("OrderMappingService enqueueRecalculate starts one order mapping recalculati
   assert.equal(enqueueCalls[0]?.requestJson.reason, "MANUAL_RECALCULATE_ORDER_MAPPING");
 });
 
-run("OrderMappingService createAndMapMany skips order recalculation during sales-unit creation", () => {
+runAsync("OrderMappingService createAndMapMany skips order recalculation during sales-unit creation", async () => {
   const databaseService = createMemoryDatabaseService();
   const createCalls: Array<{ options?: { skipOrderRecalculation?: boolean } }> = [];
   const orderMappingService = new OrderMappingService(
@@ -1107,7 +1492,7 @@ run("OrderMappingService createAndMapMany skips order recalculation during sales
     draft.orderSourceSignatures.push(createOrderSourceSignature("sig-create", "alpha pack"));
   });
 
-  orderMappingService.createAndMapMany(["sig-create"], {
+  await orderMappingService.createAndMapMany(["sig-create"], {
     displayName: "Alpha Pack",
     matchAliases: ["alpha pack"],
     memo: null,
@@ -1260,6 +1645,189 @@ run("DatabaseService normalizeSnapshot keeps conflicting manual ad rows as signa
   assert.equal(signature.canonicalSalesUnitId, null);
   assert.equal(signature.confirmedAt, null);
   assert.equal(new Set(normalized.adCampaignDailyCosts.map((item) => item.adCampaignSignatureId)).size, 1);
+});
+
+runAsync("DatabaseService writeCommitted propagates PostgreSQL failures without swapping memory snapshot", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  service.database = createEmptyDatabase();
+  service.database.stores.push({ id: "store-original" } as never);
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.persistSnapshotToPostgres = async () => {
+    throw new Error("POSTGRES_COMMIT_FAILED");
+  };
+
+  await assert.rejects(
+    () =>
+      service.writeCommitted((draft: ReturnType<typeof createEmptyDatabase>) => {
+        draft.stores.push({ id: "store-new" } as never);
+      }),
+    /POSTGRES_COMMIT_FAILED/,
+  );
+
+  assert.deepEqual(
+    service.getSnapshot().stores.map((store: { id: string }) => store.id),
+    ["store-original"],
+  );
+  assert.equal(service.getPersistenceStatus().lastPersistenceError?.message, "POSTGRES_COMMIT_FAILED");
+});
+
+runAsync("DatabaseService file mode writes committed snapshots atomically under DATA_DIR", async () => {
+  const originalDatabaseUrl = process.env.DATABASE_URL;
+  const originalDataDir = process.env.DATA_DIR;
+  const tempDir = mkdtempSync(join(tmpdir(), "patima-db-"));
+
+  try {
+    delete process.env.DATABASE_URL;
+    process.env.DATA_DIR = tempDir;
+    const service = new DatabaseService();
+    await service.onModuleInit();
+
+    await service.writeCommitted((draft) => {
+      draft.stores.push({ id: "store-atomic" } as never);
+    });
+
+    const filePath = join(tempDir, "database.json");
+    assert.equal(existsSync(filePath), true);
+    assert.equal(readdirSync(tempDir).some((fileName) => fileName.includes(".tmp-")), false);
+    assert.equal(JSON.parse(readFileSync(filePath, "utf-8")).stores[0].id, "store-atomic");
+  } finally {
+    if (originalDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL;
+    } else {
+      process.env.DATABASE_URL = originalDatabaseUrl;
+    }
+    if (originalDataDir === undefined) {
+      delete process.env.DATA_DIR;
+    } else {
+      process.env.DATA_DIR = originalDataDir;
+    }
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+run("DatabaseService stableStringify and hashPayload ignore object key order", () => {
+  const left = { b: 2, a: { d: 4, c: 3 } };
+  const right = { a: { c: 3, d: 4 }, b: 2 };
+
+  assert.equal(stableStringify(left), stableStringify(right));
+  assert.equal(hashPayload(left), hashPayload(right));
+});
+
+runAsync("DatabaseService PostgreSQL persistence upserts rows and deletes missing ids without TRUNCATE", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+  };
+
+  await service.persistTableRowsIncrementally(
+    client,
+    { key: "orders", tableName: "orders" },
+    [
+      { id: "order-1", storeId: "store-1", externalOrderId: "ext-1", amount: 100 },
+      { id: "order-2", storeId: "store-1", externalOrderId: "ext-2", amount: 200 },
+    ],
+  );
+
+  const sqlText = queries.map((query) => query.text).join("\n");
+  assert.equal(/TRUNCATE/i.test(sqlText), false);
+  assert.match(sqlText, /INSERT INTO orders \(id, payload, payload_hash, updated_at\)/);
+  assert.match(sqlText, /ON CONFLICT \(id\) DO UPDATE/);
+  assert.match(sqlText, /payload_hash IS DISTINCT FROM EXCLUDED\.payload_hash/);
+  assert.match(sqlText, /DELETE FROM orders/);
+  assert.deepEqual(queries.at(-1)?.values, [["order-1", "order-2"]]);
+
+  const insertValues = queries[0].values as unknown[];
+  assert.equal(insertValues[0], "order-1");
+  assert.equal(insertValues[2], hashPayload({ id: "order-1", storeId: "store-1", externalOrderId: "ext-1", amount: 100 }));
+});
+
+runAsync("DatabaseService PostgreSQL persistence deletes all rows for an empty table snapshot", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+  };
+
+  await service.persistTableRowsIncrementally(client, { key: "orders", tableName: "orders" }, []);
+
+  assert.equal(queries.length, 1);
+  assert.match(queries[0].text, /DELETE FROM orders/);
+  assert.equal(queries[0].values, undefined);
+  assert.equal(/TRUNCATE/i.test(queries[0].text), false);
+});
+
+runAsync("DatabaseService PostgreSQL persistence splits large upserts into batches", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const rows = Array.from({ length: POSTGRES_UPSERT_BATCH_SIZE + 1 }, (_, index) => ({
+    id: `order-${index}`,
+    storeId: "store-1",
+    externalOrderId: `ext-${index}`,
+  }));
+
+  await service.persistTableRowsIncrementally(client, { key: "orders", tableName: "orders" }, rows);
+
+  const insertQueries = queries.filter((query) => /INSERT INTO orders/.test(query.text));
+  assert.equal(insertQueries.length, 2);
+  assert.equal((insertQueries[0].values as unknown[]).length, POSTGRES_UPSERT_BATCH_SIZE * 3);
+  assert.equal((insertQueries[1].values as unknown[]).length, 3);
+});
+
+runAsync("DatabaseService duplicate business key warnings skip unique index and create lookup fallback", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: string[] = [];
+  const warningCalls: unknown[][] = [];
+  const originalWarn = console.warn;
+  const client = {
+    query: async (text: string) => {
+      queries.push(text);
+      if (text.includes("externalProductOrderId") && text.includes("HAVING COUNT(*) > 1")) {
+        return {
+          rows: [
+            {
+              store_id: "store-1",
+              external_product_order_id: "product-order-1",
+              duplicate_count: 2,
+            },
+          ],
+          rowCount: 1,
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+
+  try {
+    console.warn = (...args: unknown[]) => {
+      warningCalls.push(args);
+    };
+    const warnings = await service.warnAboutDuplicateBusinessKeys(client);
+    await service.ensurePostgresIndexes(client, warnings);
+
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].checkId, "order-items-store-external-product-order");
+    assert.equal(queries.some((query) => /CREATE UNIQUE INDEX IF NOT EXISTS idx_order_items_store_external_product_order/.test(query)), false);
+    assert.equal(queries.some((query) => /idx_order_items_store_external_product_order_lookup/.test(query)), true);
+    assert.equal(warningCalls.length >= 2, true);
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 run("calculateDashboardSummary excludes conflict order revenue and conflict ad cost from totals", () => {
@@ -1526,7 +2094,7 @@ run("profit rows keep delivery fee separate from product revenue and net profit"
   assert.equal(summary.deliveryMargin, -3480);
 });
 
-run("AdsService confirms two same-date uploads and sums ad cost across active confirmed uploads", () => {
+runAsync("AdsService confirms two same-date uploads and sums ad cost across active confirmed uploads", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
   const date = "2026-04-03";
 
@@ -1534,13 +2102,13 @@ run("AdsService confirms two same-date uploads and sums ad cost across active co
     draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha", "beta"]));
   });
 
-  adsService.previewUpload(
+  await adsService.previewUpload(
     "store-1",
     date,
     createAdUploadFile(date, [{ campaignId: "cmp-1001", campaignName: "alpha launch", totalCost: 120 }]),
   );
 
-  adsService.previewUpload(
+  await adsService.previewUpload(
     "store-1",
     date,
     createAdUploadFile(date, [{ campaignId: "cmp-1002", campaignName: "beta launch", totalCost: 80 }]),
@@ -1557,7 +2125,7 @@ run("AdsService confirms two same-date uploads and sums ad cost across active co
   assert.equal(summary.totalAdCost, 200);
 });
 
-run("AdsService rejects preview when campaignId overlaps an active confirmed upload on the same date", () => {
+runAsync("AdsService rejects preview when campaignId overlaps an active confirmed upload on the same date", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
   const date = "2026-04-03";
 
@@ -1575,7 +2143,7 @@ run("AdsService rejects preview when campaignId overlaps an active confirmed upl
     );
   });
 
-  assert.throws(
+  await assert.rejects(
     () =>
       adsService.previewUpload(
         "store-1",
@@ -1591,11 +2159,11 @@ run("AdsService rejects preview when campaignId overlaps an active confirmed upl
   );
 });
 
-run("AdsService rejects preview when the new file contains duplicate campaignIds", () => {
+runAsync("AdsService rejects preview when the new file contains duplicate campaignIds", async () => {
   const { adsService } = createAdsServiceHarness();
   const date = "2026-04-03";
 
-  assert.throws(
+  await assert.rejects(
     () =>
       adsService.previewUpload(
         "store-1",
@@ -1878,7 +2446,7 @@ run("ProfitService latest activity date falls back to the latest ad date when no
   assert.equal(latestDate.data.date, "2026-04-06");
 });
 
-run("AdsService deleteUpload deactivates the upload and removes related ad rows", () => {
+runAsync("AdsService deleteUpload deactivates the upload and removes related ad rows", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
   const date = "2026-04-03";
 
@@ -1917,7 +2485,7 @@ run("AdsService deleteUpload deactivates the upload and removes related ad rows"
     draft.adCampaignDailyCosts.push(row as never);
   });
 
-  const result = adsService.deleteUpload("upload-delete");
+  const result = await adsService.deleteUpload("upload-delete");
   const snapshot = databaseService.getSnapshot();
   const upload = snapshot.adExcelUploads.find((item: { id: string }) => item.id === "upload-delete");
 
@@ -2027,7 +2595,7 @@ run("AdsService listAdCampaignSignatures excludes stale signatures and searches 
   assert.equal(reasonAliasResult.data.items[0].id, "ad-signature-no-rule");
 });
 
-run("AdsService saveManualMappings applies one sales unit to multiple rows", () => {
+runAsync("AdsService saveManualMappings applies one sales unit to multiple rows", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
 
   databaseService.write((draft) => {
@@ -2052,7 +2620,7 @@ run("AdsService saveManualMappings applies one sales unit to multiple rows", () 
     );
   });
 
-  const result = adsService.saveManualMappings(
+  const result = await adsService.saveManualMappings(
     ["ad-upload-1-cmp-1", "ad-upload-2-cmp-2"],
     { canonicalSalesUnitId: "sales-1" },
   );
@@ -2068,7 +2636,7 @@ run("AdsService saveManualMappings applies one sales unit to multiple rows", () 
   });
 });
 
-run("AdsService stores manual mappings on campaign signatures and later uploads inherit them", () => {
+runAsync("AdsService stores manual mappings on campaign signatures and later uploads inherit them", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
 
   databaseService.write((draft) => {
@@ -2078,7 +2646,7 @@ run("AdsService stores manual mappings on campaign signatures and later uploads 
     );
   });
 
-  adsService.previewUpload(
+  await adsService.previewUpload(
     "store-1",
     "2026-04-03",
     createAdUploadFile("2026-04-03", [
@@ -2091,7 +2659,7 @@ run("AdsService stores manual mappings on campaign signatures and later uploads 
     (item: { campaignId: string }) => item.campaignId === "cmp-signature",
   )!;
 
-  adsService.saveManualMappings([firstRow.id], { canonicalSalesUnitId: "sales-1" });
+  await adsService.saveManualMappings([firstRow.id], { canonicalSalesUnitId: "sales-1" });
   const manualSnapshot = databaseService.getSnapshot();
   const signature = manualSnapshot.adCampaignSignatures.find(
     (item: { campaignId: string | null }) => item.campaignId === "cmp-signature",
@@ -2120,14 +2688,14 @@ run("AdsService stores manual mappings on campaign signatures and later uploads 
     });
   });
 
-  adsService.recalculateMappings([signature.id]);
+  await adsService.recalculateMappings([signature.id]);
   assert.equal(
     databaseService.getSnapshot().adCampaignSignatures.find((item: { id: string }) => item.id === signature.id)
       ?.canonicalSalesUnitId,
     "sales-1",
   );
 
-  adsService.previewUpload(
+  await adsService.previewUpload(
     "store-1",
     "2026-04-04",
     createAdUploadFile("2026-04-04", [
@@ -2152,7 +2720,7 @@ run("AdsService stores manual mappings on campaign signatures and later uploads 
   });
 });
 
-run("AdsService saveManualMappings rejects inactive sales units", () => {
+runAsync("AdsService saveManualMappings rejects inactive sales units", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
   const inactiveSalesUnit = createSalesUnit("sales-1", "Alpha Unit", ["alpha"]) as Record<string, unknown>;
 
@@ -2176,7 +2744,7 @@ run("AdsService saveManualMappings rejects inactive sales units", () => {
     );
   });
 
-  assert.throws(
+  await assert.rejects(
     () =>
       adsService.saveManualMappings(["ad-upload-5-cmp-5"], {
         canonicalSalesUnitId: "sales-1",
@@ -2188,7 +2756,7 @@ run("AdsService saveManualMappings rejects inactive sales units", () => {
   );
 });
 
-run("AdsService setIntentionalUnmappedMany applies one note to multiple rows", () => {
+runAsync("AdsService setIntentionalUnmappedMany applies one note to multiple rows", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
 
   databaseService.write((draft) => {
@@ -2212,7 +2780,7 @@ run("AdsService setIntentionalUnmappedMany applies one note to multiple rows", (
     );
   });
 
-  const result = adsService.setIntentionalUnmappedMany(
+  const result = await adsService.setIntentionalUnmappedMany(
     ["ad-upload-3-cmp-3", "ad-upload-4-cmp-4"],
     { reasonNote: "merged into brand spend" },
   );

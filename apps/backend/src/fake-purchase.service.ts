@@ -45,14 +45,14 @@ export class FakePurchaseService {
     };
   }
 
-  upsert(payload: { storeId: string; date: string; amount: number }): DailyFakePurchase {
+  async upsert(payload: { storeId: string; date: string; amount: number }): Promise<DailyFakePurchase> {
     this.validateStoreId(payload.storeId);
     this.validateDate(payload.date);
     this.validateAmount(payload.amount);
     this.storeService.ensureWritable(payload.storeId);
 
     let previousAmount: number | null = null;
-    const persisted = this.databaseService.write((draft) => {
+    const persisted = await this.databaseService.writeCommitted((draft) => {
       const existing = draft.dailyFakePurchases.find(
         (row) => row.storeId === payload.storeId && row.date === payload.date,
       );
@@ -62,6 +62,15 @@ export class FakePurchaseService {
         previousAmount = existing.amount;
         existing.amount = payload.amount;
         existing.updatedAt = timestamp;
+        this.auditLogService.appendToDraft(draft, {
+          storeId: payload.storeId,
+          domain: "FAKE_PURCHASE",
+          action: "UPSERT",
+          targetId: `${payload.storeId}-${payload.date}`,
+          actorIdentifier: "LOCALHOST_ADMIN",
+          beforeJson: previousAmount,
+          afterJson: payload.amount,
+        });
         return { ...existing };
       }
 
@@ -74,17 +83,16 @@ export class FakePurchaseService {
         updatedAt: timestamp,
       };
       draft.dailyFakePurchases.push(created);
+      this.auditLogService.appendToDraft(draft, {
+        storeId: payload.storeId,
+        domain: "FAKE_PURCHASE",
+        action: "UPSERT",
+        targetId: `${payload.storeId}-${payload.date}`,
+        actorIdentifier: "LOCALHOST_ADMIN",
+        beforeJson: previousAmount,
+        afterJson: payload.amount,
+      });
       return created;
-    });
-
-    this.auditLogService.record({
-      storeId: payload.storeId,
-      domain: "FAKE_PURCHASE",
-      action: "UPSERT",
-      targetId: `${payload.storeId}-${payload.date}`,
-      actorIdentifier: "LOCALHOST_ADMIN",
-      beforeJson: previousAmount,
-      afterJson: payload.amount,
     });
 
     return persisted;

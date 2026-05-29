@@ -24,8 +24,8 @@ export class OperationService implements OnModuleInit {
     private readonly auditLogService: AuditLogService,
   ) {}
 
-  onModuleInit(): void {
-    this.reconcileInFlightOperations();
+  async onModuleInit(): Promise<void> {
+    await this.reconcileInFlightOperations();
   }
 
   registerRetryExecutor(
@@ -36,13 +36,11 @@ export class OperationService implements OnModuleInit {
   }
 
   hasRunningOperation(storeId: string): boolean {
-    this.cleanupStaleOperations();
     const snapshot = this.databaseService.getSnapshot();
     return snapshot.operations.some((operation) => operation.storeId === storeId && operation.status === "RUNNING");
   }
 
   hasInFlightOperation(storeId: string, operationType?: OperationType): boolean {
-    this.cleanupStaleOperations();
     const snapshot = this.databaseService.getSnapshot();
     return snapshot.operations.some(
       (operation) =>
@@ -52,8 +50,8 @@ export class OperationService implements OnModuleInit {
     );
   }
 
-  list(storeId: string, status?: OperationStatus, operationType?: OperationType, page?: number, pageSize?: number) {
-    this.cleanupStaleOperations();
+  async list(storeId: string, status?: OperationStatus, operationType?: OperationType, page?: number, pageSize?: number) {
+    await this.cleanupStaleOperations();
     const snapshot = this.databaseService.getSnapshot();
     const items = snapshot.operations
       .filter((item) => item.storeId === storeId)
@@ -64,8 +62,8 @@ export class OperationService implements OnModuleInit {
     return formatApiSuccess(paginate(items, page, pageSize));
   }
 
-  get(operationId: string) {
-    this.cleanupStaleOperations();
+  async get(operationId: string) {
+    await this.cleanupStaleOperations();
     const snapshot = this.databaseService.getSnapshot();
     const operation = snapshot.operations.find((item) => item.id === operationId);
 
@@ -119,7 +117,7 @@ export class OperationService implements OnModuleInit {
       });
     }
 
-    const retryOperation = this.enqueue(
+    const retryOperation = await this.enqueue(
       operation.storeId,
       operation.operationType,
       operation.requestJson ?? {},
@@ -134,13 +132,13 @@ export class OperationService implements OnModuleInit {
     });
   }
 
-  enqueue(
+  async enqueue(
     storeId: string,
     operationType: OperationType,
     requestJson: Record<string, unknown>,
     executor: OperationExecutor,
     retryOfOperationId: string | null = null,
-  ): OperationRecord {
+  ): Promise<OperationRecord> {
     const operation: OperationRecord = {
       id: createId(),
       storeId,
@@ -157,7 +155,7 @@ export class OperationService implements OnModuleInit {
       finishedAt: null,
     };
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       draft.operations.push(operation);
     });
 
@@ -165,7 +163,7 @@ export class OperationService implements OnModuleInit {
     const next = previous
       .catch(() => undefined)
       .then(async () => {
-        this.databaseService.write((draft) => {
+        await this.databaseService.writeCommitted((draft) => {
           const current = draft.operations.find((item) => item.id === operation.id);
           if (!current) {
             return;
@@ -176,7 +174,7 @@ export class OperationService implements OnModuleInit {
 
         try {
           const result = await executor();
-          this.databaseService.write((draft) => {
+          await this.databaseService.writeCommitted((draft) => {
             const current = draft.operations.find((item) => item.id === operation.id);
             if (!current) {
               return;
@@ -184,18 +182,18 @@ export class OperationService implements OnModuleInit {
             current.status = "SUCCEEDED";
             current.resultJson = result;
             current.finishedAt = nowIso();
-          });
-          this.auditLogService.record({
-            storeId,
-            domain: "RECALCULATION",
-            action: "RUN",
-            targetId: operation.id,
-            actorIdentifier: "LOCALHOST_ADMIN",
-            beforeJson: null,
-            afterJson: result,
+            this.auditLogService.appendToDraft(draft, {
+              storeId,
+              domain: "RECALCULATION",
+              action: "RUN",
+              targetId: operation.id,
+              actorIdentifier: "LOCALHOST_ADMIN",
+              beforeJson: null,
+              afterJson: result,
+            });
           });
         } catch (error) {
-          this.databaseService.write((draft) => {
+          await this.databaseService.writeCommitted((draft) => {
             const current = draft.operations.find((item) => item.id === operation.id);
             if (!current) {
               return;
@@ -205,6 +203,10 @@ export class OperationService implements OnModuleInit {
             current.finishedAt = nowIso();
           });
         }
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[OperationService] operation queue failed for ${operation.id}: ${message}`);
       });
 
     this.storeQueues.set(storeId, next);
@@ -212,13 +214,13 @@ export class OperationService implements OnModuleInit {
     return operation;
   }
 
-  private reconcileInFlightOperations() {
-    this.markOperationsAsFailed((operation) => operation.status === "QUEUED" || operation.status === "RUNNING");
+  private async reconcileInFlightOperations() {
+    await this.markOperationsAsFailed((operation) => operation.status === "QUEUED" || operation.status === "RUNNING");
   }
 
-  private cleanupStaleOperations() {
+  private async cleanupStaleOperations() {
     const now = Date.now();
-    this.markOperationsAsFailed((operation) => {
+    await this.markOperationsAsFailed((operation) => {
       if (operation.status === "RUNNING" && operation.startedAt) {
         return now - Date.parse(operation.startedAt) > OperationService.STALE_RUNNING_OPERATION_MS;
       }
@@ -231,7 +233,7 @@ export class OperationService implements OnModuleInit {
     });
   }
 
-  private markOperationsAsFailed(predicate: (operation: OperationRecord) => boolean) {
+  private async markOperationsAsFailed(predicate: (operation: OperationRecord) => boolean) {
     const snapshot = this.databaseService.getSnapshot();
     const targets = snapshot.operations.filter(predicate);
 
@@ -240,7 +242,7 @@ export class OperationService implements OnModuleInit {
     }
 
     const targetIds = new Set(targets.map((operation) => operation.id));
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       draft.operations.forEach((operation) => {
         if (!targetIds.has(operation.id)) {
           return;

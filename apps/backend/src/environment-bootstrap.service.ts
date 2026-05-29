@@ -13,13 +13,13 @@ export class EnvironmentBootstrapService implements OnApplicationBootstrap {
     private readonly naverCommerceConfigService: NaverCommerceConfigService,
   ) {}
 
-  onApplicationBootstrap(): void {
+  async onApplicationBootstrap(): Promise<void> {
     const bootstrapStore = this.naverCommerceConfigService.getBootstrapStorePayload();
     if (!bootstrapStore) {
       return;
     }
 
-    this.databaseService.write((draft) => {
+    await this.databaseService.writeCommitted((draft) => {
       const now = nowIso();
       let store = draft.stores.find(
         (item) =>
