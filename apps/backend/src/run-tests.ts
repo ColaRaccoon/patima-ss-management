@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSourceSignature, normalizeText, DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
+import type { OperationRecord, OperationType } from "@patima/shared";
 import * as XLSX from "xlsx";
 import {
   evaluateAdMapping,
@@ -20,8 +21,12 @@ import {
   calculateVatAmount,
   calculateVatAdjustedRevenue,
   createEmptyDatabase,
+  getActiveConfirmedUploadIds,
+  getAdMappingStatus,
+  getOrderItemMappingStatus,
   getSignatureIndex,
   getWeekdayNameKo,
+  paginate,
   repairMojibakeText,
   resolvePackageKey,
   saleStatusFromNaverOrderState,
@@ -33,7 +38,9 @@ import type { SyncedOrderItemInput } from "./naver-commerce.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
 import { OperationService } from "./operation.service";
+import { OperationWorkerService } from "./operation-worker.service";
 import { ProfitService } from "./profit.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 import {
   DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS,
   getKstRetentionCutoffDate,
@@ -44,7 +51,9 @@ import {
   recalculateOrderMappingsForTouchedItems,
   resolveOrderSignatureAutoMapping,
 } from "./sales-unit-auto-mapper";
+import { SalesUnitService } from "./sales-unit.service";
 import { isMeaningfulName, extractNameFromOptionInfo, enrichSignatureDisplayName } from "./signature-enrichment";
+import { buildPaginationResult, createSqlBuilder, normalizePagination } from "./query-builders";
 
 const run = (name: string, fn: () => void) => {
   fn();
@@ -79,8 +88,39 @@ const createSalesUnit = (id: string, displayName: string, matchAliases: string[]
     updatedAt: new Date().toISOString(),
   }) as never;
 
+const createOperationRecord = (
+  overrides: Partial<OperationRecord> &
+    Pick<OperationRecord, "id" | "storeId" | "operationType" | "status">,
+): OperationRecord => {
+  const timestamp = new Date().toISOString();
+  return {
+    retryOfOperationId: null,
+    requestedBy: "LOCALHOST_ADMIN",
+    requestJson: {},
+    resultJson: null,
+    errorMessage: null,
+    cutoffAt: timestamp,
+    createdAt: timestamp,
+    startedAt: null,
+    finishedAt: null,
+    attemptCount: 0,
+    maxAttempts: 3,
+    runAfter: null,
+    heartbeatAt: null,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    lockedAt: null,
+    progressJson: null,
+    ...overrides,
+  };
+};
+
+const normalizeOperationForTest = (operation: OperationRecord): OperationRecord =>
+  createOperationRecord(operation);
+
 const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   database,
+  operationLocks: new Set<string>(),
   getSnapshot() {
     return JSON.parse(JSON.stringify(this.database));
   },
@@ -92,6 +132,353 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   },
   async writeCommitted(mutator: (draft: typeof database) => unknown) {
     return this.write(mutator);
+  },
+  async queryOperations(query: {
+    storeId: string;
+    status?: string;
+    operationType?: string;
+    page?: number;
+    pageSize?: number;
+  }) {
+    const items = this.database.operations
+      .map((item) => normalizeOperationForTest(item))
+      .filter((item) => item.storeId === query.storeId)
+      .filter((item) => (query.status ? item.status === query.status : true))
+      .filter((item) => (query.operationType ? item.operationType === query.operationType : true))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+
+    return paginate(items, query.page, query.pageSize);
+  },
+  async getOperationById(operationId: string) {
+    const operation = this.database.operations.find((item) => item.id === operationId);
+    return operation ? JSON.parse(JSON.stringify(normalizeOperationForTest(operation))) : null;
+  },
+  async insertOperation(operation: OperationRecord) {
+    const normalized = normalizeOperationForTest(operation);
+    return this.write((draft) => {
+      draft.operations.push(normalized);
+      return JSON.parse(JSON.stringify(normalized));
+    });
+  },
+  async releaseExpiredOperationLeases(now = new Date()) {
+    const nowAt = now.toISOString();
+    return this.write((draft) => {
+      let recoveredCount = 0;
+      draft.operations = draft.operations.map((operation) => {
+        const normalized = normalizeOperationForTest(operation);
+        if (normalized.status !== "RUNNING" || (normalized.leaseExpiresAt && normalized.leaseExpiresAt > nowAt)) {
+          return operation;
+        }
+        recoveredCount += 1;
+        if (normalized.attemptCount >= normalized.maxAttempts) {
+          return {
+            ...normalized,
+            status: "FAILED",
+            errorMessage: normalized.errorMessage ?? "OPERATION_LEASE_EXPIRED",
+            runAfter: null,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            finishedAt: nowAt,
+          };
+        }
+        return {
+          ...normalized,
+          status: "QUEUED",
+          errorMessage: "OPERATION_LEASE_EXPIRED",
+          runAfter: nowAt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          finishedAt: null,
+        };
+      });
+      return recoveredCount;
+    });
+  },
+  async acquireNextOperation(leaseOwner: string, leaseDurationMs: number, now = new Date()) {
+    return this.write((draft) => {
+      const nowAt = now.toISOString();
+      const normalized = draft.operations.map((operation, index) => ({
+        index,
+        operation: normalizeOperationForTest(operation),
+      }));
+      const candidate = normalized
+        .filter(({ operation }) => {
+          if (operation.attemptCount >= operation.maxAttempts) {
+            return false;
+          }
+          if (operation.status === "QUEUED") {
+            return !operation.runAfter || operation.runAfter <= nowAt;
+          }
+          return operation.status === "RUNNING" && (!operation.leaseExpiresAt || operation.leaseExpiresAt <= nowAt);
+        })
+        .filter(
+          ({ operation }) =>
+            !normalized.some(
+              ({ operation: active }) =>
+                active.id !== operation.id &&
+                active.storeId === operation.storeId &&
+                active.operationType === operation.operationType &&
+                active.status === "RUNNING" &&
+                !!active.leaseExpiresAt &&
+                active.leaseExpiresAt > nowAt,
+            ),
+        )
+        .sort((left, right) => {
+          const leftRank = left.operation.status === "RUNNING" ? 0 : 1;
+          const rightRank = right.operation.status === "RUNNING" ? 0 : 1;
+          return (
+            leftRank - rightRank ||
+            (left.operation.runAfter ?? left.operation.createdAt).localeCompare(
+              right.operation.runAfter ?? right.operation.createdAt,
+            ) ||
+            left.operation.createdAt.localeCompare(right.operation.createdAt)
+          );
+        })[0];
+
+      if (!candidate) {
+        return null;
+      }
+
+      const leased = createOperationRecord({
+        ...candidate.operation,
+        status: "RUNNING",
+        attemptCount: candidate.operation.attemptCount + 1,
+        runAfter: null,
+        errorMessage: null,
+        startedAt: candidate.operation.startedAt ?? nowAt,
+        finishedAt: null,
+        heartbeatAt: nowAt,
+        lockedAt: nowAt,
+        leaseOwner,
+        leaseExpiresAt: new Date(now.getTime() + leaseDurationMs).toISOString(),
+      });
+      draft.operations[candidate.index] = leased;
+      return JSON.parse(JSON.stringify(leased));
+    });
+  },
+  async heartbeatOperation(
+    operationId: string,
+    leaseOwner: string,
+    leaseDurationMs: number,
+    progressJson?: Record<string, unknown> | null,
+    now = new Date(),
+  ) {
+    return this.write((draft) => {
+      const operation = draft.operations.find((item) => item.id === operationId);
+      if (!operation || operation.leaseOwner !== leaseOwner) {
+        return null;
+      }
+      operation.heartbeatAt = now.toISOString();
+      operation.leaseExpiresAt = new Date(now.getTime() + leaseDurationMs).toISOString();
+      if (progressJson !== undefined) {
+        operation.progressJson = progressJson;
+      }
+      return JSON.parse(JSON.stringify(operation));
+    });
+  },
+  async markOperationSucceeded(operationId: string, leaseOwner: string, resultJson: Record<string, unknown>) {
+    return this.write((draft) => {
+      const operation = draft.operations.find((item) => item.id === operationId);
+      if (!operation || operation.leaseOwner !== leaseOwner) {
+        return null;
+      }
+      operation.status = "SUCCEEDED";
+      operation.resultJson = resultJson;
+      operation.errorMessage = null;
+      operation.finishedAt = new Date().toISOString();
+      operation.runAfter = null;
+      operation.leaseOwner = null;
+      operation.leaseExpiresAt = null;
+      return JSON.parse(JSON.stringify(operation));
+    });
+  },
+  async markOperationFailedOrQueued(
+    operationId: string,
+    leaseOwner: string,
+    params: { errorMessage: string; shouldRetry: boolean; runAfter: string | null; finishedAt?: string },
+  ) {
+    return this.write((draft) => {
+      const operation = draft.operations.find((item) => item.id === operationId);
+      if (!operation || operation.leaseOwner !== leaseOwner) {
+        return null;
+      }
+      operation.status = params.shouldRetry ? "QUEUED" : "FAILED";
+      operation.errorMessage = params.errorMessage;
+      operation.runAfter = params.shouldRetry ? params.runAfter : null;
+      operation.leaseOwner = null;
+      operation.leaseExpiresAt = null;
+      operation.finishedAt = params.shouldRetry ? null : (params.finishedAt ?? new Date().toISOString());
+      return JSON.parse(JSON.stringify(operation));
+    });
+  },
+  async deferOperationLease(
+    operationId: string,
+    leaseOwner: string,
+    params: { runAfter: string; errorMessage: string; decrementAttempt?: boolean },
+  ) {
+    return this.write((draft) => {
+      const operation = draft.operations.find((item) => item.id === operationId);
+      if (!operation || operation.leaseOwner !== leaseOwner) {
+        return null;
+      }
+      operation.status = "QUEUED";
+      operation.attemptCount = Math.max(0, operation.attemptCount - (params.decrementAttempt ? 1 : 0));
+      operation.errorMessage = params.errorMessage;
+      operation.runAfter = params.runAfter;
+      operation.leaseOwner = null;
+      operation.leaseExpiresAt = null;
+      operation.finishedAt = null;
+      return JSON.parse(JSON.stringify(operation));
+    });
+  },
+  async tryAcquireOperationExecutionLock(storeId: string, operationType: OperationType) {
+    const lockName = `operation:${storeId}:${operationType}`;
+    if (this.operationLocks.has(lockName)) {
+      return null;
+    }
+    this.operationLocks.add(lockName);
+    let released = false;
+    return {
+      lockName,
+      release: async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        this.operationLocks.delete(lockName);
+      },
+    };
+  },
+  async queryOrderItems(query: {
+    storeId: string;
+    dateFrom?: string;
+    dateTo?: string;
+    productName?: string;
+    optionInfo?: string;
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+    orderStatus?: string;
+    saleStatus?: string;
+    paymentDateStatus?: "ALL" | "PRESENT" | "MISSING";
+    page?: number;
+    pageSize?: number;
+  }) {
+    const keywordProduct = query.productName ? normalizeText(query.productName) : null;
+    const keywordOption = query.optionInfo ? normalizeText(query.optionInfo) : null;
+    const items = this.database.orderItems
+      .filter((item) => item.storeId === query.storeId)
+      .filter((item) =>
+        query.dateFrom && query.dateTo
+          ? !!item.paymentDate && item.paymentDate >= query.dateFrom && item.paymentDate <= query.dateTo
+          : true,
+      )
+      .filter((item) => (keywordProduct ? item.normalizedProductName.includes(keywordProduct) : true))
+      .filter((item) => (keywordOption ? item.normalizedOptionInfo.includes(keywordOption) : true))
+      .filter((item) =>
+        query.mappingStatus && query.mappingStatus !== "ALL"
+          ? getOrderItemMappingStatus(this.database, item) === query.mappingStatus
+          : true,
+      )
+      .filter((item) => (query.orderStatus ? item.orderStatus === query.orderStatus : true))
+      .filter((item) => (query.saleStatus ? item.saleStatus === query.saleStatus : true))
+      .filter((item) =>
+        query.paymentDateStatus && query.paymentDateStatus !== "ALL"
+          ? query.paymentDateStatus === "PRESENT"
+            ? !!item.paymentDate
+            : !item.paymentDate
+          : true,
+      )
+      .sort((left, right) => (right.paymentDate ?? "").localeCompare(left.paymentDate ?? ""));
+
+    return paginate(items, query.page, query.pageSize);
+  },
+  async queryAdCampaignSignatures(query: {
+    storeId: string;
+    dateFrom?: string;
+    dateTo?: string;
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+    q?: string;
+    page?: number;
+    pageSize?: number;
+  }) {
+    const activeUploadIds = getActiveConfirmedUploadIds(this.database, query.storeId);
+    const keyword = query.q ? normalizeText(query.q) : null;
+    const rowsBySignatureId = new Map<string, Array<(typeof database.adCampaignDailyCosts)[number]>>();
+    const salesUnitsById = new Map(this.database.canonicalSalesUnits.map((item) => [item.id, item]));
+
+    this.database.adCampaignDailyCosts
+      .filter((row) => row.storeId === query.storeId && activeUploadIds.has(row.sourceUploadId))
+      .filter((row) => (query.dateFrom ? row.reportDate >= query.dateFrom : true))
+      .filter((row) => (query.dateTo ? row.reportDate <= query.dateTo : true))
+      .forEach((row) => {
+        if (!row.adCampaignSignatureId) {
+          return;
+        }
+        const rows = rowsBySignatureId.get(row.adCampaignSignatureId) ?? [];
+        rows.push(row);
+        rowsBySignatureId.set(row.adCampaignSignatureId, rows);
+      });
+
+    const signatures = this.database.adCampaignSignatures
+      .filter((signature) => signature.storeId === query.storeId)
+      .filter((signature) => rowsBySignatureId.has(signature.id))
+      .filter((signature) =>
+        query.mappingStatus && query.mappingStatus !== "ALL"
+          ? getAdMappingStatus(signature) === query.mappingStatus
+          : true,
+      )
+      .filter((signature) => {
+        if (!keyword) {
+          return true;
+        }
+
+        const rows = rowsBySignatureId.get(signature.id) ?? [];
+        const salesUnitDisplayName = signature.canonicalSalesUnitId
+          ? salesUnitsById.get(signature.canonicalSalesUnitId)?.displayName
+          : null;
+        const mappingReasonAlias =
+          signature.mappingReason === "NO_RULE"
+            ? "NO_RULE_MATCH"
+            : signature.mappingReason === "MULTIPLE_RULES"
+              ? "MULTIPLE_RULE_MATCHES"
+              : signature.mappingReason;
+
+        return (
+          normalizeText(signature.campaignNameSnapshot).includes(keyword) ||
+          normalizeText(repairMojibakeText(signature.campaignNameSnapshot)).includes(keyword) ||
+          normalizeText(signature.normalizedCampaignName).includes(keyword) ||
+          normalizeText(signature.campaignId ?? "").includes(keyword) ||
+          normalizeText(salesUnitDisplayName).includes(keyword) ||
+          normalizeText(signature.mappingReason).includes(keyword) ||
+          normalizeText(mappingReasonAlias).includes(keyword) ||
+          normalizeText(repairMojibakeText(signature.reasonNote)).includes(keyword) ||
+          normalizeText(signature.firstSeenDate).includes(keyword) ||
+          normalizeText(signature.lastSeenDate).includes(keyword) ||
+          rows.some((row) => normalizeText(row.reportDate).includes(keyword))
+        );
+      })
+      .sort((left, right) =>
+        (right.lastSeenDate ?? right.updatedAt).localeCompare(left.lastSeenDate ?? left.updatedAt),
+      );
+
+    return paginate(
+      signatures.map((signature) => {
+        const rows = rowsBySignatureId.get(signature.id) ?? [];
+        const latestRow = rows
+          .slice()
+          .sort((left, right) =>
+            `${right.reportDate}:${right.updatedAt}`.localeCompare(`${left.reportDate}:${left.updatedAt}`),
+          )[0];
+
+        return {
+          signature,
+          latestRow: latestRow ?? null,
+          totalCost: rows.reduce((sum, row) => sum + row.totalCost, 0),
+          rowCount: rows.length,
+        };
+      }),
+      query.page,
+      query.pageSize,
+    );
   },
 });
 
@@ -116,8 +503,11 @@ const createAuditLogServiceDouble = (auditCalls: Array<Record<string, unknown>> 
   },
 });
 
-const createAdsServiceHarness = () => {
+const createAdsServiceHarness = (params?: { withProfitSummaryService?: boolean }) => {
   const databaseService = createMemoryDatabaseService();
+  const profitSummaryService = params?.withProfitSummaryService
+    ? new ProfitSummaryService(databaseService as never)
+    : undefined;
   const adsService = new AdsService(
     databaseService as never,
     {
@@ -130,9 +520,10 @@ const createAdsServiceHarness = () => {
       },
     } as never,
     createAuditLogServiceDouble() as never,
+    profitSummaryService,
   );
 
-  return { databaseService, adsService };
+  return { databaseService, adsService, profitSummaryService };
 };
 
 const createOrderMappingServiceHarness = () => {
@@ -227,8 +618,12 @@ const createOrderSyncServiceHarness = (params?: {
   configuredStoreIds?: string[];
   inFlightStoreIds?: string[];
   liveOrderItems?: SyncedOrderItemInput[];
+  withProfitSummaryService?: boolean;
 }) => {
   const databaseService = createMemoryDatabaseService();
+  const profitSummaryService = params?.withProfitSummaryService
+    ? new ProfitSummaryService(databaseService as never)
+    : undefined;
   const enqueueCalls: Array<{
     storeId: string;
     operationType: string;
@@ -284,9 +679,10 @@ const createOrderSyncServiceHarness = (params?: {
         throw new Error("fetchOrderItems not configured for this test");
       },
     } as never,
+    profitSummaryService,
   );
 
-  return { databaseService, orderSyncService, enqueueCalls, retryExecutors };
+  return { databaseService, orderSyncService, enqueueCalls, retryExecutors, profitSummaryService };
 };
 
 const createSyncedOrderItemInput = (params: {
@@ -481,6 +877,253 @@ const createAdCampaignSignature = (params: {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }) as never;
+
+const createPostgresQueryHarness = (responses: Array<{ rows: Array<Record<string, unknown>> }>) => {
+  const queries: Array<{ text: string; params: unknown[] }> = [];
+  const service = Object.create(DatabaseService.prototype) as {
+    storageMode: string;
+    pool: {
+      query: (text: string, params?: readonly unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>;
+    };
+    queryOperations: DatabaseService["queryOperations"];
+    queryOrderItems: DatabaseService["queryOrderItems"];
+    queryAdCampaignSignatures: DatabaseService["queryAdCampaignSignatures"];
+  };
+
+  service.storageMode = "postgres";
+  service.pool = {
+    async query(text: string, params: readonly unknown[] = []) {
+      queries.push({ text, params: [...params] });
+      const response = responses.shift();
+      if (!response) {
+        throw new Error(`Unexpected query: ${text}`);
+      }
+      return response;
+    },
+  };
+
+  return { service: service as unknown as DatabaseService, queries };
+};
+
+run("query builders normalize pagination and keep user values in params", () => {
+  const builder = createSqlBuilder();
+  builder.addCondition("payload->>'storeId' = {param}", "store-1' OR true");
+  builder.addCondition((placeholder) => `payload->>'status' = ${placeholder}`, "RUNNING");
+
+  const pagination = normalizePagination(-2, 999);
+  const query = builder.buildPaginated(
+    `SELECT payload FROM operations ${builder.whereClause()} ORDER BY payload->>'createdAt' DESC`,
+    pagination,
+  );
+  const result = buildPaginationResult(["a", "b"], 401, pagination);
+
+  assert.equal(query.text.includes("store-1' OR true"), false);
+  assert.deepEqual(query.params, ["store-1' OR true", "RUNNING", 200, 0]);
+  assert.equal(result.page, 1);
+  assert.equal(result.pageSize, 200);
+  assert.equal(result.totalPages, 3);
+});
+
+runAsync("DatabaseService queryOperations uses PostgreSQL count, page, and bound params", async () => {
+  const operation = createOperationRecord({
+    id: "op-2",
+    storeId: "store-1' OR true",
+    operationType: "ORDER_SYNC",
+    status: "RUNNING",
+    createdAt: "2026-04-03T00:00:00.000Z",
+  });
+  const { service, queries } = createPostgresQueryHarness([
+    { rows: [{ total_count: 3 }] },
+    { rows: [{ payload: operation }] },
+  ]);
+
+  const result = await service.queryOperations({
+    storeId: "store-1' OR true",
+    status: "RUNNING",
+    operationType: "ORDER_SYNC",
+    page: 2,
+    pageSize: 1,
+  });
+
+  assert.equal(result.totalCount, 3);
+  assert.equal(result.items[0].id, "op-2");
+  assert.match(queries[0].text, /COUNT\(\*\)::int AS total_count FROM operations/);
+  assert.equal(queries[0].text.includes("store-1' OR true"), false);
+  assert.deepEqual(queries[0].params, ["store-1' OR true", "RUNNING", "ORDER_SYNC"]);
+  assert.match(queries[1].text, /LIMIT \$4 OFFSET \$5/);
+  assert.deepEqual(queries[1].params, ["store-1' OR true", "RUNNING", "ORDER_SYNC", 1, 1]);
+});
+
+runAsync("DatabaseService queryOrderItems pushes filters into PostgreSQL", async () => {
+  const orderItem = {
+    id: "item-1",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "external-item-1",
+    externalProductId: null,
+    optionCode: null,
+    packageNumber: null,
+    rawProductName: "Needle Product",
+    rawOptionInfo: "Black",
+    normalizedProductName: "needle product",
+    normalizedOptionInfo: "black",
+    sourceSignature: "needle product || black",
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: 10000,
+    deliveryFeeAmount: 0,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: "2026-04-03",
+    paymentDate: "2026-04-03",
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  };
+  const { service, queries } = createPostgresQueryHarness([
+    { rows: [{ total_count: "2" }] },
+    { rows: [{ payload: orderItem }] },
+  ]);
+
+  const result = await service.queryOrderItems({
+    storeId: "store-1",
+    dateFrom: "2026-04-01",
+    dateTo: "2026-04-30",
+    productName: "Needle_%",
+    optionInfo: "Black",
+    mappingStatus: "UNMAPPED",
+    orderStatus: "PAYED",
+    saleStatus: "SALE",
+    paymentDateStatus: "PRESENT",
+    page: 1,
+    pageSize: 50,
+  });
+
+  assert.equal(result.totalCount, 2);
+  assert.equal(result.items[0].id, "item-1");
+  assert.match(queries[0].text, /LEFT JOIN order_source_signatures signatures/);
+  assert.match(queries[0].text, /items\.payload->>'paymentDate' >= \$2/);
+  assert.equal(queries[0].text.includes("Needle_%"), false);
+  assert.match(queries[0].text, /LIKE \$4 ESCAPE/);
+  assert.deepEqual(queries[0].params, [
+    "store-1",
+    "2026-04-01",
+    "2026-04-30",
+    "%needle\\_\\%%",
+    "%black%",
+    "UNMAPPED",
+    "PAYED",
+    "SALE",
+  ]);
+});
+
+runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and returns page summaries", async () => {
+  const signature = createAdCampaignSignature({
+    id: "ad-signature-1",
+    campaignId: "cmp-1",
+    campaignName: "Needle Launch",
+    firstSeenDate: "2026-04-01",
+    lastSeenDate: "2026-04-03",
+  });
+  const latestRow = Object.assign(
+    createConfirmedUploadRow({
+      uploadId: "upload-1",
+      reportDate: "2026-04-03",
+      campaignId: "cmp-1",
+      campaignName: "Needle Launch",
+      canonicalSalesUnitId: null,
+      totalCost: 120,
+    }) as Record<string, unknown>,
+    { adCampaignSignatureId: "ad-signature-1" },
+  );
+  const { service, queries } = createPostgresQueryHarness([
+    { rows: [{ total_count: 1 }] },
+    {
+      rows: [
+        {
+          signature_payload: signature,
+          latest_row_payload: latestRow,
+          total_cost: "120",
+          row_count: 1,
+        },
+      ],
+    },
+  ]);
+
+  const result = await service.queryAdCampaignSignatures({
+    storeId: "store-1",
+    dateFrom: "2026-04-01",
+    dateTo: "2026-04-30",
+    q: "Needle_%' OR true",
+    page: 1,
+    pageSize: 20,
+  });
+
+  assert.equal(result.totalCount, 1);
+  assert.equal(result.items[0].signature.id, "ad-signature-1");
+  assert.equal(result.items[0].latestRow?.sourceUploadId, "upload-1");
+  assert.equal(result.items[0].totalCost, 120);
+  assert.match(queries[0].text, /EXISTS \(/);
+  assert.match(queries[1].text, /LEFT JOIN LATERAL/);
+  assert.equal(queries[0].text.includes("Needle_%' OR true"), false);
+  assert.equal(queries[0].params.some((param) => param === "%needle\\_\\%' or true%"), true);
+  assert.equal(queries[1].params.at(-2), 20);
+  assert.equal(queries[1].params.at(-1), 0);
+});
+
+runAsync("DatabaseService queryAdCampaignSignatures keeps repaired Hangul search compatible", async () => {
+  const database = createEmptyDatabase();
+  database.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-mojibake", reportDate: "2026-04-03" }));
+  database.adCampaignSignatures.push(
+    createAdCampaignSignature({
+      id: "ad-signature-mojibake",
+      campaignId: "cmp-mojibake",
+      campaignName: "ì¸í¼ëí° ìº íì¸",
+      firstSeenDate: "2026-04-03",
+      lastSeenDate: "2026-04-03",
+    }),
+  );
+  database.adCampaignDailyCosts.push(
+    Object.assign(
+      createConfirmedUploadRow({
+        uploadId: "upload-mojibake",
+        reportDate: "2026-04-03",
+        campaignId: "cmp-mojibake",
+        campaignName: "ì¸í¼ëí° ìº íì¸",
+        canonicalSalesUnitId: null,
+        totalCost: 50,
+      }) as Record<string, unknown>,
+      { adCampaignSignatureId: "ad-signature-mojibake" },
+    ) as never,
+  );
+  const service = Object.create(DatabaseService.prototype) as {
+    storageMode: string;
+    database: typeof database;
+    pool: { query: () => never };
+    queryAdCampaignSignatures: DatabaseService["queryAdCampaignSignatures"];
+  };
+  service.storageMode = "postgres";
+  service.database = database;
+  service.pool = {
+    query: () => {
+      throw new Error("Hangul repaired search should use snapshot fallback");
+    },
+  };
+
+  const result = await service.queryAdCampaignSignatures({ storeId: "store-1", q: "인피니티" });
+
+  assert.equal(result.totalCount, 1);
+  assert.equal(result.items[0].signature.id, "ad-signature-mojibake");
+});
 
 run("normalizeText keeps prefixes and symbols while normalizing whitespace and case", () => {
   assert.equal(normalizeText("  [Fast Delivery]\nRunning Hat: BLACK  "), "[fast delivery] running hat: black");
@@ -855,7 +1498,7 @@ runAsync("OrderSyncService retains recent rawPayloads and prunes only expired st
     assert.equal(syncedOldItem.deliveryFeeAmount, 3210);
     assert.equal(syncedOldItem.paymentCommission, 456);
 
-    const listResult = orderSyncService.listOrderItems({ storeId: "store-1", dateFrom: oldDate, dateTo: oldDate });
+    const listResult = await orderSyncService.listOrderItems({ storeId: "store-1", dateFrom: oldDate, dateTo: oldDate });
     assert.equal(
       listResult.data.items.some((item: { id: string }) => item.id === "prune-item-old"),
       true,
@@ -922,42 +1565,193 @@ run("OperationService hasInFlightOperation checks queued and running operations 
 
   databaseService.write((draft) => {
     draft.operations.push(
-      {
+      createOperationRecord({
         id: "op-queued",
         storeId: "store-1",
         operationType: "ORDER_SYNC",
         status: "QUEUED",
-        retryOfOperationId: null,
-        requestedBy: "LOCALHOST_ADMIN",
-        requestJson: {},
-        resultJson: null,
-        errorMessage: null,
-        cutoffAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-        startedAt: null,
-        finishedAt: null,
-      },
-      {
+      }),
+      createOperationRecord({
         id: "op-done",
         storeId: "store-1",
         operationType: "RECALCULATE_AD_MAPPING",
         status: "SUCCEEDED",
-        retryOfOperationId: null,
-        requestedBy: "LOCALHOST_ADMIN",
-        requestJson: {},
-        resultJson: null,
-        errorMessage: null,
-        cutoffAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-        startedAt: null,
         finishedAt: new Date().toISOString(),
-      },
+      }),
     );
   });
 
   assert.equal(operationService.hasInFlightOperation("store-1", "ORDER_SYNC"), true);
   assert.equal(operationService.hasInFlightOperation("store-1", "RECALCULATE_AD_MAPPING"), false);
   assert.equal(operationService.hasInFlightOperation("store-2", "ORDER_SYNC"), false);
+});
+
+runAsync("OperationService enqueue records queued DB operation without executing inline", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    createAuditLogServiceDouble() as never,
+  );
+  let executed = false;
+
+  const operation = await operationService.enqueue(
+    "store-1",
+    "ORDER_SYNC",
+    { dateFrom: "2026-05-01" },
+    async () => {
+      executed = true;
+      return {};
+    },
+  );
+
+  const stored = databaseService.getSnapshot().operations.find((item: OperationRecord) => item.id === operation.id)!;
+  assert.equal(executed, false);
+  assert.equal(stored.status, "QUEUED");
+  assert.equal(stored.attemptCount, 0);
+  assert.equal(stored.maxAttempts, 3);
+  assert.equal(stored.runAfter, stored.createdAt);
+  assert.equal(stored.leaseOwner, null);
+});
+
+runAsync("OperationWorkerService pollOnce leases and completes one queued operation", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    createAuditLogServiceDouble() as never,
+  );
+  operationService.registerRetryExecutor("ORDER_SYNC", async (operation) => ({
+    ok: true,
+    attemptCount: operation.attemptCount,
+  }));
+  const operation = await operationService.enqueue("store-1", "ORDER_SYNC", {}, async () => ({}));
+  const worker = new OperationWorkerService(operationService);
+
+  assert.equal(await worker.pollOnce(), true);
+
+  const stored = databaseService.getSnapshot().operations.find((item: OperationRecord) => item.id === operation.id)!;
+  assert.equal(stored.status, "SUCCEEDED");
+  assert.equal(stored.attemptCount, 1);
+  assert.deepEqual(stored.resultJson, { ok: true, attemptCount: 1 });
+  assert.equal(stored.leaseOwner, null);
+  assert.equal(stored.leaseExpiresAt, null);
+  assert.ok(stored.startedAt);
+  assert.ok(stored.finishedAt);
+  assert.ok(stored.heartbeatAt);
+});
+
+runAsync("OperationWorkerService retries failed operations with backoff before max attempts", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    createAuditLogServiceDouble() as never,
+  );
+  operationService.registerRetryExecutor("ORDER_SYNC", async () => {
+    throw new Error("SYNC_FAILED");
+  });
+  const operation = await operationService.enqueue("store-1", "ORDER_SYNC", {}, async () => ({}));
+  const worker = new OperationWorkerService(operationService);
+
+  assert.equal(await worker.pollOnce(), true);
+
+  const stored = databaseService.getSnapshot().operations.find((item: OperationRecord) => item.id === operation.id)!;
+  assert.equal(stored.status, "QUEUED");
+  assert.equal(stored.attemptCount, 1);
+  assert.equal(stored.errorMessage, "SYNC_FAILED");
+  assert.ok(stored.runAfter && stored.runAfter > stored.createdAt);
+  assert.equal(stored.finishedAt, null);
+});
+
+runAsync("OperationWorkerService marks operation failed at max attempts", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    createAuditLogServiceDouble() as never,
+  );
+  operationService.registerRetryExecutor("ORDER_SYNC", async () => {
+    throw new Error("FINAL_FAILURE");
+  });
+  const operation = await operationService.enqueue("store-1", "ORDER_SYNC", {}, async () => ({}));
+  databaseService.write((draft) => {
+    const stored = draft.operations.find((item) => item.id === operation.id)!;
+    stored.maxAttempts = 1;
+  });
+  const worker = new OperationWorkerService(operationService);
+
+  assert.equal(await worker.pollOnce(), true);
+
+  const stored = databaseService.getSnapshot().operations.find((item: OperationRecord) => item.id === operation.id)!;
+  assert.equal(stored.status, "FAILED");
+  assert.equal(stored.attemptCount, 1);
+  assert.equal(stored.errorMessage, "FINAL_FAILURE");
+  assert.equal(stored.runAfter, null);
+  assert.ok(stored.finishedAt);
+});
+
+runAsync("OperationService heartbeat extends lease and stores progress", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    createAuditLogServiceDouble() as never,
+  );
+  const operation = await operationService.enqueue("store-1", "ORDER_SYNC", {}, async () => ({}));
+  const acquired = await databaseService.acquireNextOperation("worker-a", 120_000) as OperationRecord | null;
+  assert.equal(acquired?.id, operation.id);
+
+  const heartbeat = await databaseService.heartbeatOperation(operation.id, "worker-a", 120_000, {
+    phase: "fetching",
+  }) as OperationRecord | null;
+
+  assert.equal(heartbeat?.progressJson?.phase, "fetching");
+  assert.ok(heartbeat?.heartbeatAt);
+  assert.ok(heartbeat?.leaseExpiresAt);
+});
+
+runAsync("Database operation lease prevents another same store/type acquisition until expired", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    createAuditLogServiceDouble() as never,
+  );
+  const first = await operationService.enqueue("store-1", "ORDER_SYNC", { n: 1 }, async () => ({}));
+  await operationService.enqueue("store-1", "ORDER_SYNC", { n: 2 }, async () => ({}));
+
+  const acquired = await databaseService.acquireNextOperation("worker-a", 120_000) as OperationRecord | null;
+  assert.equal(acquired?.id, first.id);
+  assert.equal(await databaseService.acquireNextOperation("worker-b", 120_000), null);
+
+  databaseService.write((draft) => {
+    const stored = draft.operations.find((item) => item.id === first.id)!;
+    stored.leaseExpiresAt = "2000-01-01T00:00:00.000Z";
+  });
+
+  const reacquired = await databaseService.acquireNextOperation("worker-b", 120_000) as OperationRecord | null;
+  assert.equal(reacquired?.id, first.id);
+  assert.equal(reacquired?.attemptCount, 2);
+});
+
+runAsync("OperationWorkerService defers same store/type execution when execution lock is busy", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const operationService = new OperationService(
+    databaseService as never,
+    createAuditLogServiceDouble() as never,
+  );
+  operationService.registerRetryExecutor("ORDER_SYNC", async () => ({ ok: true }));
+  const operation = await operationService.enqueue("store-1", "ORDER_SYNC", {}, async () => ({}));
+  const existingLock = await databaseService.tryAcquireOperationExecutionLock("store-1", "ORDER_SYNC");
+  const worker = new OperationWorkerService(operationService);
+
+  try {
+    assert.ok(existingLock);
+    assert.equal(await worker.pollOnce(), true);
+  } finally {
+    await existingLock?.release();
+  }
+
+  const stored = databaseService.getSnapshot().operations.find((item: OperationRecord) => item.id === operation.id)!;
+  assert.equal(stored.status, "QUEUED");
+  assert.equal(stored.attemptCount, 0);
+  assert.equal(stored.errorMessage, "STORE_OPERATION_LOCK_BUSY");
+  assert.ok(stored.runAfter && stored.runAfter > stored.createdAt);
 });
 
 run("NaverCommerceService omits optionCode when readable option fields are present", () => {
@@ -1766,6 +2560,38 @@ runAsync("DatabaseService PostgreSQL persistence deletes all rows for an empty t
   assert.equal(/TRUNCATE/i.test(queries[0].text), false);
 });
 
+runAsync("DatabaseService runtime PostgreSQL persistence skips queue-owned operations table", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  service.pool = {
+    connect: async () => client,
+  };
+  const snapshot = createEmptyDatabase();
+  snapshot.stores.push({ id: "store-runtime" } as never);
+  snapshot.operations.push(
+    createOperationRecord({
+      id: "operation-from-other-worker",
+      storeId: "store-runtime",
+      operationType: "ORDER_SYNC",
+      status: "QUEUED",
+    }),
+  );
+
+  await service.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false });
+
+  const sqlText = queries.map((query) => query.text).join("\n");
+  assert.match(sqlText, /INSERT INTO stores/);
+  assert.equal(/INSERT INTO operations/i.test(sqlText), false);
+  assert.equal(/DELETE FROM operations/i.test(sqlText), false);
+});
+
 runAsync("DatabaseService PostgreSQL persistence splits large upserts into batches", async () => {
   const service = Object.create(DatabaseService.prototype) as any;
   const queries: Array<{ text: string; values?: unknown[] }> = [];
@@ -2004,6 +2830,7 @@ run("profit rows keep delivery fee separate from product revenue and net profit"
   const database = createEmptyDatabase();
   const date = "2026-04-02";
 
+  database.stores.push(createStoreRecord("store-1", "Main Store"));
   database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Diet Socks", ["dietsocks"]));
   database.salesUnitCostSnapshots.push({
     id: "snapshot-delivery-profit",
@@ -2092,6 +2919,347 @@ run("profit rows keep delivery fee separate from product revenue and net profit"
   assert.equal(summary.uniquePackageCount, 1);
   assert.equal(summary.deliveryUnitCost, 3500);
   assert.equal(summary.deliveryMargin, -3480);
+});
+
+run("createEmptyDatabase includes daily profit summary collections", () => {
+  const database = createEmptyDatabase();
+
+  assert.deepEqual(database.dailySalesUnitProfits, []);
+  assert.deepEqual(database.dailyStoreSummaries, []);
+});
+
+runAsync("ProfitSummaryService stores calculation rows and ProfitService prefers them", async () => {
+  const database = createEmptyDatabase();
+  const date = "2026-04-02";
+
+  database.stores.push(createStoreRecord("store-1", "Main Store"));
+  database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Diet Socks", ["dietsocks"]));
+  database.salesUnitCostSnapshots.push({
+    id: "snapshot-summary-profit",
+    storeId: "store-1",
+    effectiveFrom: date,
+    sourceFileName: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.salesUnitCostSnapshotEntries.push({
+    id: "cost-summary-profit",
+    snapshotId: "snapshot-summary-profit",
+    storeId: "store-1",
+    canonicalSalesUnitId: "sales-1",
+    unitCost: 10,
+    feeRate: 0.1,
+    otherCost: 5,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.orderItems.push({
+    id: "order-summary-profit",
+    storeId: "store-1",
+    orderId: "record-summary-profit",
+    orderSourceSignatureId: null,
+    canonicalSalesUnitId: "sales-1",
+    externalProductOrderId: "external-summary-profit",
+    externalProductId: null,
+    packageNumber: null,
+    rawProductName: "diet socks",
+    rawOptionInfo: null,
+    normalizedProductName: normalizeText("diet socks"),
+    normalizedOptionInfo: "",
+    sourceSignature: createSourceSignature("diet socks", null),
+    quantity: 1,
+    productPaymentAmount: 100,
+    totalProductAmount: 100,
+    deliveryFeeAmount: 20,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: date,
+    paymentDate: date,
+    saleStatus: "SALE",
+    orderStatus: "DELIVERED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+
+  const databaseService = createMemoryDatabaseService(database);
+  const summaryService = new ProfitSummaryService(databaseService as never);
+  const profitService = new ProfitService(databaseService as never, summaryService);
+
+  await summaryService.recalculateStoreDates({
+    storeId: "store-1",
+    dateFrom: date,
+    dateTo: date,
+    reason: "MANUAL",
+  });
+
+  databaseService.write((draft) => {
+    draft.orderItems = [];
+  });
+
+  const rows = profitService.listDailySalesUnits({
+    storeId: "store-1",
+    dateFrom: date,
+    dateTo: date,
+  }).data.items;
+  const summary = profitService.getDashboardSummary("store-1", date).data;
+
+  assert.equal(databaseService.getSnapshot().dailySalesUnitProfits.length, 1);
+  assert.equal(databaseService.getSnapshot().dailyStoreSummaries.length, 1);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].totalProductRevenue, 100);
+  assert.equal(summary.totalProductRevenue, 100);
+});
+
+runAsync("ProfitService uses stored child rows for group child detail", async () => {
+  const database = createEmptyDatabase();
+  const date = "2026-04-06";
+
+  database.stores.push(createStoreRecord("store-1", "Main Store"));
+  database.canonicalSalesUnits.push(
+    Object.assign(createSalesUnit("group-1", "Group Unit", []) as Record<string, unknown>, {
+      isGroup: true,
+      parentSalesUnitId: null,
+    }) as never,
+    Object.assign(createSalesUnit("sales-child", "Child Unit", ["child unit"]) as Record<string, unknown>, {
+      parentSalesUnitId: "group-1",
+      isGroup: false,
+    }) as never,
+  );
+  database.salesUnitCostSnapshots.push({
+    id: "snapshot-child-summary",
+    storeId: "store-1",
+    effectiveFrom: date,
+    sourceFileName: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.salesUnitCostSnapshotEntries.push({
+    id: "cost-child-summary",
+    snapshotId: "snapshot-child-summary",
+    storeId: "store-1",
+    canonicalSalesUnitId: "sales-child",
+    unitCost: 10,
+    feeRate: 0,
+    otherCost: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.orderItems.push({
+    id: "order-child-summary",
+    storeId: "store-1",
+    orderId: "record-child-summary",
+    orderSourceSignatureId: null,
+    canonicalSalesUnitId: "sales-child",
+    externalProductOrderId: "external-child-summary",
+    externalProductId: null,
+    packageNumber: null,
+    rawProductName: "child unit",
+    rawOptionInfo: null,
+    normalizedProductName: normalizeText("child unit"),
+    normalizedOptionInfo: "",
+    sourceSignature: createSourceSignature("child unit", null),
+    quantity: 2,
+    productPaymentAmount: 200,
+    totalProductAmount: 200,
+    deliveryFeeAmount: 0,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: date,
+    paymentDate: date,
+    saleStatus: "SALE",
+    orderStatus: "DELIVERED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+
+  const databaseService = createMemoryDatabaseService(database);
+  const summaryService = new ProfitSummaryService(databaseService as never);
+  const profitService = new ProfitService(databaseService as never, summaryService);
+
+  await summaryService.recalculateStoreDates({
+    storeId: "store-1",
+    dateFrom: date,
+    dateTo: date,
+    reason: "MANUAL",
+  });
+
+  const detail = profitService.getDailySalesUnitDetail("store-1", "sales-child", date).data;
+
+  assert.equal(detail.summary.canonicalSalesUnitId, "sales-child");
+  assert.equal(detail.summary.displayName, "Child Unit");
+  assert.equal(detail.summary.totalProductRevenue, 200);
+});
+
+runAsync("SalesUnitService refreshes stored summaries after grouping changes", async () => {
+  const database = createEmptyDatabase();
+  const date = "2026-04-07";
+
+  database.stores.push(createStoreRecord("store-1", "Main Store"));
+  database.canonicalSalesUnits.push(createSalesUnit("sales-child", "Child Unit", ["child unit"]));
+  database.salesUnitCostSnapshots.push({
+    id: "snapshot-sales-unit-refresh",
+    storeId: "store-1",
+    effectiveFrom: date,
+    sourceFileName: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.salesUnitCostSnapshotEntries.push({
+    id: "cost-sales-unit-refresh",
+    snapshotId: "snapshot-sales-unit-refresh",
+    storeId: "store-1",
+    canonicalSalesUnitId: "sales-child",
+    unitCost: 10,
+    feeRate: 0,
+    otherCost: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.orderItems.push({
+    id: "order-sales-unit-refresh",
+    storeId: "store-1",
+    orderId: "record-sales-unit-refresh",
+    orderSourceSignatureId: null,
+    canonicalSalesUnitId: "sales-child",
+    externalProductOrderId: "external-sales-unit-refresh",
+    externalProductId: null,
+    packageNumber: null,
+    rawProductName: "child unit",
+    rawOptionInfo: null,
+    normalizedProductName: normalizeText("child unit"),
+    normalizedOptionInfo: "",
+    sourceSignature: createSourceSignature("child unit", null),
+    quantity: 1,
+    productPaymentAmount: 100,
+    totalProductAmount: 100,
+    deliveryFeeAmount: 0,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: date,
+    paymentDate: date,
+    saleStatus: "SALE",
+    orderStatus: "DELIVERED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+
+  const databaseService = createMemoryDatabaseService(database);
+  const summaryService = new ProfitSummaryService(databaseService as never);
+  const salesUnitService = new SalesUnitService(
+    databaseService as never,
+    { ensureWritable: () => undefined } as never,
+    createAuditLogServiceDouble() as never,
+    summaryService,
+  );
+
+  await summaryService.recalculateStoreDates({
+    storeId: "store-1",
+    dateFrom: date,
+    dateTo: date,
+    reason: "MANUAL",
+  });
+  assert.equal(databaseService.getSnapshot().dailySalesUnitProfits[0].canonicalSalesUnitId, "sales-child");
+
+  await salesUnitService.createSalesUnitGroup("store-1", "Group Unit", ["sales-child"]);
+
+  const storedRow = databaseService.getSnapshot().dailySalesUnitProfits[0];
+  assert.equal(storedRow.canonicalSalesUnitId === "sales-child", false);
+  assert.equal(storedRow.childRows?.[0]?.canonicalSalesUnitId, "sales-child");
+});
+
+runAsync("OrderSyncService recalculates daily profit summaries after successful sync", async () => {
+  const date = "2026-04-05";
+  const { databaseService, orderSyncService } = createOrderSyncServiceHarness({
+    stores: [createStoreRecord("store-1", "Main Store")],
+    configuredStoreIds: ["store-1"],
+    withProfitSummaryService: true,
+    liveOrderItems: [
+      createSyncedOrderItemInput({
+        externalOrderId: "summary-sync-order",
+        externalProductOrderId: "summary-sync-item",
+        date,
+        rawProductName: "Summary Product",
+        productPaymentAmount: 100,
+        deliveryFeeAmount: 0,
+        paymentCommission: 0,
+      }),
+    ],
+  });
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Summary Product", ["Summary Product"]));
+    draft.salesUnitCostSnapshots.push({
+      id: "snapshot-order-summary",
+      storeId: "store-1",
+      effectiveFrom: date,
+      sourceFileName: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as never);
+    draft.salesUnitCostSnapshotEntries.push({
+      id: "cost-order-summary",
+      snapshotId: "snapshot-order-summary",
+      storeId: "store-1",
+      canonicalSalesUnitId: "sales-1",
+      unitCost: 0,
+      feeRate: 0,
+      otherCost: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as never);
+  });
+
+  const result = await orderSyncService.performSync("store-1", date, date, "MANUAL");
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(snapshot.dailyStoreSummaries.length, 1);
+  assert.equal(snapshot.dailySalesUnitProfits.length, 1);
+  assert.equal(snapshot.dailySalesUnitProfits[0].totalProductRevenue, 100);
+  assert.equal(result.summaryRecalculation?.recalculatedDateCount, 1);
+});
+
+runAsync("AdsService recalculates daily profit summaries after confirmed upload changes", async () => {
+  const { databaseService, adsService } = createAdsServiceHarness({ withProfitSummaryService: true });
+  const date = "2026-04-03";
+
+  databaseService.write((draft) => {
+    draft.stores.push(createStoreRecord("store-1", "Main Store"));
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
+  });
+
+  await adsService.previewUpload(
+    "store-1",
+    date,
+    createAdUploadFile(date, [{ campaignId: "cmp-summary", campaignName: "alpha launch", totalCost: 120 }]),
+  );
+
+  let snapshot = databaseService.getSnapshot();
+  assert.equal(snapshot.dailyStoreSummaries.length, 1);
+  assert.equal(snapshot.dailyStoreSummaries[0].totalAdCost, 120);
+  assert.equal(snapshot.dailySalesUnitProfits.length, 1);
+  assert.equal(snapshot.dailySalesUnitProfits[0].totalAdCost, 120);
+
+  await adsService.deleteUpload(snapshot.adExcelUploads[0].id);
+
+  snapshot = databaseService.getSnapshot();
+  assert.equal(snapshot.dailyStoreSummaries.length, 1);
+  assert.equal(snapshot.dailyStoreSummaries[0].totalAdCost, 0);
+  assert.equal(snapshot.dailySalesUnitProfits.length, 0);
 });
 
 runAsync("AdsService confirms two same-date uploads and sums ad cost across active confirmed uploads", async () => {
@@ -2501,7 +3669,7 @@ runAsync("AdsService deleteUpload deactivates the upload and removes related ad 
   assert.equal(calculateDashboardSummary(snapshot, "store-1", date).totalAdCost, 0);
 });
 
-run("AdsService listAdCampaignSignatures excludes stale signatures and searches extended fields", () => {
+runAsync("AdsService listAdCampaignSignatures excludes stale signatures and searches extended fields", async () => {
   const { databaseService, adsService } = createAdsServiceHarness();
 
   databaseService.write((draft) => {
@@ -2575,22 +3743,22 @@ run("AdsService listAdCampaignSignatures excludes stale signatures and searches 
     );
   });
 
-  const defaultResult = adsService.listAdCampaignSignatures({ storeId: "store-1" });
+  const defaultResult = await adsService.listAdCampaignSignatures({ storeId: "store-1" });
   assert.equal(defaultResult.data.totalCount, 2);
   assert.deepEqual(
     new Set(defaultResult.data.items.map((item: { id: string }) => item.id)),
     new Set(["ad-signature-active", "ad-signature-no-rule"]),
   );
 
-  ["Needle Unit", "budget hold", "intentional", "2026-04-03"].forEach((q) => {
-    const result = adsService.listAdCampaignSignatures({ storeId: "store-1", q });
+  for (const q of ["Needle Unit", "budget hold", "intentional", "2026-04-03"]) {
+    const result = await adsService.listAdCampaignSignatures({ storeId: "store-1", q });
     assert.equal(
       result.data.items.some((item: { id: string }) => item.id === "ad-signature-active"),
       true,
     );
-  });
+  }
 
-  const reasonAliasResult = adsService.listAdCampaignSignatures({ storeId: "store-1", q: "NO_RULE_MATCH" });
+  const reasonAliasResult = await adsService.listAdCampaignSignatures({ storeId: "store-1", q: "NO_RULE_MATCH" });
   assert.equal(reasonAliasResult.data.totalCount, 1);
   assert.equal(reasonAliasResult.data.items[0].id, "ad-signature-no-rule");
 });

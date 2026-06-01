@@ -27,6 +27,7 @@ import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
 import { OperationService } from "./operation.service";
 import { ProfitService } from "./profit.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 import { formatApiSuccess } from "./helpers";
@@ -61,6 +62,7 @@ export class AppController {
     private readonly costService: CostService,
     private readonly fakePurchaseService: FakePurchaseService,
     private readonly profitService: ProfitService,
+    private readonly profitSummaryService: ProfitSummaryService,
     private readonly operationService: OperationService,
     private readonly mappingSeedService: MappingSeedService,
     private readonly databaseService: DatabaseService,
@@ -609,6 +611,24 @@ export class AppController {
     );
     res.setHeader("Content-Length", buffer.length.toString());
     res.end(buffer);
+  }
+
+  @Post("profits/daily-summaries/recalculate")
+  recalculateDailyProfitSummaries(
+    @Body()
+    body: {
+      storeId: string;
+      dateFrom: string;
+      dateTo: string;
+      reason?: "ORDER_SYNC" | "AD_UPLOAD" | "COST_CHANGE" | "MAPPING_CHANGE" | "MANUAL";
+    },
+  ) {
+    return this.profitSummaryService.recalculateStoreDates({
+      storeId: body.storeId,
+      dateFrom: body.dateFrom,
+      dateTo: body.dateTo,
+      reason: body.reason ?? "MANUAL",
+    });
   }
 
   @Get("profits/daily-sales-units/:salesUnitId")

@@ -1,71 +1,103 @@
-# scripts/
+# scripts
 
-프로젝트 유지보수용 범용 스크립트.
+운영/보수용 스크립트 모음입니다. DB 관련 스크립트는 PostgreSQL `DATABASE_URL`을 기준으로 동작합니다.
 
-## db-export.mjs / db-import.mjs
+## 공식 집/회사 DB 동기화
 
-다른 PC(회사 ↔ 집)에서 동일 데이터로 작업하기 위한 스냅샷 이동 도구.
+현재 공식 수단은 `scripts/db-export.mjs` / `scripts/db-import.mjs` 기반 **단방향 전체 snapshot 이동**입니다. 양방향 merge가 아니며, 한쪽 PC를 원본으로 정한 뒤 다른 PC DB를 snapshot 상태로 덮어씁니다.
 
-이 프로젝트는 Postgres에 `(id TEXT, payload JSONB, payload_hash TEXT, updated_at)` 구조로
-모든 데이터를 저장한다. 백엔드 runtime 쓰기는 row 단위 upsert/delete를 사용하지만,
-이 스크립트는 PC 간 이동과 백업 복원을 위한 명시적 full snapshot 도구다.
-`pg_dump` 없이도 JSON 한 파일로 완전한 복원 지점이 된다.
+원본 PC:
 
-### 내보내기 (소스 PC)
-
-```
+```powershell
 node scripts/db-export.mjs
-# 또는 경로 지정
-node scripts/db-export.mjs snapshot.json
 ```
 
-기본 출력: `backups/patima-<timestamp>.json` (gitignored).
+대상 PC:
 
-### 가져오기 (대상 PC)
+```powershell
+node scripts/db-import.mjs backups/patima-xxxx.json --yes
+```
 
-1. 저장소 클론 및 의존성 설치
-   ```
-   git clone <repo>
-   cd patima-naver-ss
-   npm install
-   ```
+필수 조건:
 
-2. `.env` 작성 (회사 PC의 `.env` 내용 참고하여 직접 작성; `.env`는 gitignore)
-   ```
-   DATABASE_URL=postgresql://patima_app:patima_local@localhost:5432/patima_naver_ss
-   MASTER_KEY=<회사 PC와 동일 값>
-   NAVER_STORE_NAME=Infinity Sports
-   PORT=4000
-   NEXT_PUBLIC_API_BASE_URL=http://localhost:4000/api/v1
-   ```
+- 대상 PC의 backend는 import 전에 중지합니다.
+- 집/회사 `.env`의 `MASTER_KEY`는 같아야 합니다.
+- `DATABASE_URL`은 대상 PostgreSQL DB를 가리켜야 합니다.
+- `backups/`는 gitignore 대상이므로 snapshot 파일은 USB, 개인 클라우드, 사내 승인 경로 등 별도 수단으로 이동합니다.
+- 양쪽 PC에서 동시에 수정한 데이터를 자동 merge하지 않습니다.
 
-   `MASTER_KEY`는 암호화된 commerce credential 복호화에 쓰이므로 반드시 동일 값.
+`db-export.mjs`는 현재 schema의 JSONB payload 테이블 전체를 snapshot에 포함합니다. 새 payload 테이블이 생기면 `scripts/db-maintenance-utils.mjs`의 `FULL_SYNC_TABLES`, `db-import.mjs`, 이 문서를 함께 확인합니다.
 
-3. Postgres 기동 (docker compose 사용)
-   ```
-   docker compose up db -d
-   ```
+`db-import.mjs`는 명시적 restore/full sync 도구이므로 대상 JSONB payload 테이블을 `TRUNCATE` 후 snapshot row를 재삽입합니다. runtime API persistence에서 `TRUNCATE`를 쓰지 않는 것과 별개의 운영 복구 절차입니다.
 
-4. 스냅샷 임포트 — 백엔드는 켜지 말 것 (snapshot-replace가 덮어씀)
-   ```
-   node scripts/db-import.mjs <snapshot 경로>
-   # 확인 없이 바로 실행
-   node scripts/db-import.mjs <snapshot 경로> --yes
-   ```
+## DB 크기 리포트
 
-5. 백엔드/프론트 기동
-   ```
-   npm run dev
-   ```
+```powershell
+node scripts/report-db-size.mjs
+```
 
-### 주의
+출력 항목:
 
-- 임포트는 대상 DB의 **모든 JSONB 블롭 테이블을 TRUNCATE** 후 교체한다.
-- 스냅샷은 `schemaVersion`과 `payload_hash`를 포함한다. 오래된 v1 스냅샷은
-  임포트 시 `payload_hash`를 backfill해서 복원한다.
-- 임포트 후 backend가 필요한 `payload_hash` 컬럼과 JSONB expression index를 보장한다.
-- 이 도구는 단방향 full sync이며, 양쪽 PC에서 동시에 수정한 데이터를 merge하지 않는다.
-- 소스 PC의 스냅샷을 집 PC로 옮기는 법: 이메일 첨부, 클라우드 드라이브,
-  USB, 또는 private git-lfs. `backups/`는 `.gitignore`에 들어있어 일반
-  커밋으로는 올라가지 않는다.
-- 주기적으로(작업 전후) 스냅샷을 뜨면 양쪽 PC의 동기화가 쉬워진다.
+- table별 row count와 payload byte 추정치
+- export 대상 table 누락 여부
+- `orders` / `order_items`의 `rawPayload` null/non-null count
+- `audit_logs`, `operations` 요약
+- 가장 큰 payload row top 20
+- `backups/` 파일 크기 목록
+
+## rawPayload 수동 prune
+
+기본은 dry-run입니다.
+
+```powershell
+node scripts/prune-order-raw-payloads.mjs --days 90
+node scripts/prune-order-raw-payloads.mjs --days 90 --yes
+```
+
+동작:
+
+- `orders.payload.rawPayload`, `order_items.payload.rawPayload` 값만 JSON null로 바꿉니다.
+- 주문 row, 주문상품 row, option/fee/revenue/mapping 필드, daily summary row는 삭제하지 않습니다.
+- 기준일은 KST cutoff입니다.
+- `orders`: `paymentDatetime -> orderDatetime -> syncedAt`
+- `order_items`: `paymentDate -> orderDate -> createdAt`
+- 실제 변경 시 `payload_hash`는 null로 두어 다음 backend 기동/쓰기 또는 export 시 실제 payload 기준으로 다시 계산되게 합니다.
+
+## audit log 보존/archive
+
+기본 보존 기간은 180일입니다.
+
+```powershell
+node scripts/prune-audit-logs.mjs --days 180
+node scripts/prune-audit-logs.mjs --days 180 --yes
+```
+
+`--yes`를 붙이면 cutoff 이전 `audit_logs` row를 `DB_ARCHIVE_DIR` 아래 JSONL 파일로 먼저 archive한 뒤 DB에서 삭제합니다. archive 없이 삭제하는 옵션은 제공하지 않습니다.
+
+## operation 보존/archive
+
+기본 보존 기간은 90일입니다.
+
+```powershell
+node scripts/prune-operations.mjs --days 90 --keep-failed
+node scripts/prune-operations.mjs --days 90 --prune-failed --yes
+```
+
+정책:
+
+- `QUEUED`, `RUNNING`은 항상 보존합니다.
+- 기본 대상은 cutoff 이전 `SUCCEEDED` operation입니다.
+- `FAILED`는 기본 보존하며, `--prune-failed`가 있을 때만 archive/delete 후보가 됩니다.
+- retry chain에 최근/진행 중 row가 연결되어 있으면 오래된 원본도 보존합니다.
+
+## 환경변수
+
+```env
+ORDER_RAW_PAYLOAD_RETENTION_DAYS=90
+AUDIT_LOG_RETENTION_DAYS=180
+OPERATION_RETENTION_DAYS=90
+DB_ARCHIVE_DIR=./backups/archive
+```
+
+모든 prune/archive 스크립트는 기본 dry-run이며 실제 변경은 `--yes`가 있을 때만 수행합니다. `--yes` 실행 전에는 backend를 중지하고 `node scripts/db-export.mjs`로 최신 snapshot을 남기는 것을 권장합니다.
+

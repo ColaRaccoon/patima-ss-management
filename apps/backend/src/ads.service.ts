@@ -30,6 +30,7 @@ import {
   repairMojibakeText,
 } from "./helpers";
 import { OperationService } from "./operation.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 import { StoreService } from "./store.service";
 
 export const AD_UPLOAD_REQUIRED_HEADERS = [
@@ -44,17 +45,6 @@ export const AD_UPLOAD_REQUIRED_HEADERS = [
 
 const WEEKDAYS = new Set(["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]);
 
-const toDisplayMappingReasonAlias = (value: string | null | undefined) => {
-  switch (value) {
-    case "NO_RULE":
-      return "NO_RULE_MATCH";
-    case "MULTIPLE_RULES":
-      return "MULTIPLE_RULE_MATCHES";
-    default:
-      return value ?? "";
-  }
-};
-
 @Injectable()
 export class AdsService implements OnModuleInit {
   constructor(
@@ -62,6 +52,7 @@ export class AdsService implements OnModuleInit {
     private readonly storeService: StoreService,
     private readonly operationService: OperationService,
     private readonly auditLogService: AuditLogService,
+    private readonly profitSummaryService?: ProfitSummaryService,
   ) {}
 
   onModuleInit(): void {
@@ -213,6 +204,8 @@ export class AdsService implements OnModuleInit {
       });
     });
 
+    await this.recalculateProfitSummaryForAdDate(storeId, reportDate);
+
     return formatApiSuccess({
       uploadId: upload.id,
       reportDate,
@@ -330,6 +323,8 @@ export class AdsService implements OnModuleInit {
         },
       });
     });
+
+    await this.recalculateProfitSummaryForAdDate(upload.storeId, upload.reportDate);
 
     return formatApiSuccess({
       uploadId: upload.id,
@@ -467,6 +462,8 @@ export class AdsService implements OnModuleInit {
       });
     });
 
+    await this.recalculateProfitSummaryForAdDate(upload.storeId, upload.reportDate);
+
     return {
       uploadId: upload.id,
       confirmedRowCount: previewRows.length,
@@ -505,7 +502,7 @@ export class AdsService implements OnModuleInit {
     return formatApiSuccess(paginate(items, query.page, query.pageSize));
   }
 
-  listAdCampaignSignatures(query: {
+  async listAdCampaignSignatures(query: {
     storeId: string;
     dateFrom?: string;
     dateTo?: string;
@@ -514,71 +511,11 @@ export class AdsService implements OnModuleInit {
     page?: number;
     pageSize?: number;
   }) {
-    const snapshot = this.databaseService.getSnapshot();
-    const activeUploadIds = getActiveConfirmedUploadIds(snapshot, query.storeId);
-    const keyword = query.q ? normalizeText(query.q) : null;
-    const rowsBySignatureId = new Map<string, AdCampaignDailyCost[]>();
-    const salesUnitsById = new Map(snapshot.canonicalSalesUnits.map((item) => [item.id, item]));
+    const result = await this.databaseService.queryAdCampaignSignatures(query);
 
-    snapshot.adCampaignDailyCosts
-      .filter((row) => row.storeId === query.storeId && activeUploadIds.has(row.sourceUploadId))
-      .filter((row) => (query.dateFrom ? row.reportDate >= query.dateFrom : true))
-      .filter((row) => (query.dateTo ? row.reportDate <= query.dateTo : true))
-      .forEach((row) => {
-        if (!row.adCampaignSignatureId) {
-          return;
-        }
-        const rows = rowsBySignatureId.get(row.adCampaignSignatureId) ?? [];
-        rows.push(row);
-        rowsBySignatureId.set(row.adCampaignSignatureId, rows);
-      });
-
-    const signatures = snapshot.adCampaignSignatures
-      .filter((signature) => signature.storeId === query.storeId)
-      .filter((signature) => rowsBySignatureId.has(signature.id))
-      .filter((signature) =>
-        query.mappingStatus && query.mappingStatus !== "ALL"
-          ? getAdMappingStatus(signature) === query.mappingStatus
-          : true,
-      )
-      .filter((signature) => {
-        if (!keyword) {
-          return true;
-        }
-
-        const rows = rowsBySignatureId.get(signature.id) ?? [];
-        const salesUnitDisplayName = signature.canonicalSalesUnitId
-          ? salesUnitsById.get(signature.canonicalSalesUnitId)?.displayName
-          : null;
-        const reasonNote = repairMojibakeText(signature.reasonNote);
-        const mappingReasonAlias = toDisplayMappingReasonAlias(signature.mappingReason);
-        return (
-          normalizeText(signature.campaignNameSnapshot).includes(keyword) ||
-          normalizeText(repairMojibakeText(signature.campaignNameSnapshot)).includes(keyword) ||
-          normalizeText(signature.normalizedCampaignName).includes(keyword) ||
-          normalizeText(signature.campaignId ?? "").includes(keyword) ||
-          normalizeText(salesUnitDisplayName).includes(keyword) ||
-          normalizeText(signature.mappingReason).includes(keyword) ||
-          normalizeText(mappingReasonAlias).includes(keyword) ||
-          normalizeText(reasonNote).includes(keyword) ||
-          normalizeText(signature.firstSeenDate).includes(keyword) ||
-          normalizeText(signature.lastSeenDate).includes(keyword) ||
-          rows.some((row) => normalizeText(row.reportDate).includes(keyword))
-        );
-      })
-      .sort((left, right) =>
-        (right.lastSeenDate ?? right.updatedAt).localeCompare(left.lastSeenDate ?? left.updatedAt),
-      );
-
-    const items = signatures.map((signature) => {
-      const rows = rowsBySignatureId.get(signature.id) ?? [];
-      const latestRow = rows
-        .slice()
-        .sort((left, right) =>
-          `${right.reportDate}:${right.updatedAt}`.localeCompare(`${left.reportDate}:${left.updatedAt}`),
-        )[0];
-
-      return {
+    return formatApiSuccess({
+      ...result,
+      items: result.items.map(({ signature, latestRow, totalCost, rowCount }) => ({
         id: signature.id,
         adCampaignSignatureId: signature.id,
         uploadId: latestRow?.sourceUploadId ?? signature.id,
@@ -588,20 +525,18 @@ export class AdsService implements OnModuleInit {
         campaignId: signature.campaignId ?? latestRow?.campaignId ?? "",
         campaignName: repairMojibakeText(signature.campaignNameSnapshot),
         normalizedCampaignName: signature.normalizedCampaignName,
-        totalCost: rows.reduce((sum, row) => sum + row.totalCost, 0),
+        totalCost,
         matchedRuleCount: signature.matchedRuleCount,
         canonicalSalesUnitId: signature.canonicalSalesUnitId,
         mappingReason: signature.mappingReason,
         reasonNote: repairMojibakeText(signature.reasonNote),
         reasonNoteInherited: signature.reasonNoteInherited,
-        usageCount: signature.usageCount ?? rows.length,
+        usageCount: signature.usageCount ?? rowCount,
         firstSeenDate: signature.firstSeenDate,
         lastSeenDate: signature.lastSeenDate,
         confirmedAt: signature.confirmedAt,
-      };
+      })),
     });
-
-    return formatApiSuccess(paginate(items, query.page, query.pageSize));
   }
 
   async setIntentionalUnmapped(adCostId: string, payload: { reasonNote: string }) {
@@ -666,8 +601,9 @@ export class AdsService implements OnModuleInit {
     const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds);
     this.storeService.ensureWritable(storeId);
     const timestamp = nowIso();
+    let targetSignatureIds = new Set<string>();
     await this.databaseService.writeCommitted((draft) => {
-      const targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
+      targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
       draft.adCampaignSignatures.forEach((signature) => {
         if (!targetSignatureIds.has(signature.id)) {
           return;
@@ -685,6 +621,7 @@ export class AdsService implements OnModuleInit {
         signatureIds: targetSignatureIds,
       });
     });
+    await this.recalculateProfitSummariesForAdIdentifiers(storeId, dedupedIds, targetSignatureIds);
 
     return { adCostIds: dedupedIds };
   }
@@ -721,8 +658,9 @@ export class AdsService implements OnModuleInit {
 
     this.storeService.ensureWritable(storeId);
     const timestamp = nowIso();
+    let targetSignatureIds = new Set<string>();
     await this.databaseService.writeCommitted((draft) => {
-      const targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
+      targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
       draft.adCampaignSignatures.forEach((signature) => {
         if (!targetSignatureIds.has(signature.id)) {
           return;
@@ -740,6 +678,7 @@ export class AdsService implements OnModuleInit {
         signatureIds: targetSignatureIds,
       });
     });
+    await this.recalculateProfitSummariesForAdIdentifiers(storeId, dedupedIds, targetSignatureIds);
 
     return { adCostIds: dedupedIds };
   }
@@ -756,6 +695,7 @@ export class AdsService implements OnModuleInit {
         applyToRows: true,
       });
     });
+    await this.recalculateProfitSummariesForAdIdentifiers(storeId, dedupedIds, targetSignatureIds);
     const nextSnapshot = this.databaseService.getSnapshot();
     const signaturesById = new Map(nextSnapshot.adCampaignSignatures.map((signature) => [signature.id, signature]));
     const rowsById = new Map(nextSnapshot.adCampaignDailyCosts.map((row) => [row.id, row]));
@@ -774,6 +714,30 @@ export class AdsService implements OnModuleInit {
       adCostIds: dedupedIds,
       mappings,
     };
+  }
+
+  private async recalculateProfitSummariesForAdIdentifiers(
+    storeId: string,
+    ids: string[],
+    signatureIds: Set<string>,
+  ) {
+    const idSet = new Set(ids);
+    const dates = this.databaseService
+      .getSnapshot()
+      .adCampaignDailyCosts.filter(
+        (item) =>
+          item.storeId === storeId &&
+          (idSet.has(item.id) ||
+            (item.adCampaignSignatureId ? signatureIds.has(item.adCampaignSignatureId) : false) ||
+            signatureIds.has(item.id)),
+      )
+      .map((item) => item.reportDate);
+
+    await this.profitSummaryService?.refreshStoreDateListBestEffort({
+      storeId,
+      dates,
+      reason: "MAPPING_CHANGE",
+    });
   }
 
   private resolveAdCostBatch(adCostIds: string[], snapshot = this.databaseService.getSnapshot()) {
@@ -925,6 +889,15 @@ export class AdsService implements OnModuleInit {
     }
 
     return campaigns;
+  }
+
+  private async recalculateProfitSummaryForAdDate(storeId: string, reportDate: string) {
+    await this.profitSummaryService?.refreshStoreDatesBestEffort({
+      storeId,
+      dateFrom: reportDate,
+      dateTo: reportDate,
+      reason: "AD_UPLOAD",
+    });
   }
 
   private getActiveConfirmedRows(snapshot: DatabaseShape, storeId: string, reportDate: string) {

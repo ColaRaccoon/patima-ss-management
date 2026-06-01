@@ -13,9 +13,11 @@ import { MappingSeedService } from "./mapping-seed.service";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { NaverCommerceService } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
+import { OperationWorkerService } from "./operation-worker.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
 import { ProfitService } from "./profit.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 
@@ -39,8 +41,10 @@ import { StoreService } from "./store.service";
     CampaignMappingService,
     CostService,
     FakePurchaseService,
+    ProfitSummaryService,
     ProfitService,
     MappingSeedService,
+    OperationWorkerService,
   ],
 })
 export class AppModule {}

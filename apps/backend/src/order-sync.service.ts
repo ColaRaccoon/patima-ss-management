@@ -7,7 +7,6 @@ import {
   ensureKstDateRange,
   ensureStoreExists,
   formatApiSuccess,
-  getOrderItemMappingStatus,
   getSignatureMappingStatus,
   mapOrderItemResponse,
   nowIso,
@@ -16,6 +15,7 @@ import {
 } from "./helpers";
 import { NaverCommerceService, SyncedOrderItemInput } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 import {
   getKstRetentionCutoffDate,
   getOrderRawPayloadRetentionDays,
@@ -81,6 +81,7 @@ export class OrderSyncService implements OnModuleInit {
     private readonly operationService: OperationService,
     private readonly auditLogService: AuditLogService,
     private readonly naverCommerceService: NaverCommerceService,
+    private readonly profitSummaryService?: ProfitSummaryService,
   ) {}
 
   onModuleInit(): void {
@@ -399,6 +400,15 @@ export class OrderSyncService implements OnModuleInit {
         });
       });
 
+      const summaryRecalculation = this.profitSummaryService
+        ? await this.profitSummaryService.refreshStoreDatesBestEffort({
+            storeId,
+            dateFrom,
+            dateTo,
+            reason: "ORDER_SYNC",
+          })
+        : null;
+
       const result = {
         syncSource,
         ordersUpserted,
@@ -411,6 +421,7 @@ export class OrderSyncService implements OnModuleInit {
         rawPayloadRetentionCutoffDate,
         rawPayloadPrunedOrderCount,
         rawPayloadPrunedOrderItemCount,
+        ...(summaryRecalculation ? { summaryRecalculation } : {}),
       };
 
       return result;
@@ -439,7 +450,7 @@ export class OrderSyncService implements OnModuleInit {
     }
   }
 
-  listOrderItems(query: {
+  async listOrderItems(query: {
     storeId: string;
     dateFrom?: string;
     dateTo?: string;
@@ -452,40 +463,13 @@ export class OrderSyncService implements OnModuleInit {
     page?: number;
     pageSize?: number;
   }) {
-    const keywordProduct = query.productName ? normalizeText(query.productName) : null;
-    const keywordOption = query.optionInfo ? normalizeText(query.optionInfo) : null;
     const snapshot = this.databaseService.getSnapshot();
-    const items = snapshot.orderItems
-      .filter((item) => item.storeId === query.storeId)
-      .filter((item) =>
-        query.dateFrom && query.dateTo
-          ? !!item.paymentDate && item.paymentDate >= query.dateFrom && item.paymentDate <= query.dateTo
-          : true,
-      )
-      .filter((item) => (keywordProduct ? item.normalizedProductName.includes(keywordProduct) : true))
-      .filter((item) => (keywordOption ? item.normalizedOptionInfo.includes(keywordOption) : true))
-      .filter((item) =>
-        query.mappingStatus && query.mappingStatus !== "ALL"
-          ? getOrderItemMappingStatus(snapshot, item) === query.mappingStatus
-          : true,
-      )
-      .filter((item) => (query.orderStatus ? item.orderStatus === query.orderStatus : true))
-      .filter((item) => (query.saleStatus ? item.saleStatus === query.saleStatus : true))
-      .filter((item) =>
-        query.paymentDateStatus && query.paymentDateStatus !== "ALL"
-          ? query.paymentDateStatus === "PRESENT"
-            ? !!item.paymentDate
-            : !item.paymentDate
-          : true,
-      )
-      .sort((left, right) => (right.paymentDate ?? "").localeCompare(left.paymentDate ?? ""));
-
+    const result = await this.databaseService.queryOrderItems(query);
     return formatApiSuccess(
-      paginate(
-        items.map((item) => mapOrderItemResponse(snapshot, item)),
-        query.page,
-        query.pageSize,
-      ),
+      {
+        ...result,
+        items: result.items.map((item) => mapOrderItemResponse(snapshot, item)),
+      },
     );
   }
 

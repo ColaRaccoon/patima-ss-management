@@ -14,6 +14,7 @@ import {
   paginate,
   sanitizeMatchAliases,
 } from "./helpers";
+import { ProfitSummaryService } from "./profit-summary.service";
 import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
 import { StoreService } from "./store.service";
 
@@ -37,6 +38,7 @@ export class SalesUnitService {
     private readonly databaseService: DatabaseService,
     private readonly storeService: StoreService,
     private readonly auditLogService: AuditLogService,
+    private readonly profitSummaryService?: ProfitSummaryService,
   ) {}
 
   /**
@@ -161,6 +163,7 @@ export class SalesUnitService {
         afterJson: created,
       });
     });
+    await this.recalculateProfitSummariesForStore(payload.storeId);
 
     return formatApiSuccess(created);
   }
@@ -209,6 +212,7 @@ export class SalesUnitService {
         afterJson: updated,
       });
     });
+    await this.recalculateProfitSummariesForStore(existing.storeId);
 
     return formatApiSuccess(updated);
   }
@@ -239,6 +243,7 @@ export class SalesUnitService {
       recalculateOrderMappingsForStore(draft, existing.storeId);
       recalculateAdMappingsForStore(draft, existing.storeId);
     });
+    await this.recalculateProfitSummariesForStore(existing.storeId);
 
     return formatApiSuccess({
       salesUnitId,
@@ -267,6 +272,7 @@ export class SalesUnitService {
       recalculateOrderMappingsForStore(draft, existing.storeId);
       recalculateAdMappingsForStore(draft, existing.storeId);
     });
+    await this.recalculateProfitSummariesForStore(existing.storeId);
 
     return formatApiSuccess({
       salesUnitId,
@@ -422,6 +428,7 @@ export class SalesUnitService {
         afterJson: groupUnit,
       });
     });
+    await this.recalculateProfitSummariesForStore(storeId);
 
     return formatApiSuccess(groupUnit);
   }
@@ -518,6 +525,7 @@ export class SalesUnitService {
         afterJson: { ...child, parentSalesUnitId: groupId },
       });
     });
+    await this.recalculateProfitSummariesForStore(storeId);
 
     return formatApiSuccess({ groupId, childId });
   }
@@ -572,6 +580,7 @@ export class SalesUnitService {
         afterJson: { ...child, parentSalesUnitId: null },
       });
     });
+    await this.recalculateProfitSummariesForStore(storeId);
 
     return formatApiSuccess({ childId, parentId });
   }
@@ -652,8 +661,17 @@ export class SalesUnitService {
         afterJson: { ...group, isActive: false, deactivatedAt: nowIso() },
       });
     });
+    await this.recalculateProfitSummariesForStore(storeId);
 
     return formatApiSuccess({ groupId });
+  }
+
+  private async recalculateProfitSummariesForStore(storeId: string) {
+    await this.profitSummaryService?.refreshStoreDatesSinceBestEffort({
+      storeId,
+      dateFrom: "0001-01-01",
+      reason: "MAPPING_CHANGE",
+    });
   }
 
   private ensureUnique(target: CanonicalSalesUnit, excludeId?: string) {

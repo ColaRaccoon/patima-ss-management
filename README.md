@@ -40,6 +40,9 @@ Optional storage controls:
 
 ```env
 ORDER_RAW_PAYLOAD_RETENTION_DAYS=90
+AUDIT_LOG_RETENTION_DAYS=180
+OPERATION_RETENTION_DAYS=90
+DB_ARCHIVE_DIR=./backups/archive
 ```
 
 `ORDER_RAW_PAYLOAD_RETENTION_DAYS` keeps `OrderRecord.rawPayload` and `OrderItem.rawPayload`
@@ -47,12 +50,24 @@ only for recent KST order/payment dates. It must be a non-negative integer; inva
 back to `90`. Set it to `0` to avoid storing new order raw payloads and prune existing payloads
 for the synced store.
 
+Maintenance scripts are dry-run by default:
+
+```bash
+node scripts/report-db-size.mjs
+node scripts/prune-order-raw-payloads.mjs --days 90
+node scripts/prune-audit-logs.mjs --days 180
+node scripts/prune-operations.mjs --days 90 --keep-failed
+```
+
+Add `--yes` only after creating a fresh snapshot and stopping the backend.
+
 ## Current behavior
 
 - If `DATABASE_URL` exists, PostgreSQL is the primary storage provider.
 - If `DATABASE_URL` is missing, the backend falls back to `apps/backend/data/database.json`.
 - Write APIs use committed persistence for the main mutation paths: a successful PostgreSQL write response means the snapshot transaction committed, and file fallback writes through a temporary file before rename.
 - PostgreSQL runtime persistence keeps the `id + payload JSONB` tables but writes changed snapshots with row-level upsert/delete and `payload_hash`; full PC sync remains `scripts/db-export.mjs` / `scripts/db-import.mjs`.
+- DB maintenance scripts cover size reporting, manual order raw payload pruning, audit log archiving, operation archiving, and restore rehearsal. See `scripts/README.md` and `DB_RESTORE_RUNBOOK.md`.
 - If matching `NAVER_*` values exist, the backend bootstraps a Smart Store record and seller credential automatically.
 - Credential test now issues a real SELLER token and checks seller account/channel endpoints.
 - Order sync now prefers live Naver Commerce API calls.

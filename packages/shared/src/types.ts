@@ -286,6 +286,14 @@ export interface OperationRecord {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  attemptCount: number;
+  maxAttempts: number;
+  runAfter: string | null;
+  heartbeatAt: string | null;
+  leaseOwner: string | null;
+  leaseExpiresAt: string | null;
+  lockedAt: string | null;
+  progressJson: Record<string, unknown> | null;
 }
 
 export interface AuditLog {
@@ -371,6 +379,26 @@ export interface DailySalesUnitProfit {
   childRows?: DailySalesUnitProfit[];
 }
 
+export interface StoredDailySalesUnitProfit extends DailySalesUnitProfit {
+  id: string;
+  storeId: string;
+  costSnapshotId: string | null;
+  mappingBasisHash: string | null;
+  calculationVersion: string;
+  calculatedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StoredDailyStoreSummary extends DashboardSummary {
+  id: string;
+  storeId: string;
+  calculationVersion: string;
+  calculatedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DailySalesUnitDetailRevenueBreakdown {
   productRevenueOriginal: number;
   vatRate: number;
@@ -445,6 +473,8 @@ export interface DatabaseShape {
   salesUnitCostSnapshots: SalesUnitCostSnapshot[];
   salesUnitCostSnapshotEntries: SalesUnitCostSnapshotEntry[];
   dailyFakePurchases: DailyFakePurchase[];
+  dailySalesUnitProfits: StoredDailySalesUnitProfit[];
+  dailyStoreSummaries: StoredDailyStoreSummary[];
   operations: OperationRecord[];
   auditLogs: AuditLog[];
 }

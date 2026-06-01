@@ -14,6 +14,7 @@ import {
   paginate,
 } from "./helpers";
 import { OperationService } from "./operation.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 
@@ -25,6 +26,7 @@ export class CampaignMappingService implements OnModuleInit {
     private readonly operationService: OperationService,
     private readonly auditLogService: AuditLogService,
     private readonly salesUnitService: SalesUnitService,
+    private readonly profitSummaryService?: ProfitSummaryService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -362,6 +364,7 @@ export class CampaignMappingService implements OnModuleInit {
     await this.databaseService.writeCommitted((draft) => {
       recalculateAdCampaignSignaturesForStore(draft, storeId, { onlyUnconfirmed: true });
     });
+    await this.recalculateProfitSummariesForAdDates(storeId);
 
     return {
       recalculatedAdRows: this.databaseService
@@ -371,5 +374,18 @@ export class CampaignMappingService implements OnModuleInit {
         .getSnapshot()
         .adCampaignSignatures.filter((item) => item.storeId === storeId && !item.confirmedAt).length,
     };
+  }
+
+  private async recalculateProfitSummariesForAdDates(storeId: string) {
+    const dates = this.databaseService
+      .getSnapshot()
+      .adCampaignDailyCosts.filter((item) => item.storeId === storeId)
+      .map((item) => item.reportDate);
+
+    await this.profitSummaryService?.refreshStoreDateListBestEffort({
+      storeId,
+      dates,
+      reason: "MAPPING_CHANGE",
+    });
   }
 }

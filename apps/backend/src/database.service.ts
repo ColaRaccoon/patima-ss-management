@@ -1,10 +1,32 @@
 import { Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
-import { AdCampaignSignature, DatabaseShape, DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
+import {
+  AdCampaignDailyCost,
+  AdCampaignSignature,
+  DatabaseShape,
+  DEFAULT_DELIVERY_UNIT_COST,
+  MappingStatus,
+  OperationRecord,
+  OperationStatus,
+  OperationType,
+  OrderItem,
+  PaginationResult,
+  normalizeText,
+} from "@patima/shared";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { Pool, PoolClient } from "pg";
-import { createEmptyDatabase, getSignatureMappingStatus, migrateCanonicalSalesUnit } from "./helpers";
+import {
+  createEmptyDatabase,
+  getActiveConfirmedUploadIds,
+  getAdMappingStatus,
+  getOrderItemMappingStatus,
+  getSignatureMappingStatus,
+  migrateCanonicalSalesUnit,
+  paginate,
+  repairMojibakeText,
+} from "./helpers";
+import { buildPaginationResult, createSqlBuilder, normalizePagination } from "./query-builders";
 
 type DatabaseCollectionKey = keyof DatabaseShape;
 type StorageMode = "postgres" | "file";
@@ -17,6 +39,7 @@ interface PersistenceErrorState {
 interface StorageTable {
   key: DatabaseCollectionKey;
   tableName: string;
+  queueOwned?: boolean;
 }
 
 interface PostgresJsonbIndex {
@@ -38,6 +61,114 @@ interface DuplicateKeyWarning {
   rows: Array<Record<string, unknown>>;
 }
 
+type ListMappingStatus = "ALL" | MappingStatus;
+
+export interface OperationListQuery {
+  storeId: string;
+  status?: OperationStatus;
+  operationType?: OperationType;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface OperationExecutionLock {
+  lockName: string;
+  release: () => Promise<void>;
+}
+
+export interface OrderItemListQuery {
+  storeId: string;
+  dateFrom?: string;
+  dateTo?: string;
+  productName?: string;
+  optionInfo?: string;
+  mappingStatus?: ListMappingStatus;
+  orderStatus?: string;
+  saleStatus?: string;
+  paymentDateStatus?: "ALL" | "PRESENT" | "MISSING";
+  page?: number;
+  pageSize?: number;
+}
+
+export interface AdCampaignSignatureListQuery {
+  storeId: string;
+  dateFrom?: string;
+  dateTo?: string;
+  mappingStatus?: ListMappingStatus;
+  q?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface AdCampaignSignatureQueryItem {
+  signature: AdCampaignSignature;
+  latestRow: AdCampaignDailyCost | null;
+  totalCost: number;
+  rowCount: number;
+}
+
+const parsePgCount = (value: unknown): number => {
+  if (typeof value === "number") {
+    return value;
+  }
+
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const DEFAULT_OPERATION_MAX_ATTEMPTS = 3;
+const OPERATION_LOCK_BUSY_ATTEMPT_DECREMENT = 1;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const HANGUL_REGEX = /[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/;
+
+const escapeLikePattern = (value: string): string => value.replace(/[\\%_]/g, (match) => `\\${match}`);
+
+const likePattern = (value: string): string => `%${escapeLikePattern(value)}%`;
+
+const toDisplayMappingReasonAlias = (value: string | null | undefined) => {
+  switch (value) {
+    case "NO_RULE":
+      return "NO_RULE_MATCH";
+    case "MULTIPLE_RULES":
+      return "MULTIPLE_RULE_MATCHES";
+    default:
+      return value ?? "";
+  }
+};
+
+const orderItemMappingStatusSql = (itemAlias: string, signatureAlias: string) => `
+  CASE
+    WHEN ${signatureAlias}.payload IS NOT NULL THEN COALESCE(
+      ${signatureAlias}.payload->>'mappingStatus',
+      CASE
+        WHEN NULLIF(${signatureAlias}.payload->>'canonicalSalesUnitId', '') IS NOT NULL THEN 'MAPPED'
+        ELSE 'UNMAPPED'
+      END
+    )
+    WHEN NULLIF(${itemAlias}.payload->>'canonicalSalesUnitId', '') IS NOT NULL THEN 'MAPPED'
+    ELSE 'UNMAPPED'
+  END
+`;
+
+const adCampaignMappingStatusSql = (signatureAlias: string) => `
+  CASE
+    WHEN ${signatureAlias}.payload->>'mappingReason' = 'MULTIPLE_RULES' THEN 'CONFLICT'
+    WHEN NULLIF(${signatureAlias}.payload->>'canonicalSalesUnitId', '') IS NOT NULL THEN 'MAPPED'
+    ELSE 'UNMAPPED'
+  END
+`;
+
+const adCampaignMappingReasonAliasSql = (signatureAlias: string) => `
+  CASE ${signatureAlias}.payload->>'mappingReason'
+    WHEN 'NO_RULE' THEN 'NO_RULE_MATCH'
+    WHEN 'MULTIPLE_RULES' THEN 'MULTIPLE_RULE_MATCHES'
+    ELSE COALESCE(${signatureAlias}.payload->>'mappingReason', '')
+  END
+`;
+
 const STORAGE_TABLES: StorageTable[] = [
   { key: "stores", tableName: "stores" },
   { key: "commerceCredentials", tableName: "commerce_api_credentials" },
@@ -55,11 +186,13 @@ const STORAGE_TABLES: StorageTable[] = [
   { key: "salesUnitCostSnapshots", tableName: "sales_unit_cost_snapshots" },
   { key: "salesUnitCostSnapshotEntries", tableName: "sales_unit_cost_snapshot_entries" },
   { key: "dailyFakePurchases", tableName: "daily_fake_purchases" },
-  { key: "operations", tableName: "operations" },
+  { key: "dailySalesUnitProfits", tableName: "daily_sales_unit_profits" },
+  { key: "dailyStoreSummaries", tableName: "daily_store_summaries" },
+  { key: "operations", tableName: "operations", queueOwned: true },
   { key: "auditLogs", tableName: "audit_logs" },
 ];
 
-export const POSTGRES_SCHEMA_VERSION = 2;
+export const POSTGRES_SCHEMA_VERSION = 3;
 export const POSTGRES_UPSERT_BATCH_SIZE = 500;
 
 const POSTGRES_JSONB_INDEXES: PostgresJsonbIndex[] = [
@@ -92,14 +225,65 @@ const POSTGRES_JSONB_INDEXES: PostgresJsonbIndex[] = [
           ON order_items ((payload->>'storeId'), (payload->>'saleStatus'))`,
   },
   {
+    name: "idx_order_items_store_order_status",
+    sql: `CREATE INDEX IF NOT EXISTS idx_order_items_store_order_status
+          ON order_items ((payload->>'storeId'), (payload->>'orderStatus'))`,
+  },
+  {
+    name: "idx_order_items_store_signature",
+    sql: `CREATE INDEX IF NOT EXISTS idx_order_items_store_signature
+          ON order_items ((payload->>'storeId'), (payload->>'orderSourceSignatureId'))`,
+  },
+  {
+    name: "idx_ad_signatures_store_last_seen",
+    sql: `CREATE INDEX IF NOT EXISTS idx_ad_signatures_store_last_seen
+          ON ad_campaign_signatures ((payload->>'storeId'), (payload->>'lastSeenDate'), (payload->>'updatedAt'))`,
+  },
+  {
     name: "idx_ad_costs_store_report_campaign",
     sql: `CREATE INDEX IF NOT EXISTS idx_ad_costs_store_report_campaign
           ON ad_campaign_daily_costs ((payload->>'storeId'), (payload->>'reportDate'), (payload->>'campaignId'))`,
   },
   {
+    name: "idx_ad_costs_store_signature_upload_report",
+    sql: `CREATE INDEX IF NOT EXISTS idx_ad_costs_store_signature_upload_report
+          ON ad_campaign_daily_costs ((payload->>'storeId'), (payload->>'adCampaignSignatureId'), (payload->>'sourceUploadId'), (payload->>'reportDate'))`,
+  },
+  {
     name: "idx_operations_store_status_created",
     sql: `CREATE INDEX IF NOT EXISTS idx_operations_store_status_created
           ON operations ((payload->>'storeId'), (payload->>'status'), (payload->>'createdAt'))`,
+  },
+  {
+    name: "idx_operations_store_type_created",
+    sql: `CREATE INDEX IF NOT EXISTS idx_operations_store_type_created
+          ON operations ((payload->>'storeId'), (payload->>'operationType'), (payload->>'createdAt'))`,
+  },
+  {
+    name: "idx_operations_status_run_after_created",
+    sql: `CREATE INDEX IF NOT EXISTS idx_operations_status_run_after_created
+          ON operations ((payload->>'status'), (payload->>'runAfter'), (payload->>'createdAt'))`,
+  },
+  {
+    name: "idx_operations_store_type_status_lease",
+    sql: `CREATE INDEX IF NOT EXISTS idx_operations_store_type_status_lease
+          ON operations ((payload->>'storeId'), (payload->>'operationType'), (payload->>'status'), (payload->>'leaseExpiresAt'))`,
+  },
+  {
+    name: "idx_daily_sales_unit_profit_unique",
+    requiresDuplicateCheckId: "daily-sales-unit-profits-store-date-unit",
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_sales_unit_profit_unique
+          ON daily_sales_unit_profits ((payload->>'storeId'), (payload->>'date'), (payload->>'canonicalSalesUnitId'))`,
+    duplicateFallbackSql: `CREATE INDEX IF NOT EXISTS idx_daily_sales_unit_profit_lookup
+                           ON daily_sales_unit_profits ((payload->>'storeId'), (payload->>'date'), (payload->>'canonicalSalesUnitId'))`,
+  },
+  {
+    name: "idx_daily_store_summary_unique",
+    requiresDuplicateCheckId: "daily-store-summaries-store-date",
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_store_summary_unique
+          ON daily_store_summaries ((payload->>'storeId'), (payload->>'date'))`,
+    duplicateFallbackSql: `CREATE INDEX IF NOT EXISTS idx_daily_store_summary_lookup
+                           ON daily_store_summaries ((payload->>'storeId'), (payload->>'date'))`,
   },
 ];
 
@@ -161,6 +345,34 @@ const POSTGRES_DUPLICATE_KEY_CHECKS: DuplicateKeyCheck[] = [
           HAVING COUNT(*) > 1
           LIMIT 20`,
   },
+  {
+    id: "daily-sales-unit-profits-store-date-unit",
+    label: "daily_sales_unit_profits (storeId, date, canonicalSalesUnitId)",
+    sql: `SELECT payload->>'storeId' AS store_id,
+                 payload->>'date' AS date,
+                 payload->>'canonicalSalesUnitId' AS canonical_sales_unit_id,
+                 COUNT(*)::int AS duplicate_count
+          FROM daily_sales_unit_profits
+          WHERE payload->>'storeId' IS NOT NULL
+            AND payload->>'date' IS NOT NULL
+            AND payload->>'canonicalSalesUnitId' IS NOT NULL
+          GROUP BY 1, 2, 3
+          HAVING COUNT(*) > 1
+          LIMIT 20`,
+  },
+  {
+    id: "daily-store-summaries-store-date",
+    label: "daily_store_summaries (storeId, date)",
+    sql: `SELECT payload->>'storeId' AS store_id,
+                 payload->>'date' AS date,
+                 COUNT(*)::int AS duplicate_count
+          FROM daily_store_summaries
+          WHERE payload->>'storeId' IS NOT NULL
+            AND payload->>'date' IS NOT NULL
+          GROUP BY 1, 2
+          HAVING COUNT(*) > 1
+          LIMIT 20`,
+  },
 ];
 
 const toStableJsonValue = (value: unknown): unknown => {
@@ -203,6 +415,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   private persistenceQueue: Promise<void> = Promise.resolve();
   private pendingWriteCount = 0;
   private lastPersistenceError: PersistenceErrorState | null = null;
+  private readonly operationExecutionLocks = new Set<string>();
 
   private readonly filePath = join(this.resolveDataDir(), "database.json");
 
@@ -239,6 +452,697 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       hasPendingWrite: this.pendingWriteCount > 0,
       lastPersistenceError: this.lastPersistenceError,
     };
+  }
+
+  async queryOperations(query: OperationListQuery): Promise<PaginationResult<OperationRecord>> {
+    if (this.storageMode !== "postgres") {
+      return this.queryOperationsFromSnapshot(query);
+    }
+
+    const pagination = normalizePagination(query.page, query.pageSize);
+    const builder = createSqlBuilder();
+    builder.addCondition("payload->>'storeId' = {param}", query.storeId);
+    if (query.status) {
+      builder.addCondition("payload->>'status' = {param}", query.status);
+    }
+    if (query.operationType) {
+      builder.addCondition("payload->>'operationType' = {param}", query.operationType);
+    }
+
+    const whereClause = builder.whereClause();
+    const countQuery = builder.build(`SELECT COUNT(*)::int AS total_count FROM operations ${whereClause}`);
+    const countResult = await this.getPool().query<{ total_count: number | string }>(
+      countQuery.text,
+      countQuery.params,
+    );
+    const totalCount = parsePgCount(countResult.rows[0]?.total_count);
+
+    const itemsQuery = builder.buildPaginated(
+      `SELECT payload
+       FROM operations
+       ${whereClause}
+       ORDER BY payload->>'createdAt' DESC, id DESC`,
+      pagination,
+    );
+    const rows = await this.getPool().query<{ payload: OperationRecord }>(itemsQuery.text, itemsQuery.params);
+
+    return buildPaginationResult(
+      rows.rows.map((row) => this.normalizeOperationRecord(row.payload)),
+      totalCount,
+      pagination,
+    );
+  }
+
+  async getOperationById(operationId: string): Promise<OperationRecord | null> {
+    if (this.storageMode !== "postgres") {
+      const operation = this.database.operations.find((item) => item.id === operationId);
+      return operation ? this.cloneSnapshot(this.normalizeOperationRecord(operation)) : null;
+    }
+
+    const result = await this.getPool().query<{ payload: OperationRecord }>(
+      "SELECT payload FROM operations WHERE id = $1",
+      [operationId],
+    );
+    const operation = result.rows[0]?.payload;
+    if (!operation) {
+      return null;
+    }
+
+    const normalized = this.normalizeOperationRecord(operation);
+    this.upsertOperationInMemory(normalized);
+    return this.cloneSnapshot(normalized);
+  }
+
+  async insertOperation(operation: OperationRecord): Promise<OperationRecord> {
+    const normalized = this.normalizeOperationRecord(operation);
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        draft.operations.push(normalized);
+        return this.cloneSnapshot(normalized);
+      });
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO operations (id, payload, payload_hash, updated_at)
+           VALUES ($1, $2::jsonb, $3, NOW())`,
+          [normalized.id, JSON.stringify(normalized), hashPayload(normalized)],
+        );
+        await client.query("COMMIT");
+        this.upsertOperationInMemory(normalized);
+        return this.cloneSnapshot(normalized);
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async releaseExpiredOperationLeases(now: Date = new Date()): Promise<number> {
+    const nowAt = now.toISOString();
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        let recoveredCount = 0;
+        draft.operations = draft.operations.map((operation) => {
+          const recovered = this.recoverExpiredOperationLease(operation, nowAt);
+          if (recovered !== operation) {
+            recoveredCount += 1;
+          }
+          return recovered;
+        });
+        return recoveredCount;
+      });
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        const result = await client.query<{ payload: OperationRecord }>(
+          `SELECT payload
+           FROM operations
+           WHERE payload->>'status' = 'RUNNING'
+             AND COALESCE(NULLIF(payload->>'leaseExpiresAt', ''), '0001-01-01T00:00:00.000Z') <= $1
+           FOR UPDATE`,
+          [nowAt],
+        );
+
+        let recoveredCount = 0;
+        for (const row of result.rows) {
+          const recovered = this.recoverExpiredOperationLease(row.payload, nowAt);
+          if (recovered === row.payload) {
+            continue;
+          }
+          recoveredCount += 1;
+          await this.updateOperationPayload(client, recovered);
+          this.upsertOperationInMemory(recovered);
+        }
+
+        await client.query("COMMIT");
+        return recoveredCount;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async acquireNextOperation(
+    leaseOwner: string,
+    leaseDurationMs: number,
+    now: Date = new Date(),
+  ): Promise<OperationRecord | null> {
+    const nowAt = now.toISOString();
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        const candidate = this.findNextOperationCandidate(draft.operations, nowAt);
+        if (!candidate) {
+          return null;
+        }
+
+        const leased = this.prepareLeasedOperation(candidate.operation, leaseOwner, leaseDurationMs, nowAt);
+        draft.operations[candidate.index] = leased;
+        return this.cloneSnapshot(leased);
+      });
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        const result = await client.query<{ id: string; payload: OperationRecord }>(
+          `SELECT id, payload
+           FROM operations
+           WHERE (
+             (
+               payload->>'status' = 'QUEUED'
+               AND (NULLIF(payload->>'runAfter', '') IS NULL OR payload->>'runAfter' <= $1)
+             )
+             OR (
+               payload->>'status' = 'RUNNING'
+               AND (NULLIF(payload->>'leaseExpiresAt', '') IS NULL OR payload->>'leaseExpiresAt' <= $1)
+             )
+           )
+           AND COALESCE(NULLIF(payload->>'attemptCount', '')::int, 0)
+             < COALESCE(NULLIF(payload->>'maxAttempts', '')::int, ${DEFAULT_OPERATION_MAX_ATTEMPTS})
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations active
+             WHERE active.id <> operations.id
+               AND active.payload->>'storeId' = operations.payload->>'storeId'
+               AND active.payload->>'operationType' = operations.payload->>'operationType'
+               AND active.payload->>'status' = 'RUNNING'
+               AND COALESCE(NULLIF(active.payload->>'leaseExpiresAt', ''), '0001-01-01T00:00:00.000Z') > $1
+           )
+           ORDER BY
+             CASE WHEN payload->>'status' = 'RUNNING' THEN 0 ELSE 1 END,
+             COALESCE(NULLIF(payload->>'runAfter', ''), payload->>'createdAt'),
+             payload->>'createdAt',
+             id
+           LIMIT 1
+           FOR UPDATE SKIP LOCKED`,
+          [nowAt],
+        );
+
+        const row = result.rows[0];
+        if (!row) {
+          await client.query("COMMIT");
+          return null;
+        }
+
+        const leased = this.prepareLeasedOperation(
+          this.normalizeOperationRecord(row.payload),
+          leaseOwner,
+          leaseDurationMs,
+          nowAt,
+        );
+        await this.updateOperationPayload(client, leased);
+        await client.query("COMMIT");
+        this.upsertOperationInMemory(leased);
+        return this.cloneSnapshot(leased);
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async heartbeatOperation(
+    operationId: string,
+    leaseOwner: string,
+    leaseDurationMs: number,
+    progressJson?: Record<string, unknown> | null,
+    now: Date = new Date(),
+  ): Promise<OperationRecord | null> {
+    const heartbeatAt = now.toISOString();
+    const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs).toISOString();
+    return this.updateOperationRecord(operationId, leaseOwner, (operation) => ({
+      ...operation,
+      heartbeatAt,
+      leaseExpiresAt,
+      ...(progressJson !== undefined ? { progressJson } : {}),
+    }));
+  }
+
+  async markOperationSucceeded(
+    operationId: string,
+    leaseOwner: string,
+    resultJson: Record<string, unknown>,
+    finishedAt: string = new Date().toISOString(),
+  ): Promise<OperationRecord | null> {
+    return this.updateOperationRecord(operationId, leaseOwner, (operation) => ({
+      ...operation,
+      status: "SUCCEEDED",
+      resultJson,
+      errorMessage: null,
+      finishedAt,
+      runAfter: null,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    }));
+  }
+
+  async markOperationFailedOrQueued(
+    operationId: string,
+    leaseOwner: string,
+    params: {
+      errorMessage: string;
+      shouldRetry: boolean;
+      runAfter: string | null;
+      finishedAt?: string;
+    },
+  ): Promise<OperationRecord | null> {
+    return this.updateOperationRecord(operationId, leaseOwner, (operation) => {
+      if (params.shouldRetry) {
+        return {
+          ...operation,
+          status: "QUEUED",
+          errorMessage: params.errorMessage,
+          runAfter: params.runAfter,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          finishedAt: null,
+        };
+      }
+
+      return {
+        ...operation,
+        status: "FAILED",
+        errorMessage: params.errorMessage,
+        runAfter: null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        finishedAt: params.finishedAt ?? new Date().toISOString(),
+      };
+    });
+  }
+
+  async deferOperationLease(
+    operationId: string,
+    leaseOwner: string,
+    params: {
+      runAfter: string;
+      errorMessage: string;
+      decrementAttempt?: boolean;
+    },
+  ): Promise<OperationRecord | null> {
+    return this.updateOperationRecord(operationId, leaseOwner, (operation) => ({
+      ...operation,
+      status: "QUEUED",
+      attemptCount: Math.max(
+        0,
+        operation.attemptCount - (params.decrementAttempt ? OPERATION_LOCK_BUSY_ATTEMPT_DECREMENT : 0),
+      ),
+      errorMessage: params.errorMessage,
+      runAfter: params.runAfter,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      finishedAt: null,
+    }));
+  }
+
+  async tryAcquireOperationExecutionLock(
+    storeId: string,
+    operationType: OperationType,
+  ): Promise<OperationExecutionLock | null> {
+    const lockName = `operation:${storeId}:${operationType}`;
+
+    if (this.storageMode !== "postgres") {
+      if (this.operationExecutionLocks.has(lockName)) {
+        return null;
+      }
+
+      this.operationExecutionLocks.add(lockName);
+      let released = false;
+      return {
+        lockName,
+        release: async () => {
+          if (released) {
+            return;
+          }
+          released = true;
+          this.operationExecutionLocks.delete(lockName);
+        },
+      };
+    }
+
+    const client = await this.getPool().connect();
+    const result = await client.query<{ locked: boolean }>(
+      "SELECT pg_try_advisory_lock(hashtext($1)) AS locked",
+      [lockName],
+    );
+    if (!result.rows[0]?.locked) {
+      client.release();
+      return null;
+    }
+
+    let released = false;
+    return {
+      lockName,
+      release: async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        try {
+          await client.query("SELECT pg_advisory_unlock(hashtext($1))", [lockName]);
+        } finally {
+          client.release();
+        }
+      },
+    };
+  }
+
+  async queryOrderItems(query: OrderItemListQuery): Promise<PaginationResult<OrderItem>> {
+    if (this.storageMode !== "postgres") {
+      return this.queryOrderItemsFromSnapshot(query);
+    }
+
+    const pagination = normalizePagination(query.page, query.pageSize);
+    const builder = createSqlBuilder();
+    const fromClause = `
+      FROM order_items items
+      LEFT JOIN order_source_signatures signatures
+        ON signatures.id = items.payload->>'orderSourceSignatureId'
+    `;
+    builder.addCondition("items.payload->>'storeId' = {param}", query.storeId);
+
+    if (query.dateFrom && query.dateTo) {
+      builder.addCondition("NULLIF(items.payload->>'paymentDate', '') IS NOT NULL");
+      builder.addCondition("items.payload->>'paymentDate' >= {param}", query.dateFrom);
+      builder.addCondition("items.payload->>'paymentDate' <= {param}", query.dateTo);
+    }
+
+    const keywordProduct = query.productName ? normalizeText(query.productName) : null;
+    if (keywordProduct) {
+      builder.addCondition("COALESCE(items.payload->>'normalizedProductName', '') LIKE {param} ESCAPE '\\'", likePattern(keywordProduct));
+    }
+
+    const keywordOption = query.optionInfo ? normalizeText(query.optionInfo) : null;
+    if (keywordOption) {
+      builder.addCondition("COALESCE(items.payload->>'normalizedOptionInfo', '') LIKE {param} ESCAPE '\\'", likePattern(keywordOption));
+    }
+
+    if (query.mappingStatus && query.mappingStatus !== "ALL") {
+      builder.addCondition(`${orderItemMappingStatusSql("items", "signatures")} = {param}`, query.mappingStatus);
+    }
+    if (query.orderStatus) {
+      builder.addCondition("items.payload->>'orderStatus' = {param}", query.orderStatus);
+    }
+    if (query.saleStatus) {
+      builder.addCondition("items.payload->>'saleStatus' = {param}", query.saleStatus);
+    }
+    if (query.paymentDateStatus && query.paymentDateStatus !== "ALL") {
+      builder.addCondition(
+        query.paymentDateStatus === "PRESENT"
+          ? "NULLIF(items.payload->>'paymentDate', '') IS NOT NULL"
+          : "NULLIF(items.payload->>'paymentDate', '') IS NULL",
+      );
+    }
+
+    const whereClause = builder.whereClause();
+    const countQuery = builder.build(`SELECT COUNT(*)::int AS total_count ${fromClause} ${whereClause}`);
+    const countResult = await this.getPool().query<{ total_count: number | string }>(
+      countQuery.text,
+      countQuery.params,
+    );
+    const totalCount = parsePgCount(countResult.rows[0]?.total_count);
+
+    const itemsQuery = builder.buildPaginated(
+      `SELECT items.payload
+       ${fromClause}
+       ${whereClause}
+       ORDER BY COALESCE(items.payload->>'paymentDate', '') DESC, items.id ASC`,
+      pagination,
+    );
+    const rows = await this.getPool().query<{ payload: OrderItem }>(itemsQuery.text, itemsQuery.params);
+
+    return buildPaginationResult(
+      rows.rows.map((row) => row.payload),
+      totalCount,
+      pagination,
+    );
+  }
+
+  async queryAdCampaignSignatures(
+    query: AdCampaignSignatureListQuery,
+  ): Promise<PaginationResult<AdCampaignSignatureQueryItem>> {
+    if (this.storageMode !== "postgres" || (query.q ? HANGUL_REGEX.test(query.q) : false)) {
+      return this.queryAdCampaignSignaturesFromSnapshot(query);
+    }
+
+    const pagination = normalizePagination(query.page, query.pageSize);
+    const builder = createSqlBuilder();
+    const fromClause = `
+      FROM ad_campaign_signatures signatures
+      LEFT JOIN canonical_sales_units sales_units
+        ON sales_units.id = signatures.payload->>'canonicalSalesUnitId'
+    `;
+    builder.addCondition("signatures.payload->>'storeId' = {param}", query.storeId);
+    builder.addCondition(
+      `EXISTS (
+        SELECT 1
+        FROM ad_campaign_daily_costs costs
+        JOIN ad_excel_uploads uploads
+          ON uploads.id = costs.payload->>'sourceUploadId'
+        WHERE ${this.buildActiveAdCostPredicate(builder, "costs", "uploads", query)}
+      )`,
+    );
+
+    if (query.mappingStatus && query.mappingStatus !== "ALL") {
+      builder.addCondition(`${adCampaignMappingStatusSql("signatures")} = {param}`, query.mappingStatus);
+    }
+
+    const keyword = query.q ? normalizeText(query.q) : null;
+    if (keyword) {
+      const pattern = likePattern(keyword);
+      const searchCostPredicate = this.buildActiveAdCostPredicate(builder, "search_costs", "search_uploads", query);
+      const searchConditions = [
+        `LOWER(COALESCE(signatures.payload->>'campaignNameSnapshot', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(COALESCE(signatures.payload->>'normalizedCampaignName', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(COALESCE(signatures.payload->>'campaignId', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(COALESCE(sales_units.payload->>'displayName', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(COALESCE(signatures.payload->>'mappingReason', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(${adCampaignMappingReasonAliasSql("signatures")}) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(COALESCE(signatures.payload->>'reasonNote', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(COALESCE(signatures.payload->>'firstSeenDate', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `LOWER(COALESCE(signatures.payload->>'lastSeenDate', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
+        `EXISTS (
+          SELECT 1
+          FROM ad_campaign_daily_costs search_costs
+          JOIN ad_excel_uploads search_uploads
+            ON search_uploads.id = search_costs.payload->>'sourceUploadId'
+          WHERE ${searchCostPredicate}
+            AND LOWER(COALESCE(search_costs.payload->>'reportDate', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'
+        )`,
+      ];
+      builder.addCondition(`(${searchConditions.join(" OR ")})`);
+    }
+
+    const whereClause = builder.whereClause();
+    const countQuery = builder.build(`SELECT COUNT(*)::int AS total_count ${fromClause} ${whereClause}`);
+    const countResult = await this.getPool().query<{ total_count: number | string }>(
+      countQuery.text,
+      countQuery.params,
+    );
+    const totalCount = parsePgCount(countResult.rows[0]?.total_count);
+
+    const summaryPredicate = this.buildActiveAdCostPredicate(builder, "summary_costs", "summary_uploads", query);
+    const itemsQuery = builder.buildPaginated(
+      `SELECT signatures.payload AS signature_payload,
+              summary.latest_row_payload,
+              COALESCE(summary.total_cost, 0)::float8 AS total_cost,
+              COALESCE(summary.row_count, 0)::int AS row_count
+       ${fromClause}
+       LEFT JOIN LATERAL (
+         SELECT SUM(COALESCE((summary_costs.payload->>'totalCost')::numeric, 0)) AS total_cost,
+                COUNT(*)::int AS row_count,
+                (ARRAY_AGG(summary_costs.payload ORDER BY summary_costs.payload->>'reportDate' DESC, summary_costs.payload->>'updatedAt' DESC))[1] AS latest_row_payload
+         FROM ad_campaign_daily_costs summary_costs
+         JOIN ad_excel_uploads summary_uploads
+           ON summary_uploads.id = summary_costs.payload->>'sourceUploadId'
+         WHERE ${summaryPredicate}
+       ) summary ON TRUE
+       ${whereClause}
+       ORDER BY COALESCE(NULLIF(signatures.payload->>'lastSeenDate', ''), signatures.payload->>'updatedAt') DESC,
+                signatures.id ASC`,
+      pagination,
+    );
+    const rows = await this.getPool().query<{
+      signature_payload: AdCampaignSignature;
+      latest_row_payload: AdCampaignDailyCost | null;
+      total_cost: number | string | null;
+      row_count: number | string | null;
+    }>(itemsQuery.text, itemsQuery.params);
+
+    return buildPaginationResult(
+      rows.rows.map((row) => ({
+        signature: row.signature_payload,
+        latestRow: row.latest_row_payload ?? null,
+        totalCost: Number(row.total_cost ?? 0),
+        rowCount: parsePgCount(row.row_count),
+      })),
+      totalCount,
+      pagination,
+    );
+  }
+
+  private queryOperationsFromSnapshot(query: OperationListQuery): PaginationResult<OperationRecord> {
+    const items = this.database.operations
+      .map((item) => this.normalizeOperationRecord(item))
+      .filter((item) => item.storeId === query.storeId)
+      .filter((item) => (query.status ? item.status === query.status : true))
+      .filter((item) => (query.operationType ? item.operationType === query.operationType : true))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+
+    return paginate(items, query.page, query.pageSize);
+  }
+
+  private queryOrderItemsFromSnapshot(query: OrderItemListQuery): PaginationResult<OrderItem> {
+    const keywordProduct = query.productName ? normalizeText(query.productName) : null;
+    const keywordOption = query.optionInfo ? normalizeText(query.optionInfo) : null;
+    const items = this.database.orderItems
+      .filter((item) => item.storeId === query.storeId)
+      .filter((item) =>
+        query.dateFrom && query.dateTo
+          ? !!item.paymentDate && item.paymentDate >= query.dateFrom && item.paymentDate <= query.dateTo
+          : true,
+      )
+      .filter((item) => (keywordProduct ? item.normalizedProductName.includes(keywordProduct) : true))
+      .filter((item) => (keywordOption ? item.normalizedOptionInfo.includes(keywordOption) : true))
+      .filter((item) =>
+        query.mappingStatus && query.mappingStatus !== "ALL"
+          ? getOrderItemMappingStatus(this.database, item) === query.mappingStatus
+          : true,
+      )
+      .filter((item) => (query.orderStatus ? item.orderStatus === query.orderStatus : true))
+      .filter((item) => (query.saleStatus ? item.saleStatus === query.saleStatus : true))
+      .filter((item) =>
+        query.paymentDateStatus && query.paymentDateStatus !== "ALL"
+          ? query.paymentDateStatus === "PRESENT"
+            ? !!item.paymentDate
+            : !item.paymentDate
+          : true,
+      )
+      .sort((left, right) => (right.paymentDate ?? "").localeCompare(left.paymentDate ?? ""));
+
+    return paginate(items, query.page, query.pageSize);
+  }
+
+  private queryAdCampaignSignaturesFromSnapshot(
+    query: AdCampaignSignatureListQuery,
+  ): PaginationResult<AdCampaignSignatureQueryItem> {
+    const activeUploadIds = getActiveConfirmedUploadIds(this.database, query.storeId);
+    const keyword = query.q ? normalizeText(query.q) : null;
+    const rowsBySignatureId = new Map<string, AdCampaignDailyCost[]>();
+    const salesUnitsById = new Map(this.database.canonicalSalesUnits.map((item) => [item.id, item]));
+
+    this.database.adCampaignDailyCosts
+      .filter((row) => row.storeId === query.storeId && activeUploadIds.has(row.sourceUploadId))
+      .filter((row) => (query.dateFrom ? row.reportDate >= query.dateFrom : true))
+      .filter((row) => (query.dateTo ? row.reportDate <= query.dateTo : true))
+      .forEach((row) => {
+        if (!row.adCampaignSignatureId) {
+          return;
+        }
+        const rows = rowsBySignatureId.get(row.adCampaignSignatureId) ?? [];
+        rows.push(row);
+        rowsBySignatureId.set(row.adCampaignSignatureId, rows);
+      });
+
+    const signatures = this.database.adCampaignSignatures
+      .filter((signature) => signature.storeId === query.storeId)
+      .filter((signature) => rowsBySignatureId.has(signature.id))
+      .filter((signature) =>
+        query.mappingStatus && query.mappingStatus !== "ALL"
+          ? getAdMappingStatus(signature) === query.mappingStatus
+          : true,
+      )
+      .filter((signature) => {
+        if (!keyword) {
+          return true;
+        }
+
+        const rows = rowsBySignatureId.get(signature.id) ?? [];
+        const salesUnitDisplayName = signature.canonicalSalesUnitId
+          ? salesUnitsById.get(signature.canonicalSalesUnitId)?.displayName
+          : null;
+        const reasonNote = repairMojibakeText(signature.reasonNote);
+        const mappingReasonAlias = toDisplayMappingReasonAlias(signature.mappingReason);
+        return (
+          normalizeText(signature.campaignNameSnapshot).includes(keyword) ||
+          normalizeText(repairMojibakeText(signature.campaignNameSnapshot)).includes(keyword) ||
+          normalizeText(signature.normalizedCampaignName).includes(keyword) ||
+          normalizeText(signature.campaignId ?? "").includes(keyword) ||
+          normalizeText(salesUnitDisplayName).includes(keyword) ||
+          normalizeText(signature.mappingReason).includes(keyword) ||
+          normalizeText(mappingReasonAlias).includes(keyword) ||
+          normalizeText(reasonNote).includes(keyword) ||
+          normalizeText(signature.firstSeenDate).includes(keyword) ||
+          normalizeText(signature.lastSeenDate).includes(keyword) ||
+          rows.some((row) => normalizeText(row.reportDate).includes(keyword))
+        );
+      })
+      .sort((left, right) =>
+        (right.lastSeenDate ?? right.updatedAt).localeCompare(left.lastSeenDate ?? left.updatedAt),
+      );
+
+    return paginate(
+      signatures.map((signature) => {
+        const rows = rowsBySignatureId.get(signature.id) ?? [];
+        const latestRow = rows
+          .slice()
+          .sort((left, right) =>
+            `${right.reportDate}:${right.updatedAt}`.localeCompare(`${left.reportDate}:${left.updatedAt}`),
+          )[0];
+
+        return {
+          signature,
+          latestRow: latestRow ?? null,
+          totalCost: rows.reduce((sum, row) => sum + row.totalCost, 0),
+          rowCount: rows.length,
+        };
+      }),
+      query.page,
+      query.pageSize,
+    );
+  }
+
+  private buildActiveAdCostPredicate(
+    builder: ReturnType<typeof createSqlBuilder>,
+    costAlias: string,
+    uploadAlias: string,
+    query: Pick<AdCampaignSignatureListQuery, "dateFrom" | "dateTo">,
+  ): string {
+    const conditions = [
+      `${costAlias}.payload->>'adCampaignSignatureId' = signatures.id`,
+      `${costAlias}.payload->>'storeId' = signatures.payload->>'storeId'`,
+      `${uploadAlias}.payload->>'storeId' = signatures.payload->>'storeId'`,
+      `(${uploadAlias}.payload->>'isActive')::boolean IS TRUE`,
+      `${uploadAlias}.payload->>'weekdayValidationStatus' = 'PASSED'`,
+      `${uploadAlias}.payload->>'state' = 'CONFIRMED'`,
+    ];
+
+    if (query.dateFrom) {
+      conditions.push(`${costAlias}.payload->>'reportDate' >= ${builder.addParam(query.dateFrom)}`);
+    }
+    if (query.dateTo) {
+      conditions.push(`${costAlias}.payload->>'reportDate' <= ${builder.addParam(query.dateTo)}`);
+    }
+
+    return conditions.join(" AND ");
   }
 
   /**
@@ -286,6 +1190,97 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return operation;
   }
 
+  private async runPostgresCommitted<T>(operationFactory: () => Promise<T>): Promise<T> {
+    this.pendingWriteCount += 1;
+
+    const operation = this.persistenceQueue
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const result = await operationFactory();
+          this.lastPersistenceError = null;
+          return result;
+        } catch (error) {
+          this.recordPersistenceError(error);
+          throw error;
+        }
+      });
+
+    this.persistenceQueue = operation
+      .then(() => undefined, () => undefined)
+      .finally(() => {
+        this.pendingWriteCount -= 1;
+      });
+
+    return operation;
+  }
+
+  private async updateOperationRecord(
+    operationId: string,
+    leaseOwner: string,
+    mutator: (operation: OperationRecord) => OperationRecord | null,
+  ): Promise<OperationRecord | null> {
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        const index = draft.operations.findIndex((operation) => operation.id === operationId);
+        if (index === -1) {
+          return null;
+        }
+
+        const current = this.normalizeOperationRecord(draft.operations[index]);
+        if (current.leaseOwner !== leaseOwner) {
+          return null;
+        }
+
+        const next = mutator(current);
+        if (!next) {
+          return null;
+        }
+
+        draft.operations[index] = next;
+        return this.cloneSnapshot(next);
+      });
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        const result = await client.query<{ payload: OperationRecord }>(
+          "SELECT payload FROM operations WHERE id = $1 FOR UPDATE",
+          [operationId],
+        );
+        const row = result.rows[0];
+        if (!row) {
+          await client.query("COMMIT");
+          return null;
+        }
+
+        const current = this.normalizeOperationRecord(row.payload);
+        if (current.leaseOwner !== leaseOwner) {
+          await client.query("COMMIT");
+          return null;
+        }
+
+        const next = mutator(current);
+        if (!next) {
+          await client.query("COMMIT");
+          return null;
+        }
+
+        await this.updateOperationPayload(client, next);
+        await client.query("COMMIT");
+        this.upsertOperationInMemory(next);
+        return this.cloneSnapshot(next);
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
   private resolveDataDir(): string {
     if (process.env.DATA_DIR) {
       const configured = process.env.DATA_DIR;
@@ -331,6 +1326,188 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return JSON.parse(JSON.stringify(value)) as T;
   }
 
+  private findNextOperationCandidate(
+    operations: OperationRecord[],
+    nowAt: string,
+  ): { index: number; operation: OperationRecord } | null {
+    const normalized = operations.map((operation, index) => ({
+      index,
+      operation: this.normalizeOperationRecord(operation),
+    }));
+    const candidates = normalized
+      .filter(({ operation }) => this.isOperationRunnable(operation, nowAt))
+      .filter(
+        ({ operation }) =>
+          !normalized.some(
+            ({ operation: active }) =>
+              active.id !== operation.id &&
+              active.storeId === operation.storeId &&
+              active.operationType === operation.operationType &&
+              active.status === "RUNNING" &&
+              !this.isOperationLeaseExpired(active, nowAt),
+          ),
+      )
+      .sort((left, right) => this.compareOperationCandidates(left.operation, right.operation));
+
+    return candidates[0] ?? null;
+  }
+
+  private isOperationRunnable(operation: OperationRecord, nowAt: string): boolean {
+    if (operation.attemptCount >= operation.maxAttempts) {
+      return false;
+    }
+
+    if (operation.status === "QUEUED") {
+      return !operation.runAfter || operation.runAfter <= nowAt;
+    }
+
+    return operation.status === "RUNNING" && this.isOperationLeaseExpired(operation, nowAt);
+  }
+
+  private isOperationLeaseExpired(operation: OperationRecord, nowAt: string): boolean {
+    return !operation.leaseExpiresAt || operation.leaseExpiresAt <= nowAt;
+  }
+
+  private compareOperationCandidates(left: OperationRecord, right: OperationRecord): number {
+    const leftStaleRank = left.status === "RUNNING" ? 0 : 1;
+    const rightStaleRank = right.status === "RUNNING" ? 0 : 1;
+    if (leftStaleRank !== rightStaleRank) {
+      return leftStaleRank - rightStaleRank;
+    }
+
+    const leftRunAt = left.runAfter ?? left.createdAt;
+    const rightRunAt = right.runAfter ?? right.createdAt;
+    return (
+      leftRunAt.localeCompare(rightRunAt) ||
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.id.localeCompare(right.id)
+    );
+  }
+
+  private prepareLeasedOperation(
+    operation: OperationRecord,
+    leaseOwner: string,
+    leaseDurationMs: number,
+    nowAt: string,
+  ): OperationRecord {
+    const nowMs = Date.parse(nowAt);
+    return {
+      ...this.normalizeOperationRecord(operation),
+      status: "RUNNING",
+      attemptCount: Math.max(0, operation.attemptCount ?? 0) + 1,
+      errorMessage: null,
+      heartbeatAt: nowAt,
+      leaseOwner,
+      leaseExpiresAt: new Date(nowMs + leaseDurationMs).toISOString(),
+      lockedAt: nowAt,
+      runAfter: null,
+      startedAt: operation.startedAt ?? nowAt,
+      finishedAt: null,
+    };
+  }
+
+  private recoverExpiredOperationLease(
+    operation: OperationRecord,
+    nowAt: string,
+  ): OperationRecord {
+    const current = this.normalizeOperationRecord(operation);
+    if (current.status !== "RUNNING" || !this.isOperationLeaseExpired(current, nowAt)) {
+      return operation;
+    }
+
+    if (current.attemptCount >= current.maxAttempts) {
+      return {
+        ...current,
+        status: "FAILED",
+        errorMessage: current.errorMessage ?? "OPERATION_LEASE_EXPIRED",
+        runAfter: null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        finishedAt: nowAt,
+      };
+    }
+
+    return {
+      ...current,
+      status: "QUEUED",
+      errorMessage: "OPERATION_LEASE_EXPIRED",
+      runAfter: nowAt,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      finishedAt: null,
+    };
+  }
+
+  private async updateOperationPayload(client: Pool | PoolClient, operation: OperationRecord) {
+    await client.query(
+      `UPDATE operations
+       SET payload = $2::jsonb,
+           payload_hash = $3,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [operation.id, JSON.stringify(operation), hashPayload(operation)],
+    );
+  }
+
+  private upsertOperationInMemory(operation: OperationRecord) {
+    const normalized = this.normalizeOperationRecord(operation);
+    const index = this.database.operations.findIndex((item) => item.id === normalized.id);
+    if (index === -1) {
+      this.database.operations.push(this.cloneSnapshot(normalized));
+      return;
+    }
+    this.database.operations[index] = this.cloneSnapshot(normalized);
+  }
+
+  private normalizeOperationRecord(operation: OperationRecord | Partial<OperationRecord>): OperationRecord {
+    const source = isRecord(operation) ? operation : {};
+    const createdAt = typeof source.createdAt === "string" ? source.createdAt : new Date().toISOString();
+    const status = this.normalizeOperationStatus(source.status);
+    const maxAttempts =
+      typeof source.maxAttempts === "number" && Number.isInteger(source.maxAttempts) && source.maxAttempts > 0
+        ? source.maxAttempts
+        : DEFAULT_OPERATION_MAX_ATTEMPTS;
+
+    return {
+      id: typeof source.id === "string" ? source.id : hashPayload({ source, createdAt }).slice(0, 32),
+      storeId: typeof source.storeId === "string" ? source.storeId : "",
+      operationType: this.normalizeOperationType(source.operationType),
+      status,
+      retryOfOperationId: typeof source.retryOfOperationId === "string" ? source.retryOfOperationId : null,
+      requestedBy: typeof source.requestedBy === "string" ? source.requestedBy : null,
+      requestJson: isRecord(source.requestJson) ? source.requestJson : null,
+      resultJson: isRecord(source.resultJson) ? source.resultJson : null,
+      errorMessage: typeof source.errorMessage === "string" ? source.errorMessage : null,
+      cutoffAt: typeof source.cutoffAt === "string" ? source.cutoffAt : createdAt,
+      createdAt,
+      startedAt: typeof source.startedAt === "string" ? source.startedAt : null,
+      finishedAt: typeof source.finishedAt === "string" ? source.finishedAt : null,
+      attemptCount:
+        typeof source.attemptCount === "number" && Number.isInteger(source.attemptCount) && source.attemptCount >= 0
+          ? source.attemptCount
+          : 0,
+      maxAttempts,
+      runAfter: typeof source.runAfter === "string" ? source.runAfter : null,
+      heartbeatAt: typeof source.heartbeatAt === "string" ? source.heartbeatAt : null,
+      leaseOwner: typeof source.leaseOwner === "string" ? source.leaseOwner : null,
+      leaseExpiresAt: typeof source.leaseExpiresAt === "string" ? source.leaseExpiresAt : null,
+      lockedAt: typeof source.lockedAt === "string" ? source.lockedAt : null,
+      progressJson: isRecord(source.progressJson) ? source.progressJson : null,
+    };
+  }
+
+  private normalizeOperationStatus(status: unknown): OperationStatus {
+    return status === "RUNNING" || status === "SUCCEEDED" || status === "FAILED" ? status : "QUEUED";
+  }
+
+  private normalizeOperationType(operationType: unknown): OperationType {
+    return operationType === "AD_UPLOAD_CONFIRM" ||
+      operationType === "RECALCULATE_ORDER_MAPPING" ||
+      operationType === "RECALCULATE_AD_MAPPING"
+      ? operationType
+      : "ORDER_SYNC";
+  }
+
   private async initializePostgresStorage() {
     this.ensureFileStorageReady();
 
@@ -346,7 +1523,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     if (this.isEmptySnapshot(loaded)) {
       const legacy = this.loadSnapshotFromFile();
       if (!this.isEmptySnapshot(legacy)) {
-        await this.persistSnapshotToPostgres(legacy);
+        await this.persistSnapshotToPostgres(legacy, { includeQueueOwnedTables: true });
         this.database = legacy;
         return;
       }
@@ -512,6 +1689,12 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     normalized.dailyFakePurchases = Array.isArray(normalized.dailyFakePurchases)
       ? normalized.dailyFakePurchases
       : [];
+    normalized.dailySalesUnitProfits = Array.isArray(normalized.dailySalesUnitProfits)
+      ? normalized.dailySalesUnitProfits
+      : [];
+    normalized.dailyStoreSummaries = Array.isArray(normalized.dailyStoreSummaries)
+      ? normalized.dailyStoreSummaries
+      : [];
     normalized.adCampaignSignatures = Array.isArray(normalized.adCampaignSignatures)
       ? normalized.adCampaignSignatures
       : [];
@@ -542,6 +1725,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }));
     this.rebuildOrderSourceSignatureSummaries(normalized);
     this.normalizeAdCampaignSignatures(normalized);
+    normalized.operations = normalized.operations.map((operation) => this.normalizeOperationRecord(operation));
 
     return normalized;
   }
@@ -788,7 +1972,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   private async persistSnapshotWithStatus(snapshot: DatabaseShape): Promise<void> {
     try {
       if (this.storageMode === "postgres") {
-        await this.persistSnapshotToPostgres(snapshot);
+        await this.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false });
       } else {
         this.persistSnapshotToFile(snapshot);
       }
@@ -836,7 +2020,10 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return error instanceof Error ? error.message : String(error);
   }
 
-  private async persistSnapshotToPostgres(snapshot: DatabaseShape) {
+  private async persistSnapshotToPostgres(
+    snapshot: DatabaseShape,
+    options: { includeQueueOwnedTables?: boolean } = {},
+  ) {
     const client = await this.getPool().connect();
 
     try {
@@ -850,6 +2037,9 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       );
 
       for (const table of STORAGE_TABLES) {
+        if (table.queueOwned && !options.includeQueueOwnedTables) {
+          continue;
+        }
         await this.persistTableRowsIncrementally(client, table, snapshot[table.key] as Array<{ id: string }>);
       }
 

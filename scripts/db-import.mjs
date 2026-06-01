@@ -12,37 +12,23 @@ import path from 'node:path';
 import readline from 'node:readline';
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { FULL_SYNC_TABLES } from './db-maintenance-utils.mjs';
 dotenv.config();
 
-const SNAPSHOT_SCHEMA_VERSION = 2;
+const SNAPSHOT_SCHEMA_VERSION = 3;
 const SUPPORTED_FORMATS = new Set(['jsonb-payload-v1', 'jsonb-payload-v2']);
 const INSERT_BATCH_SIZE = 500;
 
 const REBUILD_BEFORE_RESTORE_INDEXES = [
   'idx_order_items_store_external_product_order',
   'idx_order_items_store_external_product_order_lookup',
+  'idx_daily_sales_unit_profit_unique',
+  'idx_daily_sales_unit_profit_lookup',
+  'idx_daily_store_summary_unique',
+  'idx_daily_store_summary_lookup',
 ];
 
-const KNOWN_STORAGE_TABLES = [
-  'stores',
-  'commerce_api_credentials',
-  'products',
-  'canonical_sales_units',
-  'order_source_signatures',
-  'orders',
-  'order_items',
-  'campaign_sales_unit_mappings',
-  'ad_campaign_signatures',
-  'ad_excel_uploads',
-  'ad_upload_preview_rows',
-  'ad_campaign_daily_costs',
-  'sales_unit_cost_settings',
-  'sales_unit_cost_snapshots',
-  'sales_unit_cost_snapshot_entries',
-  'daily_fake_purchases',
-  'operations',
-  'audit_logs',
-];
+const KNOWN_STORAGE_TABLES = FULL_SYNC_TABLES;
 
 const JSONB_INDEXES = [
   {
@@ -74,14 +60,65 @@ const JSONB_INDEXES = [
           ON order_items ((payload->>'storeId'), (payload->>'saleStatus'))`,
   },
   {
+    name: 'idx_order_items_store_order_status',
+    sql: `CREATE INDEX IF NOT EXISTS idx_order_items_store_order_status
+          ON order_items ((payload->>'storeId'), (payload->>'orderStatus'))`,
+  },
+  {
+    name: 'idx_order_items_store_signature',
+    sql: `CREATE INDEX IF NOT EXISTS idx_order_items_store_signature
+          ON order_items ((payload->>'storeId'), (payload->>'orderSourceSignatureId'))`,
+  },
+  {
+    name: 'idx_ad_signatures_store_last_seen',
+    sql: `CREATE INDEX IF NOT EXISTS idx_ad_signatures_store_last_seen
+          ON ad_campaign_signatures ((payload->>'storeId'), (payload->>'lastSeenDate'), (payload->>'updatedAt'))`,
+  },
+  {
     name: 'idx_ad_costs_store_report_campaign',
     sql: `CREATE INDEX IF NOT EXISTS idx_ad_costs_store_report_campaign
           ON ad_campaign_daily_costs ((payload->>'storeId'), (payload->>'reportDate'), (payload->>'campaignId'))`,
   },
   {
+    name: 'idx_ad_costs_store_signature_upload_report',
+    sql: `CREATE INDEX IF NOT EXISTS idx_ad_costs_store_signature_upload_report
+          ON ad_campaign_daily_costs ((payload->>'storeId'), (payload->>'adCampaignSignatureId'), (payload->>'sourceUploadId'), (payload->>'reportDate'))`,
+  },
+  {
     name: 'idx_operations_store_status_created',
     sql: `CREATE INDEX IF NOT EXISTS idx_operations_store_status_created
           ON operations ((payload->>'storeId'), (payload->>'status'), (payload->>'createdAt'))`,
+  },
+  {
+    name: 'idx_operations_store_type_created',
+    sql: `CREATE INDEX IF NOT EXISTS idx_operations_store_type_created
+          ON operations ((payload->>'storeId'), (payload->>'operationType'), (payload->>'createdAt'))`,
+  },
+  {
+    name: 'idx_operations_status_run_after_created',
+    sql: `CREATE INDEX IF NOT EXISTS idx_operations_status_run_after_created
+          ON operations ((payload->>'status'), (payload->>'runAfter'), (payload->>'createdAt'))`,
+  },
+  {
+    name: 'idx_operations_store_type_status_lease',
+    sql: `CREATE INDEX IF NOT EXISTS idx_operations_store_type_status_lease
+          ON operations ((payload->>'storeId'), (payload->>'operationType'), (payload->>'status'), (payload->>'leaseExpiresAt'))`,
+  },
+  {
+    name: 'idx_daily_sales_unit_profit_unique',
+    requiresDuplicateCheckId: 'daily-sales-unit-profits-store-date-unit',
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_sales_unit_profit_unique
+          ON daily_sales_unit_profits ((payload->>'storeId'), (payload->>'date'), (payload->>'canonicalSalesUnitId'))`,
+    duplicateFallbackSql: `CREATE INDEX IF NOT EXISTS idx_daily_sales_unit_profit_lookup
+                           ON daily_sales_unit_profits ((payload->>'storeId'), (payload->>'date'), (payload->>'canonicalSalesUnitId'))`,
+  },
+  {
+    name: 'idx_daily_store_summary_unique',
+    requiresDuplicateCheckId: 'daily-store-summaries-store-date',
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_store_summary_unique
+          ON daily_store_summaries ((payload->>'storeId'), (payload->>'date'))`,
+    duplicateFallbackSql: `CREATE INDEX IF NOT EXISTS idx_daily_store_summary_lookup
+                           ON daily_store_summaries ((payload->>'storeId'), (payload->>'date'))`,
   },
 ];
 
@@ -139,6 +176,34 @@ const DUPLICATE_CHECKS = [
           FROM sales_unit_cost_snapshots
           WHERE payload->>'storeId' IS NOT NULL
             AND payload->>'effectiveFrom' IS NOT NULL
+          GROUP BY 1, 2
+          HAVING COUNT(*) > 1
+          LIMIT 20`,
+  },
+  {
+    id: 'daily-sales-unit-profits-store-date-unit',
+    label: 'daily_sales_unit_profits (storeId, date, canonicalSalesUnitId)',
+    sql: `SELECT payload->>'storeId' AS store_id,
+                 payload->>'date' AS date,
+                 payload->>'canonicalSalesUnitId' AS canonical_sales_unit_id,
+                 COUNT(*)::int AS duplicate_count
+          FROM daily_sales_unit_profits
+          WHERE payload->>'storeId' IS NOT NULL
+            AND payload->>'date' IS NOT NULL
+            AND payload->>'canonicalSalesUnitId' IS NOT NULL
+          GROUP BY 1, 2, 3
+          HAVING COUNT(*) > 1
+          LIMIT 20`,
+  },
+  {
+    id: 'daily-store-summaries-store-date',
+    label: 'daily_store_summaries (storeId, date)',
+    sql: `SELECT payload->>'storeId' AS store_id,
+                 payload->>'date' AS date,
+                 COUNT(*)::int AS duplicate_count
+          FROM daily_store_summaries
+          WHERE payload->>'storeId' IS NOT NULL
+            AND payload->>'date' IS NOT NULL
           GROUP BY 1, 2
           HAVING COUNT(*) > 1
           LIMIT 20`,
@@ -250,7 +315,7 @@ const insertRows = async (client, table, rows) => {
       values.push(
         row.id,
         JSON.stringify(row.payload),
-        row.payload_hash ?? hashPayload(row.payload),
+        hashPayload(row.payload),
         row.updated_at ?? new Date(),
       );
       return `($${parameterIndex + 1}, $${parameterIndex + 2}::jsonb, $${parameterIndex + 3}, $${parameterIndex + 4})`;

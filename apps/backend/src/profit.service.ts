@@ -18,6 +18,7 @@ import {
   repairMojibakeText,
   roundHalfUp,
 } from "./helpers";
+import { ProfitSummaryService } from "./profit-summary.service";
 
 type ExportStoreSummary = {
   fakePurchaseAmount: number | "";
@@ -27,7 +28,10 @@ type ExportStoreSummary = {
 
 @Injectable()
 export class ProfitService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly profitSummaryService?: ProfitSummaryService,
+  ) {}
 
   getLatestActivityDate(storeId: string) {
     const snapshot = this.databaseService.getSnapshot();
@@ -74,7 +78,10 @@ export class ProfitService {
   }
 
   getDashboardSummary(storeId: string, date: string) {
-    return formatApiSuccess(calculateDashboardSummary(this.databaseService.getSnapshot(), storeId, date));
+    return formatApiSuccess(
+      this.profitSummaryService?.getDashboardSummary(storeId, date) ??
+        calculateDashboardSummary(this.databaseService.getSnapshot(), storeId, date),
+    );
   }
 
   listDailySalesUnits(query: {
@@ -86,14 +93,16 @@ export class ProfitService {
     page?: number;
     pageSize?: number;
   }) {
-    const rows = calculateDailyProfitRows(
-      this.databaseService.getSnapshot(),
-      query.storeId,
-      query.dateFrom,
-      query.dateTo,
-      query.canonicalSalesUnitId,
-      query.includeGroupChildren,
-    );
+    const rows =
+      this.profitSummaryService?.listDailySalesUnitRows(query) ??
+      calculateDailyProfitRows(
+        this.databaseService.getSnapshot(),
+        query.storeId,
+        query.dateFrom,
+        query.dateTo,
+        query.canonicalSalesUnitId,
+        query.includeGroupChildren,
+      );
     return formatApiSuccess(paginate(rows, query.page, query.pageSize));
   }
 
@@ -112,14 +121,22 @@ export class ProfitService {
     }
 
     const snapshot = this.databaseService.getSnapshot();
-    const rows = calculateDailyProfitRows(
-      snapshot,
-      query.storeId,
-      query.dateFrom,
-      query.dateTo,
-      query.canonicalSalesUnitId,
-      true,
-    );
+    const rows =
+      this.profitSummaryService?.listDailySalesUnitRows({
+        storeId: query.storeId,
+        dateFrom: query.dateFrom,
+        dateTo: query.dateTo,
+        canonicalSalesUnitId: query.canonicalSalesUnitId,
+        includeGroupChildren: true,
+      }) ??
+      calculateDailyProfitRows(
+        snapshot,
+        query.storeId,
+        query.dateFrom,
+        query.dateTo,
+        query.canonicalSalesUnitId,
+        true,
+      );
 
     const dailyStoreSummaries = this.buildDailyStoreProfitSummaryMap(
       snapshot,
@@ -183,7 +200,8 @@ export class ProfitService {
     const summaryMap = new Map<string, ExportStoreSummary>();
 
     uniqueDates.forEach((date) => {
-      const summary = calculateDashboardSummary(database, storeId, date);
+      const summary = this.profitSummaryService?.getDashboardSummary(storeId, date) ??
+        calculateDashboardSummary(database, storeId, date);
       const fakePurchaseAmount =
         database.dailyFakePurchases.find((row) => row.storeId === storeId && row.date === date)?.amount ?? 0;
       const storeNetProfit =
@@ -328,8 +346,7 @@ export class ProfitService {
       });
     }
 
-    const summary =
-      calculateDailyProfitRows(snapshot, storeId, date, date, salesUnitId)[0] ?? {
+    const summary = this.getDailySalesUnitDetailSummary(snapshot, storeId, salesUnit, date) ?? {
         date,
         canonicalSalesUnitId: salesUnitId,
         displayName: salesUnit.displayName,
@@ -404,7 +421,8 @@ export class ProfitService {
       return total + (fee.usedFallback ? fee.totalFeeCost : 0);
     }, 0);
     const activeCostSetting = getCostSettingForDate(costSettingsByUnit, date);
-    const excludedSummary = calculateDashboardSummary(snapshot, storeId, date);
+    const excludedSummary = this.profitSummaryService?.getDashboardSummary(storeId, date) ??
+      calculateDashboardSummary(snapshot, storeId, date);
     const deliverySummary = calculateStoreDeliverySummary(snapshot, storeId, date, date);
 
     return formatApiSuccess({
@@ -478,6 +496,41 @@ export class ProfitService {
         },
       },
     });
+  }
+
+  private getDailySalesUnitDetailSummary(
+    snapshot: ReturnType<DatabaseService["getSnapshot"]>,
+    storeId: string,
+    salesUnit: { id: string; parentSalesUnitId?: string | null },
+    date: string,
+  ): DailySalesUnitProfit | null {
+    const storedRow = this.profitSummaryService?.listDailySalesUnitRows({
+      storeId,
+      dateFrom: date,
+      dateTo: date,
+      canonicalSalesUnitId: salesUnit.id,
+      includeGroupChildren: true,
+    })?.find((row) => row.canonicalSalesUnitId === salesUnit.id);
+    if (storedRow) {
+      return storedRow;
+    }
+
+    const liveRows = calculateDailyProfitRows(
+      snapshot,
+      storeId,
+      date,
+      date,
+      salesUnit.parentSalesUnitId ?? salesUnit.id,
+      true,
+    );
+    return (
+      liveRows.find((row) => row.canonicalSalesUnitId === salesUnit.id) ??
+      liveRows
+        .flatMap((row) => row.childRows ?? [])
+        .find((row) => row.canonicalSalesUnitId === salesUnit.id) ??
+      liveRows[0] ??
+      null
+    );
   }
 
   getUnmappedSummary(storeId: string, dateFrom: string, dateTo: string) {

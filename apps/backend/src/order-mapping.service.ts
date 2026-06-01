@@ -6,6 +6,7 @@ import {
   nowIso,
 } from "./helpers";
 import { OperationService } from "./operation.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
@@ -17,6 +18,7 @@ export class OrderMappingService implements OnModuleInit {
     private readonly operationService: OperationService,
     private readonly storeService: StoreService,
     private readonly salesUnitService: SalesUnitService,
+    private readonly profitSummaryService?: ProfitSummaryService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -147,6 +149,7 @@ export class OrderMappingService implements OnModuleInit {
         item.updatedAt = timestamp;
       });
     });
+    await this.recalculateProfitSummariesForOrderSignatures(storeId, dedupedIds);
 
     return {
       signatureIds: dedupedIds,
@@ -197,11 +200,45 @@ export class OrderMappingService implements OnModuleInit {
     await this.databaseService.writeCommitted((draft) => {
       recalculateOrderMappingsForStore(draft, storeId);
     });
+    await this.recalculateProfitSummariesForOrderDates(storeId);
 
     return {
       recalculatedOrderItems: this.databaseService
         .getSnapshot()
         .orderItems.filter((item) => item.storeId === storeId).length,
     };
+  }
+
+  private async recalculateProfitSummariesForOrderSignatures(storeId: string, signatureIds: string[]) {
+    const signatureIdSet = new Set(signatureIds);
+    const dates = this.databaseService
+      .getSnapshot()
+      .orderItems.filter(
+        (item) =>
+          item.storeId === storeId &&
+          item.orderSourceSignatureId &&
+          signatureIdSet.has(item.orderSourceSignatureId) &&
+          item.paymentDate,
+      )
+      .map((item) => item.paymentDate!);
+
+    await this.profitSummaryService?.refreshStoreDateListBestEffort({
+      storeId,
+      dates,
+      reason: "MAPPING_CHANGE",
+    });
+  }
+
+  private async recalculateProfitSummariesForOrderDates(storeId: string) {
+    const dates = this.databaseService
+      .getSnapshot()
+      .orderItems.filter((item) => item.storeId === storeId && item.paymentDate)
+      .map((item) => item.paymentDate!);
+
+    await this.profitSummaryService?.refreshStoreDateListBestEffort({
+      storeId,
+      dates,
+      reason: "MAPPING_CHANGE",
+    });
   }
 }

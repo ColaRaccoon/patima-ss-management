@@ -15,6 +15,7 @@ import {
   nowIso,
   repairMojibakeText,
 } from "./helpers";
+import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 
@@ -25,6 +26,7 @@ export class CostService {
     private readonly storeService: StoreService,
     private readonly auditLogService: AuditLogService,
     private readonly salesUnitService: SalesUnitService,
+    private readonly profitSummaryService?: ProfitSummaryService,
   ) {}
 
   list(storeId: string, canonicalSalesUnitId?: string) {
@@ -141,6 +143,7 @@ export class CostService {
       }
       draft.salesUnitCostSettings.push(created);
     });
+    await this.recalculateProfitSummariesSince(payload.storeId, payload.effectiveFrom);
 
     return formatApiSuccess({
       costSettingId: created.id,
@@ -187,6 +190,10 @@ export class CostService {
       target.effectiveFrom = payload.effectiveFrom;
       target.updatedAt = nowIso();
     });
+    await this.recalculateProfitSummariesSince(
+      existing.storeId,
+      existing.effectiveFrom < payload.effectiveFrom ? existing.effectiveFrom : payload.effectiveFrom,
+    );
 
     return formatApiSuccess({
       costSettingId,
@@ -220,6 +227,7 @@ export class CostService {
       target.effectiveTo = payload.effectiveTo;
       target.updatedAt = nowIso();
     });
+    await this.recalculateProfitSummariesSince(existing.storeId, payload.effectiveTo);
 
     return formatApiSuccess({
       costSettingId,
@@ -261,6 +269,7 @@ export class CostService {
       target.deactivatedAt = nowIso();
       target.updatedAt = nowIso();
     });
+    await this.recalculateProfitSummariesSince(existing.storeId, existing.effectiveFrom);
 
     return formatApiSuccess({
       costSettingId,
@@ -581,6 +590,8 @@ export class CostService {
     });
 
     // 7. mismatch 체크
+    await this.recalculateProfitSummariesSince(storeId, effectiveFrom);
+
     const entryCount = costEntryRows.length;
     const salesUnitCount = activeSalesUnits.length;
 
@@ -759,10 +770,19 @@ export class CostService {
         afterJson: null,
       });
     });
+    await this.recalculateProfitSummariesSince(targetSnapshot.storeId, targetSnapshot.effectiveFrom);
 
     return {
       success: true,
       message: `스냅샷 ${targetSnapshot.effectiveFrom} 이 삭제되었습니다.`,
     };
+  }
+
+  private async recalculateProfitSummariesSince(storeId: string, dateFrom: string) {
+    await this.profitSummaryService?.refreshStoreDatesSinceBestEffort({
+      storeId,
+      dateFrom,
+      reason: "COST_CHANGE",
+    });
   }
 }
