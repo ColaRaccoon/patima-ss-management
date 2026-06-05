@@ -9,8 +9,6 @@ import {
 import * as XLSX from "xlsx";
 import { AuditLogService } from "./audit-log.service";
 import {
-  applyAdCampaignSignatureToRows,
-  ensureAdCampaignSignaturesForStore,
   getOverrideSnapshotHash,
   getRuleSnapshotHash,
   recalculateAdCampaignSignaturesForStore,
@@ -601,27 +599,16 @@ export class AdsService implements OnModuleInit {
     const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds);
     this.storeService.ensureWritable(storeId);
     const timestamp = nowIso();
-    let targetSignatureIds = new Set<string>();
-    await this.databaseService.writeCommitted((draft) => {
-      targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
-      draft.adCampaignSignatures.forEach((signature) => {
-        if (!targetSignatureIds.has(signature.id)) {
-          return;
-        }
-        signature.canonicalSalesUnitId = null;
-        signature.matchedRuleCount = 0;
-        signature.mappingReason = "INTENTIONALLY_UNMAPPED";
-        signature.reasonNote = payload.reasonNote;
-        signature.reasonNoteInherited = false;
-        signature.confirmedAt = timestamp;
-        signature.updatedAt = timestamp;
-      });
-      applyAdCampaignSignatureToRows(draft, {
-        storeId,
-        signatureIds: targetSignatureIds,
-      });
+    const commitResult = await this.databaseService.saveAdCampaignMappingsCommitted({
+      storeId,
+      targetIds: dedupedIds,
+      action: {
+        type: "INTENTIONALLY_UNMAPPED",
+        reasonNote: payload.reasonNote,
+        timestamp,
+      },
     });
-    await this.recalculateProfitSummariesForAdIdentifiers(storeId, dedupedIds, targetSignatureIds);
+    await this.recalculateProfitSummariesForAdDates(storeId, commitResult.affectedDates);
 
     return { adCostIds: dedupedIds };
   }
@@ -658,27 +645,16 @@ export class AdsService implements OnModuleInit {
 
     this.storeService.ensureWritable(storeId);
     const timestamp = nowIso();
-    let targetSignatureIds = new Set<string>();
-    await this.databaseService.writeCommitted((draft) => {
-      targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
-      draft.adCampaignSignatures.forEach((signature) => {
-        if (!targetSignatureIds.has(signature.id)) {
-          return;
-        }
-        signature.canonicalSalesUnitId = payload.canonicalSalesUnitId;
-        signature.matchedRuleCount = 0;
-        signature.mappingReason = "MANUAL_MAPPED";
-        signature.reasonNote = null;
-        signature.reasonNoteInherited = false;
-        signature.confirmedAt = timestamp;
-        signature.updatedAt = timestamp;
-      });
-      applyAdCampaignSignatureToRows(draft, {
-        storeId,
-        signatureIds: targetSignatureIds,
-      });
+    const commitResult = await this.databaseService.saveAdCampaignMappingsCommitted({
+      storeId,
+      targetIds: dedupedIds,
+      action: {
+        type: "MANUAL_MAPPED",
+        canonicalSalesUnitId: payload.canonicalSalesUnitId,
+        timestamp,
+      },
     });
-    await this.recalculateProfitSummariesForAdIdentifiers(storeId, dedupedIds, targetSignatureIds);
+    await this.recalculateProfitSummariesForAdDates(storeId, commitResult.affectedDates);
 
     return { adCostIds: dedupedIds };
   }
@@ -687,15 +663,12 @@ export class AdsService implements OnModuleInit {
     const snapshot = this.databaseService.getSnapshot();
     const { dedupedIds, storeId } = this.resolveAdSignatureBatch(adCostIds, snapshot);
     this.storeService.ensureWritable(storeId);
-    let targetSignatureIds = new Set<string>();
-    await this.databaseService.writeCommitted((draft) => {
-      targetSignatureIds = this.materializeAdCampaignSignatureIds(draft, storeId, dedupedIds);
-      recalculateAdCampaignSignaturesForStore(draft, storeId, {
-        signatureIds: targetSignatureIds,
-        applyToRows: true,
-      });
+    const commitResult = await this.databaseService.saveAdCampaignMappingsCommitted({
+      storeId,
+      targetIds: dedupedIds,
+      action: { type: "RECALCULATE" },
     });
-    await this.recalculateProfitSummariesForAdIdentifiers(storeId, dedupedIds, targetSignatureIds);
+    await this.recalculateProfitSummariesForAdDates(storeId, commitResult.affectedDates);
     const nextSnapshot = this.databaseService.getSnapshot();
     const signaturesById = new Map(nextSnapshot.adCampaignSignatures.map((signature) => [signature.id, signature]));
     const rowsById = new Map(nextSnapshot.adCampaignDailyCosts.map((row) => [row.id, row]));
@@ -716,22 +689,11 @@ export class AdsService implements OnModuleInit {
     };
   }
 
-  private async recalculateProfitSummariesForAdIdentifiers(
-    storeId: string,
-    ids: string[],
-    signatureIds: Set<string>,
-  ) {
-    const idSet = new Set(ids);
-    const dates = this.databaseService
-      .getSnapshot()
-      .adCampaignDailyCosts.filter(
-        (item) =>
-          item.storeId === storeId &&
-          (idSet.has(item.id) ||
-            (item.adCampaignSignatureId ? signatureIds.has(item.adCampaignSignatureId) : false) ||
-            signatureIds.has(item.id)),
-      )
-      .map((item) => item.reportDate);
+  private async recalculateProfitSummariesForAdDates(storeId: string, affectedDates: string[]) {
+    const dates = Array.from(new Set(affectedDates.filter(Boolean))).sort((left, right) => left.localeCompare(right));
+    if (dates.length === 0) {
+      return;
+    }
 
     await this.profitSummaryService?.refreshStoreDateListBestEffort({
       storeId,
@@ -822,26 +784,6 @@ export class AdsService implements OnModuleInit {
       dedupedIds,
       storeId: Array.from(storeIds)[0],
     };
-  }
-
-  private materializeAdCampaignSignatureIds(
-    draft: DatabaseShape,
-    storeId: string,
-    ids: string[],
-  ): Set<string> {
-    const directSignatureIds = new Set(
-      ids.filter((id) => draft.adCampaignSignatures.some((signature) => signature.id === id)),
-    );
-    const rowIds = ids.filter((id) => draft.adCampaignDailyCosts.some((row) => row.id === id));
-    const materializedFromRows = ensureAdCampaignSignaturesForStore(draft, storeId, rowIds);
-
-    draft.adCampaignDailyCosts.forEach((row) => {
-      if (row.storeId === storeId && rowIds.includes(row.id) && row.adCampaignSignatureId) {
-        materializedFromRows.add(row.adCampaignSignatureId);
-      }
-    });
-
-    return new Set([...directSignatureIds, ...materializedFromRows]);
   }
 
   private parseCampaignRows(rows: string[][], header: string[]) {

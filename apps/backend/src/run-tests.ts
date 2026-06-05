@@ -3,11 +3,22 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSourceSignature, normalizeText, DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
-import type { OperationRecord, OperationType } from "@patima/shared";
+import type {
+  AdCampaignDailyCost,
+  AdCampaignSignature,
+  OperationRecord,
+  OperationType,
+  OrderItem,
+  OrderSourceSignature,
+  StoredDailySalesUnitProfit,
+  StoredDailyStoreSummary,
+} from "@patima/shared";
 import * as XLSX from "xlsx";
 import {
+  applyAdCampaignSignatureToRows,
   evaluateAdMapping,
   getAdMappingOverride,
+  ensureAdCampaignSignaturesForStore,
   recalculateAdCampaignSignaturesForStore,
 } from "./ad-mapping-engine";
 import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
@@ -120,7 +131,17 @@ const normalizeOperationForTest = (operation: OperationRecord): OperationRecord 
 
 const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   database,
+  storageMode: "file" as "file" | "postgres",
   operationLocks: new Set<string>(),
+  writeCommittedCalls: 0,
+  createCanonicalSalesUnitCommittedCalls: 0,
+  saveOrderManualMappingsCommittedCalls: 0,
+  saveAdCampaignMappingsCommittedCalls: 0,
+  replaceDailyProfitSummariesCommittedCalls: 0,
+  removeDailyProfitSummariesCommittedCalls: 0,
+  getStorageMode() {
+    return this.storageMode;
+  },
   getSnapshot() {
     return JSON.parse(JSON.stringify(this.database));
   },
@@ -131,7 +152,208 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
     return result;
   },
   async writeCommitted(mutator: (draft: typeof database) => unknown) {
+    this.writeCommittedCalls += 1;
     return this.write(mutator);
+  },
+  async createCanonicalSalesUnitCommitted(params: {
+    salesUnit: (typeof database.canonicalSalesUnits)[number];
+    auditLog?: (typeof database.auditLogs)[number] | null;
+  }) {
+    this.createCanonicalSalesUnitCommittedCalls += 1;
+    const apply = (draft: typeof database) => {
+      if (!draft.stores.some((store) => store.id === params.salesUnit.storeId)) {
+        throw new Error("STORE_NOT_FOUND");
+      }
+      const existingIndex = draft.canonicalSalesUnits.findIndex((salesUnit) => salesUnit.id === params.salesUnit.id);
+      if (existingIndex === -1) {
+        draft.canonicalSalesUnits.push(params.salesUnit);
+      } else {
+        draft.canonicalSalesUnits[existingIndex] = params.salesUnit;
+      }
+      if (params.auditLog) {
+        const auditIndex = draft.auditLogs.findIndex((auditLog) => auditLog.id === params.auditLog!.id);
+        if (auditIndex === -1) {
+          draft.auditLogs.push(params.auditLog);
+        } else {
+          draft.auditLogs[auditIndex] = params.auditLog;
+        }
+      }
+      return { salesUnit: JSON.parse(JSON.stringify(params.salesUnit)) };
+    };
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted(apply);
+    }
+
+    return apply(this.database);
+  },
+  async saveOrderManualMappingsCommitted(params: {
+    storeId: string;
+    signatureIds: string[];
+    canonicalSalesUnitId: string;
+    timestamp: string;
+  }) {
+    this.saveOrderManualMappingsCommittedCalls += 1;
+    const signatureIds = Array.from(new Set(params.signatureIds.filter(Boolean)));
+    const apply = (draft: typeof database) => {
+      const targetIds = new Set(signatureIds);
+      const signatures = signatureIds.map((signatureId) =>
+        draft.orderSourceSignatures.find((item) => item.id === signatureId),
+      );
+      if (signatures.some((signature) => !signature || signature.storeId !== params.storeId)) {
+        throw new Error("ORDER_MANUAL_MAPPING_TARGET_NOT_FOUND");
+      }
+      signatures.forEach((signature) => {
+        const target = signature as OrderSourceSignature;
+        target.canonicalSalesUnitId = params.canonicalSalesUnitId;
+        target.mappingStatus = "MAPPED";
+        target.confirmedAt = params.timestamp;
+        target.updatedAt = params.timestamp;
+      });
+
+      const updatedOrderItems: OrderItem[] = [];
+      draft.orderItems.forEach((item) => {
+        if (
+          item.storeId !== params.storeId ||
+          !item.orderSourceSignatureId ||
+          !targetIds.has(item.orderSourceSignatureId)
+        ) {
+          return;
+        }
+        item.canonicalSalesUnitId = params.canonicalSalesUnitId;
+        item.updatedAt = params.timestamp;
+        updatedOrderItems.push(item as OrderItem);
+      });
+
+      return {
+        signatureIds,
+        updatedOrderItemCount: updatedOrderItems.length,
+        affectedDates: Array.from(
+          new Set(updatedOrderItems.map((item) => item.paymentDate).filter((date): date is string => Boolean(date))),
+        ).sort((left, right) => left.localeCompare(right)),
+      };
+    };
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted(apply);
+    }
+
+    return apply(this.database);
+  },
+  async saveAdCampaignMappingsCommitted(params: {
+    storeId: string;
+    targetIds: string[];
+    action:
+      | { type: "MANUAL_MAPPED"; canonicalSalesUnitId: string; timestamp: string }
+      | { type: "INTENTIONALLY_UNMAPPED"; reasonNote: string; timestamp: string }
+      | { type: "RECALCULATE" };
+  }) {
+    this.saveAdCampaignMappingsCommittedCalls += 1;
+    const targetIds = Array.from(new Set(params.targetIds.filter(Boolean)));
+    const apply = (draft: typeof database) => {
+      const directSignatureIds = new Set(
+        targetIds.filter((id) =>
+          draft.adCampaignSignatures.some((signature) => signature.id === id && signature.storeId === params.storeId),
+        ),
+      );
+      const rowIds = targetIds.filter((id) =>
+        draft.adCampaignDailyCosts.some((row) => row.id === id && row.storeId === params.storeId),
+      );
+      if (directSignatureIds.size + rowIds.length !== targetIds.length) {
+        throw new Error("AD_CAMPAIGN_MAPPING_TARGET_NOT_FOUND");
+      }
+      const rowSignatureIds = ensureAdCampaignSignaturesForStore(draft, params.storeId, rowIds);
+      const signatureIds = new Set([...directSignatureIds, ...rowSignatureIds]);
+      draft.adCampaignDailyCosts.forEach((row) => {
+        if (row.storeId === params.storeId && rowIds.includes(row.id) && row.adCampaignSignatureId) {
+          signatureIds.add(row.adCampaignSignatureId);
+        }
+      });
+
+      const action = params.action;
+      if (action.type === "RECALCULATE") {
+        recalculateAdCampaignSignaturesForStore(draft, params.storeId, {
+          signatureIds,
+          applyToRows: true,
+        });
+      } else {
+        draft.adCampaignSignatures.forEach((signature) => {
+          if (!signatureIds.has(signature.id)) {
+            return;
+          }
+          if (action.type === "MANUAL_MAPPED") {
+            signature.canonicalSalesUnitId = action.canonicalSalesUnitId;
+            signature.mappingReason = "MANUAL_MAPPED";
+            signature.reasonNote = null;
+          } else {
+            signature.canonicalSalesUnitId = null;
+            signature.mappingReason = "INTENTIONALLY_UNMAPPED";
+            signature.reasonNote = action.reasonNote;
+          }
+          signature.matchedRuleCount = 0;
+          signature.reasonNoteInherited = false;
+          signature.confirmedAt = action.timestamp;
+          signature.updatedAt = action.timestamp;
+        });
+        applyAdCampaignSignatureToRows(draft, {
+          storeId: params.storeId,
+          signatureIds,
+        });
+      }
+
+      const updatedRows = draft.adCampaignDailyCosts.filter(
+        (row) => row.storeId === params.storeId && row.adCampaignSignatureId && signatureIds.has(row.adCampaignSignatureId),
+      );
+      return {
+        signatureIds: Array.from(signatureIds),
+        updatedAdCampaignDailyCostCount: updatedRows.length,
+        affectedDates: Array.from(new Set(updatedRows.map((row) => row.reportDate))).sort((left, right) =>
+          left.localeCompare(right),
+        ),
+      };
+    };
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted(apply);
+    }
+
+    return apply(this.database);
+  },
+  async replaceDailyProfitSummariesCommitted(params: {
+    storeId: string;
+    dates: string[];
+    buildReplacement: (database: ReturnType<typeof createEmptyDatabase>) => {
+      dailySalesUnitProfits: StoredDailySalesUnitProfit[];
+      dailyStoreSummaries: StoredDailyStoreSummary[];
+      result: unknown;
+    };
+  }) {
+    this.replaceDailyProfitSummariesCommittedCalls += 1;
+    return this.write((draft) => {
+      const replacement = params.buildReplacement(draft);
+      const dateSet = new Set(params.dates);
+      draft.dailySalesUnitProfits = draft.dailySalesUnitProfits.filter(
+        (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
+      );
+      draft.dailyStoreSummaries = draft.dailyStoreSummaries.filter(
+        (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
+      );
+      draft.dailySalesUnitProfits.push(...replacement.dailySalesUnitProfits);
+      draft.dailyStoreSummaries.push(...replacement.dailyStoreSummaries);
+      return replacement.result;
+    });
+  },
+  async removeDailyProfitSummariesCommitted(params: { storeId: string; dates: string[] }) {
+    this.removeDailyProfitSummariesCommittedCalls += 1;
+    return this.write((draft) => {
+      const dateSet = new Set(params.dates);
+      draft.dailySalesUnitProfits = draft.dailySalesUnitProfits.filter(
+        (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
+      );
+      draft.dailyStoreSummaries = draft.dailyStoreSummaries.filter(
+        (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
+      );
+    });
   },
   async queryOperations(query: {
     storeId: string;
@@ -483,6 +705,15 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
 });
 
 const createAuditLogServiceDouble = (auditCalls: Array<Record<string, unknown>> = []) => ({
+  createAuditLog(params: Record<string, unknown>) {
+    auditCalls.push(params);
+    return {
+      id: `audit-test-${auditCalls.length}`,
+      actorType: "LOCALHOST_ADMIN",
+      createdAt: new Date().toISOString(),
+      ...params,
+    };
+  },
   record(params: Record<string, unknown>) {
     auditCalls.push(params);
     return params;
@@ -526,9 +757,12 @@ const createAdsServiceHarness = (params?: { withProfitSummaryService?: boolean }
   return { databaseService, adsService, profitSummaryService };
 };
 
-const createOrderMappingServiceHarness = () => {
+const createOrderMappingServiceHarness = (params?: { withProfitSummaryService?: boolean }) => {
   const databaseService = createMemoryDatabaseService();
   const enqueueCalls: Array<{ storeId: string; requestJson: Record<string, unknown> }> = [];
+  const profitSummaryService = params?.withProfitSummaryService
+    ? new ProfitSummaryService(databaseService as never)
+    : undefined;
   const orderMappingService = new OrderMappingService(
     databaseService as never,
     {
@@ -546,9 +780,10 @@ const createOrderMappingServiceHarness = () => {
         throw new Error("create not used in this test");
       },
     } as never,
+    profitSummaryService,
   );
 
-  return { databaseService, orderMappingService, enqueueCalls };
+  return { databaseService, orderMappingService, enqueueCalls, profitSummaryService };
 };
 
 const createFakePurchaseServiceHarness = () => {
@@ -753,6 +988,89 @@ const createOrderSourceSignature = (id: string, productName: string, storeId = "
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }) as never;
+
+const createStoredDailySalesUnitProfitForTest = (
+  overrides: Partial<StoredDailySalesUnitProfit> = {},
+): StoredDailySalesUnitProfit => {
+  const date = overrides.date ?? "2026-04-01";
+  const storeId = overrides.storeId ?? "store-1";
+  const canonicalSalesUnitId = overrides.canonicalSalesUnitId ?? "sales-1";
+  return {
+    id: overrides.id ?? `daily-sales-unit-profit:${storeId}:${date}:${canonicalSalesUnitId}`,
+    storeId,
+    date,
+    canonicalSalesUnitId,
+    displayName: overrides.displayName ?? "Test Unit",
+    totalQuantity: overrides.totalQuantity ?? 1,
+    totalRevenue: overrides.totalRevenue ?? 100,
+    totalProductRevenue: overrides.totalProductRevenue ?? 100,
+    totalDeliveryFeeAmount: overrides.totalDeliveryFeeAmount ?? 0,
+    totalAdCost: overrides.totalAdCost ?? 0,
+    totalUnitCost: overrides.totalUnitCost ?? 0,
+    totalFeeCost: overrides.totalFeeCost ?? 0,
+    totalOtherCost: overrides.totalOtherCost ?? 0,
+    roughProfit: overrides.roughProfit ?? 100,
+    estimatedNetProfit: overrides.estimatedNetProfit ?? 100,
+    profitStatus: overrides.profitStatus ?? "COMPLETE",
+    vatAmount: overrides.vatAmount ?? 0,
+    vatAdjustedRevenue: overrides.vatAdjustedRevenue ?? 100,
+    isStoreLevel: overrides.isStoreLevel,
+    isGroup: overrides.isGroup,
+    parentSalesUnitId: overrides.parentSalesUnitId,
+    childRows: overrides.childRows,
+    costSnapshotId: overrides.costSnapshotId ?? null,
+    mappingBasisHash: overrides.mappingBasisHash ?? null,
+    calculationVersion: overrides.calculationVersion ?? "profit-v1",
+    calculatedAt: overrides.calculatedAt ?? "2026-04-01T00:00:00.000Z",
+    createdAt: overrides.createdAt ?? "2026-04-01T00:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-04-01T00:00:00.000Z",
+  };
+};
+
+const createStoredDailyStoreSummaryForTest = (
+  overrides: Partial<StoredDailyStoreSummary> = {},
+): StoredDailyStoreSummary => {
+  const date = overrides.date ?? "2026-04-01";
+  const storeId = overrides.storeId ?? "store-1";
+  return {
+    id: overrides.id ?? `daily-store-summary:${storeId}:${date}`,
+    storeId,
+    date,
+    totalRevenue: overrides.totalRevenue ?? 100,
+    totalProductRevenue: overrides.totalProductRevenue ?? 100,
+    totalDeliveryFeeAmount: overrides.totalDeliveryFeeAmount ?? 0,
+    totalAdCost: overrides.totalAdCost ?? 0,
+    roughProfit: overrides.roughProfit ?? 100,
+    estimatedNetProfit: overrides.estimatedNetProfit ?? 100,
+    profitStatus: overrides.profitStatus ?? "COMPLETE",
+    salesUnitCount: overrides.salesUnitCount ?? 1,
+    incompleteCostSalesUnitCount: overrides.incompleteCostSalesUnitCount ?? 0,
+    unmappedOrderItemCount: overrides.unmappedOrderItemCount ?? 0,
+    conflictOrderItemCount: overrides.conflictOrderItemCount ?? 0,
+    unmappedCampaignCount: overrides.unmappedCampaignCount ?? 0,
+    conflictCampaignCount: overrides.conflictCampaignCount ?? 0,
+    intentionalUnmappedCampaignCount: overrides.intentionalUnmappedCampaignCount ?? 0,
+    excludedOrderRevenue: overrides.excludedOrderRevenue ?? 0,
+    excludedUnmappedOrderRevenue: overrides.excludedUnmappedOrderRevenue ?? 0,
+    excludedConflictOrderRevenue: overrides.excludedConflictOrderRevenue ?? 0,
+    excludedNonSaleOrderRevenue: overrides.excludedNonSaleOrderRevenue ?? 0,
+    excludedAdCost: overrides.excludedAdCost ?? 0,
+    excludedUnmappedAdCost: overrides.excludedUnmappedAdCost ?? 0,
+    excludedConflictAdCost: overrides.excludedConflictAdCost ?? 0,
+    excludedIntentionalUnmappedAdCost: overrides.excludedIntentionalUnmappedAdCost ?? 0,
+    totalVatAmount: overrides.totalVatAmount ?? 0,
+    totalVatAdjustedRevenue: overrides.totalVatAdjustedRevenue ?? 100,
+    uniquePackageCount: overrides.uniquePackageCount ?? 1,
+    deliveryUnitCost: overrides.deliveryUnitCost ?? DEFAULT_DELIVERY_UNIT_COST,
+    estimatedDeliveryBaseCost: overrides.estimatedDeliveryBaseCost ?? DEFAULT_DELIVERY_UNIT_COST,
+    customerPaidDeliveryFee: overrides.customerPaidDeliveryFee ?? 0,
+    deliveryMargin: overrides.deliveryMargin ?? -DEFAULT_DELIVERY_UNIT_COST,
+    calculationVersion: overrides.calculationVersion ?? "profit-v1",
+    calculatedAt: overrides.calculatedAt ?? "2026-04-01T00:00:00.000Z",
+    createdAt: overrides.createdAt ?? "2026-04-01T00:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-04-01T00:00:00.000Z",
+  };
+};
 
 const createAdUploadFile = (
   reportDate: string,
@@ -2242,6 +2560,214 @@ runAsync("OrderMappingService saveMappings deduplicates signatures without recal
   assert.equal(second?.mappingStatus, "MAPPED");
 });
 
+runAsync("OrderMappingService saveMappings updates only related rows and refreshes affected dates directly", async () => {
+  const { databaseService, orderMappingService, profitSummaryService } = createOrderMappingServiceHarness({
+    withProfitSummaryService: true,
+  });
+  const summaryService = profitSummaryService!;
+  const refreshCalls: Array<{ storeId: string; dates: string[]; reason: string }> = [];
+  const originalRefresh = summaryService.refreshStoreDateListBestEffort.bind(summaryService);
+  summaryService.refreshStoreDateListBestEffort = ((params) => {
+    refreshCalls.push({ ...params });
+    return originalRefresh(params);
+  }) as ProfitSummaryService["refreshStoreDateListBestEffort"];
+  const createMappedTestItem = (overrides: Partial<OrderItem> & Pick<OrderItem, "id" | "storeId">) =>
+    ({
+      id: overrides.id,
+      storeId: overrides.storeId,
+      orderId: `order-${overrides.id}`,
+      productId: null,
+      orderSourceSignatureId: overrides.orderSourceSignatureId ?? "sig-1",
+      canonicalSalesUnitId: overrides.canonicalSalesUnitId ?? null,
+      externalProductOrderId: `external-${overrides.id}`,
+      externalProductId: null,
+      optionCode: null,
+      packageNumber: null,
+      rawProductName: "daily unit",
+      rawOptionInfo: null,
+      normalizedProductName: normalizeText("daily unit"),
+      normalizedOptionInfo: "",
+      sourceSignature: createSourceSignature("daily unit", null),
+      quantity: 1,
+      productPaymentAmount: 100,
+      totalProductAmount: 100,
+      deliveryFeeAmount: 0,
+      paymentCommission: 0,
+      knowledgeShoppingSellingInterlockCommission: null,
+      saleCommission: null,
+      channelCommission: null,
+      orderDate: overrides.orderDate ?? overrides.paymentDate ?? "2026-04-01",
+      paymentDate: Object.prototype.hasOwnProperty.call(overrides, "paymentDate")
+        ? (overrides.paymentDate ?? null)
+        : "2026-04-01",
+      saleStatus: "SALE",
+      orderStatus: "DELIVERED",
+      isCanceled: false,
+      isReturned: false,
+      rawPayload: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: "before",
+    }) as OrderItem;
+
+  databaseService.write((draft) => {
+    draft.stores.push(createStoreRecord("store-1", "Main Store"), createStoreRecord("store-2", "Other Store"));
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Daily Unit", ["daily"]));
+    draft.orderSourceSignatures.push(
+      createOrderSourceSignature("sig-1", "daily unit"),
+      createOrderSourceSignature("sig-2", "untouched unit"),
+    );
+    draft.orderItems.push(
+      createMappedTestItem({ id: "item-target-1", storeId: "store-1", paymentDate: "2026-04-02" }) as never,
+      createMappedTestItem({ id: "item-target-2", storeId: "store-1", paymentDate: "2026-04-01" }) as never,
+      createMappedTestItem({ id: "item-target-no-date", storeId: "store-1", paymentDate: null }) as never,
+      createMappedTestItem({
+        id: "item-other-signature",
+        storeId: "store-1",
+        orderSourceSignatureId: "sig-2",
+        paymentDate: "2026-04-03",
+      }) as never,
+      createMappedTestItem({ id: "item-other-store", storeId: "store-2", paymentDate: "2026-04-04" }) as never,
+    );
+  });
+
+  databaseService.storageMode = "postgres";
+  databaseService.writeCommitted = async () => {
+    throw new Error("writeCommitted should not be used for PostgreSQL order manual mapping");
+  };
+
+  const result = await orderMappingService.saveMappings(["sig-1", "sig-1"], {
+    canonicalSalesUnitId: "sales-1",
+  });
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(result.data.updatedCount, 1);
+  assert.equal(databaseService.saveOrderManualMappingsCommittedCalls, 1);
+  assert.equal(databaseService.writeCommittedCalls, 0);
+  assert.equal(databaseService.replaceDailyProfitSummariesCommittedCalls, 1);
+  assert.deepEqual(refreshCalls[0]?.dates, ["2026-04-01", "2026-04-02"]);
+  assert.equal(snapshot.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-1")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(snapshot.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-2")?.canonicalSalesUnitId, null);
+  assert.equal(snapshot.orderItems.find((item: OrderItem) => item.id === "item-target-1")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(snapshot.orderItems.find((item: OrderItem) => item.id === "item-target-2")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(snapshot.orderItems.find((item: OrderItem) => item.id === "item-target-no-date")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(snapshot.orderItems.find((item: OrderItem) => item.id === "item-other-signature")?.canonicalSalesUnitId, null);
+  assert.equal(snapshot.orderItems.find((item: OrderItem) => item.id === "item-other-store")?.canonicalSalesUnitId, null);
+  assert.deepEqual(
+    snapshot.dailyStoreSummaries.map((row: StoredDailyStoreSummary) => row.date).sort(),
+    ["2026-04-01", "2026-04-02"],
+  );
+});
+
+runAsync("OrderMappingService saveMappings rejects cross-store signature batches", async () => {
+  const { databaseService, orderMappingService } = createOrderMappingServiceHarness();
+
+  databaseService.write((draft) => {
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Unit", ["unit"]));
+    draft.orderSourceSignatures.push(
+      createOrderSourceSignature("sig-store-1", "unit", "store-1"),
+      createOrderSourceSignature("sig-store-2", "unit", "store-2"),
+    );
+  });
+
+  await assert.rejects(
+    () =>
+      orderMappingService.saveMappings(["sig-store-1", "sig-store-2"], {
+        canonicalSalesUnitId: "sales-1",
+      }),
+    (error: unknown) =>
+      error instanceof Error &&
+      "getResponse" in error &&
+      JSON.stringify((error as { getResponse: () => unknown }).getResponse()).includes("CROSS_STORE_REFERENCE"),
+  );
+  assert.equal(databaseService.saveOrderManualMappingsCommittedCalls, 0);
+});
+
+runAsync("OrderMappingService saveMappings rejects inactive and group sales units before commit", async () => {
+  const cases: Array<{ salesUnit: Record<string, unknown> & { id: string }; reason: string }> = [
+    {
+      salesUnit: {
+        ...(createSalesUnit("sales-inactive", "Inactive Unit", ["inactive"]) as Record<string, unknown>),
+        id: "sales-inactive",
+        isActive: false,
+        deactivatedAt: new Date().toISOString(),
+      },
+      reason: "INVALID_VALUE",
+    },
+    {
+      salesUnit: {
+        ...(createSalesUnit("sales-group", "Group Unit", ["group"]) as Record<string, unknown>),
+        id: "sales-group",
+        isGroup: true,
+      },
+      reason: "CANNOT_MAP_TO_GROUP",
+    },
+  ];
+
+  for (const testCase of cases) {
+    const { databaseService, orderMappingService } = createOrderMappingServiceHarness();
+    databaseService.write((draft) => {
+      draft.canonicalSalesUnits.push(testCase.salesUnit as never);
+      draft.orderSourceSignatures.push(createOrderSourceSignature("sig-1", "unit"));
+    });
+
+    await assert.rejects(
+      () =>
+        orderMappingService.saveMappings(["sig-1"], {
+          canonicalSalesUnitId: testCase.salesUnit.id as string,
+        }),
+      (error: unknown) =>
+        error instanceof Error &&
+        "getResponse" in error &&
+        JSON.stringify((error as { getResponse: () => unknown }).getResponse()).includes(testCase.reason),
+    );
+    assert.equal(databaseService.saveOrderManualMappingsCommittedCalls, 0);
+  }
+});
+
+runAsync("OrderMappingService saveMappings skips profit summary refresh when affected dates are empty", async () => {
+  const { databaseService, orderMappingService, profitSummaryService } = createOrderMappingServiceHarness({
+    withProfitSummaryService: true,
+  });
+  const summaryService = profitSummaryService!;
+  let refreshCalls = 0;
+  const originalRefresh = summaryService.refreshStoreDateListBestEffort.bind(summaryService);
+  summaryService.refreshStoreDateListBestEffort = ((params) => {
+    refreshCalls += 1;
+    return originalRefresh(params);
+  }) as ProfitSummaryService["refreshStoreDateListBestEffort"];
+
+  databaseService.write((draft) => {
+    draft.stores.push(createStoreRecord("store-1", "Main Store"));
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "No Date Unit", ["no date"]));
+    draft.orderSourceSignatures.push(createOrderSourceSignature("sig-no-date", "no date product"));
+    draft.orderItems.push({
+      id: "order-item-no-date",
+      storeId: "store-1",
+      orderSourceSignatureId: "sig-no-date",
+      canonicalSalesUnitId: null,
+      paymentDate: null,
+      updatedAt: new Date().toISOString(),
+    } as never);
+  });
+
+  const writeCountBefore = databaseService.writeCommittedCalls;
+  const result = await orderMappingService.saveMappings(["sig-no-date"], {
+    canonicalSalesUnitId: "sales-1",
+  });
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(result.data.updatedCount, 1);
+  assert.equal(
+    snapshot.orderItems.find((item: { id: string }) => item.id === "order-item-no-date")?.canonicalSalesUnitId,
+    "sales-1",
+  );
+  assert.equal(refreshCalls, 0);
+  assert.equal(databaseService.saveOrderManualMappingsCommittedCalls, 1);
+  assert.equal(databaseService.writeCommittedCalls, writeCountBefore + 1);
+  assert.equal(snapshot.dailyStoreSummaries.length, 0);
+  assert.equal(snapshot.dailySalesUnitProfits.length, 0);
+});
+
 runAsync("OrderMappingService enqueueRecalculate starts one order mapping recalculation", async () => {
   const { orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
 
@@ -2253,9 +2779,15 @@ runAsync("OrderMappingService enqueueRecalculate starts one order mapping recalc
   assert.equal(enqueueCalls[0]?.requestJson.reason, "MANUAL_RECALCULATE_ORDER_MAPPING");
 });
 
-runAsync("OrderMappingService createAndMapMany skips order recalculation during sales-unit creation", async () => {
+runAsync("OrderMappingService createAndMapMany skips automatic recalculation during sales-unit creation", async () => {
   const databaseService = createMemoryDatabaseService();
-  const createCalls: Array<{ options?: { skipOrderRecalculation?: boolean } }> = [];
+  const createCalls: Array<{
+    options?: {
+      skipOrderRecalculation?: boolean;
+      skipAdRecalculation?: boolean;
+      skipProfitSummaryRecalculation?: boolean;
+    };
+  }> = [];
   const orderMappingService = new OrderMappingService(
     databaseService as never,
     {
@@ -2266,7 +2798,14 @@ runAsync("OrderMappingService createAndMapMany skips order recalculation during 
       ensureWritable: () => undefined,
     } as never,
     {
-      create: (payload: { displayName: string; matchAliases?: string[] | null }, options?: { skipOrderRecalculation?: boolean }) => {
+      create: (
+        payload: { displayName: string; matchAliases?: string[] | null },
+        options?: {
+          skipOrderRecalculation?: boolean;
+          skipAdRecalculation?: boolean;
+          skipProfitSummaryRecalculation?: boolean;
+        },
+      ) => {
         createCalls.push({ options });
         databaseService.write((draft) => {
           draft.canonicalSalesUnits.push(
@@ -2293,6 +2832,105 @@ runAsync("OrderMappingService createAndMapMany skips order recalculation during 
   });
 
   assert.equal(createCalls[0]?.options?.skipOrderRecalculation, true);
+  assert.equal(createCalls[0]?.options?.skipAdRecalculation, true);
+  assert.equal(createCalls[0]?.options?.skipProfitSummaryRecalculation, true);
+});
+
+runAsync("OrderMappingService createAndMapMany creates sales unit directly and maps selected signatures in PostgreSQL mode", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const salesUnitService = new SalesUnitService(
+    databaseService as never,
+    { ensureWritable: () => undefined } as never,
+    createAuditLogServiceDouble() as never,
+  );
+  const orderMappingService = new OrderMappingService(
+    databaseService as never,
+    {
+      registerRetryExecutor: () => undefined,
+      enqueue: () => ({ id: "operation-1" }),
+    } as never,
+    {
+      ensureWritable: () => undefined,
+    } as never,
+    salesUnitService,
+  );
+
+  databaseService.write((draft) => {
+    draft.stores.push(createStoreRecord("store-1", "Main Store"));
+    draft.orderSourceSignatures.push(
+      createOrderSourceSignature("sig-create-selected", "Alpha Pack"),
+      createOrderSourceSignature("sig-create-unselected", "Alpha Pack"),
+    );
+    draft.orderItems.push(
+      {
+        id: "order-item-create-selected",
+        storeId: "store-1",
+        orderSourceSignatureId: "sig-create-selected",
+        canonicalSalesUnitId: null,
+        paymentDate: "2026-04-01",
+        updatedAt: "before",
+      } as never,
+      {
+        id: "order-item-create-unselected",
+        storeId: "store-1",
+        orderSourceSignatureId: "sig-create-unselected",
+        canonicalSalesUnitId: null,
+        paymentDate: "2026-04-01",
+        updatedAt: "before",
+      } as never,
+    );
+  });
+  databaseService.storageMode = "postgres";
+  databaseService.writeCommitted = async () => {
+    throw new Error("writeCommitted should not be used for PostgreSQL create-and-map");
+  };
+
+  const result = await orderMappingService.createAndMapMany(["sig-create-selected"], {
+    displayName: "Alpha Pack",
+    matchAliases: [" Alpha Pack "],
+    linkedProductIds: ["product-alpha"],
+    linkedOptionCodes: ["option-alpha"],
+    memo: "created from mapping",
+  });
+  const snapshot = databaseService.getSnapshot();
+  const createdSalesUnitId = result.data.createdSalesUnitId;
+  const createdInSnapshot = snapshot.canonicalSalesUnits.find(
+    (salesUnit: { id: string }) => salesUnit.id === createdSalesUnitId,
+  );
+  const createdInDatabase = databaseService.database.canonicalSalesUnits.find(
+    (salesUnit: { id: string }) => salesUnit.id === createdSalesUnitId,
+  );
+
+  assert.equal(databaseService.writeCommittedCalls, 0);
+  assert.equal(databaseService.createCanonicalSalesUnitCommittedCalls, 1);
+  assert.equal(databaseService.saveOrderManualMappingsCommittedCalls, 1);
+  assert.ok(createdInSnapshot);
+  assert.ok(createdInDatabase);
+  assert.equal(createdInSnapshot?.displayName, "Alpha Pack");
+  assert.deepEqual(createdInSnapshot?.matchAliases, ["Alpha Pack"]);
+  assert.deepEqual(createdInSnapshot?.normalizedMatchAliases, ["alphapack"]);
+  assert.deepEqual(createdInSnapshot?.linkedProductIds, ["product-alpha"]);
+  assert.deepEqual(createdInSnapshot?.linkedOptionCodes, ["option-alpha"]);
+  assert.equal(
+    snapshot.orderSourceSignatures.find((signature: { id: string }) => signature.id === "sig-create-selected")
+      ?.canonicalSalesUnitId,
+    createdSalesUnitId,
+  );
+  assert.equal(
+    snapshot.orderItems.find((item: { id: string }) => item.id === "order-item-create-selected")
+      ?.canonicalSalesUnitId,
+    createdSalesUnitId,
+  );
+  assert.equal(
+    snapshot.orderSourceSignatures.find((signature: { id: string }) => signature.id === "sig-create-unselected")
+      ?.canonicalSalesUnitId,
+    null,
+  );
+  assert.equal(
+    snapshot.orderItems.find((item: { id: string }) => item.id === "order-item-create-unselected")
+      ?.canonicalSalesUnitId,
+    null,
+  );
 });
 
 runAsync("OrderSyncService listOrderSourceSignatures searches canonical sales unit display name", async () => {
@@ -2508,6 +3146,720 @@ run("DatabaseService stableStringify and hashPayload ignore object key order", (
 
   assert.equal(stableStringify(left), stableStringify(right));
   assert.equal(hashPayload(left), hashPayload(right));
+});
+
+runAsync("DatabaseService PostgreSQL saves order manual mappings with row-level direct updates", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const makeOrderItem = (overrides: Partial<OrderItem> & Pick<OrderItem, "id" | "storeId">): OrderItem =>
+    ({
+      id: overrides.id,
+      storeId: overrides.storeId,
+      orderId: `order-${overrides.id}`,
+      productId: null,
+      orderSourceSignatureId: overrides.orderSourceSignatureId ?? "sig-1",
+      canonicalSalesUnitId: overrides.canonicalSalesUnitId ?? null,
+      externalProductOrderId: `external-${overrides.id}`,
+      externalProductId: null,
+      optionCode: null,
+      packageNumber: null,
+      rawProductName: "direct unit",
+      rawOptionInfo: null,
+      normalizedProductName: normalizeText("direct unit"),
+      normalizedOptionInfo: "",
+      sourceSignature: createSourceSignature("direct unit", null),
+      quantity: 1,
+      productPaymentAmount: 100,
+      totalProductAmount: 100,
+      deliveryFeeAmount: 0,
+      paymentCommission: 0,
+      knowledgeShoppingSellingInterlockCommission: null,
+      saleCommission: null,
+      channelCommission: null,
+      orderDate: overrides.orderDate ?? overrides.paymentDate ?? "2026-04-01",
+      paymentDate: Object.prototype.hasOwnProperty.call(overrides, "paymentDate")
+        ? (overrides.paymentDate ?? null)
+        : "2026-04-01",
+      saleStatus: "SALE",
+      orderStatus: "DELIVERED",
+      isCanceled: false,
+      isReturned: false,
+      rawPayload: null,
+      createdAt: "before",
+      updatedAt: "before",
+    }) as OrderItem;
+
+  service.database = createEmptyDatabase();
+  service.database.orderSourceSignatures.push(
+    createOrderSourceSignature("sig-1", "direct unit"),
+    createOrderSourceSignature("sig-2", "direct unit two"),
+    createOrderSourceSignature("sig-other", "other unit"),
+    createOrderSourceSignature("sig-store-2", "direct unit", "store-2"),
+  );
+  service.database.orderItems.push(
+    makeOrderItem({ id: "item-1", storeId: "store-1", orderSourceSignatureId: "sig-1", paymentDate: "2026-04-02" }) as never,
+    makeOrderItem({ id: "item-2", storeId: "store-1", orderSourceSignatureId: "sig-2", paymentDate: "2026-04-01" }) as never,
+    makeOrderItem({ id: "item-3", storeId: "store-1", orderSourceSignatureId: "sig-2", paymentDate: null }) as never,
+    makeOrderItem({ id: "item-other", storeId: "store-1", orderSourceSignatureId: "sig-other", paymentDate: "2026-04-03" }) as never,
+    makeOrderItem({ id: "item-store-2", storeId: "store-2", orderSourceSignatureId: "sig-1", paymentDate: "2026-04-04" }) as never,
+  );
+
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      if (/FROM order_source_signatures/.test(text)) {
+        const ids = new Set(values?.[0] as string[]);
+        const storeId = values?.[1] as string;
+        return {
+          rows: service.database.orderSourceSignatures
+            .filter((signature: OrderSourceSignature) => ids.has(signature.id) && signature.storeId === storeId)
+            .map((signature: OrderSourceSignature) => ({ id: signature.id, payload: JSON.parse(JSON.stringify(signature)) })),
+          rowCount: 0,
+        };
+      }
+      if (/FROM order_items/.test(text)) {
+        const storeId = values?.[0] as string;
+        const ids = new Set(values?.[1] as string[]);
+        return {
+          rows: service.database.orderItems
+            .filter(
+              (item: OrderItem) =>
+                item.storeId === storeId &&
+                item.orderSourceSignatureId &&
+                ids.has(item.orderSourceSignatureId),
+            )
+            .map((item: OrderItem) => ({ id: item.id, payload: JSON.parse(JSON.stringify(item)) })),
+          rowCount: 0,
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.pool = { connect: async () => client };
+  service.persistSnapshotToPostgres = async () => {
+    throw new Error("persistSnapshotToPostgres should not be called");
+  };
+
+  const result = await service.saveOrderManualMappingsCommitted({
+    storeId: "store-1",
+    signatureIds: ["sig-1", "sig-1", "sig-2"],
+    canonicalSalesUnitId: "sales-1",
+    timestamp: "2026-06-04T00:00:00.000Z",
+  });
+
+  const sqlText = queries.map((query) => query.text).join("\n");
+  assert.match(sqlText, /BEGIN/);
+  assert.match(sqlText, /COMMIT/);
+  assert.match(sqlText, /FROM order_source_signatures/);
+  assert.match(sqlText, /payload->>'storeId' = \$2/);
+  assert.match(sqlText, /FROM order_items/);
+  assert.match(sqlText, /payload->>'storeId' = \$1/);
+  assert.match(sqlText, /payload->>'orderSourceSignatureId' = ANY\(\$2::text\[\]\)/);
+  assert.match(sqlText, /UPDATE order_source_signatures AS target/);
+  assert.match(sqlText, /UPDATE order_items AS target/);
+  assert.match(sqlText, /payload_hash = source\.payload_hash/);
+  assert.equal(/storage_metadata|INSERT INTO orders|DELETE FROM orders|loadSnapshotFromPostgres/.test(sqlText), false);
+  assert.deepEqual(
+    queries.find((query) => /FROM order_items/.test(query.text))?.values,
+    ["store-1", ["sig-1", "sig-2"]],
+  );
+
+  const signatureUpdate = queries.find((query) => /UPDATE order_source_signatures AS target/.test(query.text));
+  const updatedSignaturePayload = JSON.parse((signatureUpdate?.values as unknown[])[1] as string) as OrderSourceSignature;
+  assert.equal(updatedSignaturePayload.canonicalSalesUnitId, "sales-1");
+  assert.equal(updatedSignaturePayload.mappingStatus, "MAPPED");
+  assert.equal((signatureUpdate?.values as unknown[])[2], hashPayload(updatedSignaturePayload));
+
+  const itemUpdate = queries.find((query) => /UPDATE order_items AS target/.test(query.text));
+  const updatedItemPayload = JSON.parse((itemUpdate?.values as unknown[])[1] as string) as OrderItem;
+  assert.equal(updatedItemPayload.canonicalSalesUnitId, "sales-1");
+  assert.equal((itemUpdate?.values as unknown[])[2], hashPayload(updatedItemPayload));
+
+  assert.deepEqual(result.signatureIds, ["sig-1", "sig-2"]);
+  assert.equal(result.updatedOrderItemCount, 3);
+  assert.deepEqual(result.affectedDates, ["2026-04-01", "2026-04-02"]);
+  assert.equal(service.database.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-1")?.confirmedAt, "2026-06-04T00:00:00.000Z");
+  assert.equal(service.database.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-other")?.canonicalSalesUnitId, null);
+  assert.equal(service.database.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-store-2")?.canonicalSalesUnitId, null);
+  assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-1")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-2")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-3")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-other")?.canonicalSalesUnitId, null);
+  assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-store-2")?.canonicalSalesUnitId, null);
+});
+
+runAsync("DatabaseService PostgreSQL saves ad campaign mappings with row-level direct updates", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const rowWithoutSignature = createConfirmedUploadRow({
+    uploadId: "upload-direct",
+    reportDate: "2026-04-01",
+    campaignId: "cmp-direct",
+    campaignName: "direct launch",
+    canonicalSalesUnitId: null,
+    totalCost: 100,
+  }) as AdCampaignDailyCost;
+  const rowWithSignature = Object.assign(
+    createConfirmedUploadRow({
+      uploadId: "upload-direct-2",
+      reportDate: "2026-04-02",
+      campaignId: "cmp-direct",
+      campaignName: "direct launch",
+      canonicalSalesUnitId: null,
+      totalCost: 200,
+    }),
+    { adCampaignSignatureId: "ad-signature-direct" },
+  ) as AdCampaignDailyCost;
+  const untouchedRow = Object.assign(
+    createConfirmedUploadRow({
+      uploadId: "upload-other",
+      reportDate: "2026-04-03",
+      campaignId: "cmp-other",
+      campaignName: "other launch",
+      canonicalSalesUnitId: null,
+      totalCost: 300,
+    }),
+    { adCampaignSignatureId: "ad-signature-other" },
+  ) as AdCampaignDailyCost;
+
+  service.database = createEmptyDatabase();
+  service.database.canonicalSalesUnits.push(createSalesUnit("sales-direct", "Direct Unit", ["direct"]));
+  service.database.adCampaignSignatures.push(
+    createAdCampaignSignature({
+      id: "ad-signature-direct",
+      campaignId: "cmp-direct",
+      campaignName: "direct launch",
+    }),
+    createAdCampaignSignature({
+      id: "ad-signature-other",
+      campaignId: "cmp-other",
+      campaignName: "other launch",
+    }),
+  );
+  service.database.adCampaignDailyCosts.push(rowWithoutSignature, rowWithSignature, untouchedRow);
+
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      if (/FROM ad_campaign_signatures/.test(text)) {
+        const ids = new Set(values?.[0] as string[]);
+        const storeId = values?.[1] as string;
+        return {
+          rows: service.database.adCampaignSignatures
+            .filter((signature: AdCampaignSignature) => ids.has(signature.id) && signature.storeId === storeId)
+            .map((signature: AdCampaignSignature) => ({
+              id: signature.id,
+              payload: JSON.parse(JSON.stringify(signature)),
+            })),
+          rowCount: 0,
+        };
+      }
+      if (/FROM ad_campaign_daily_costs/.test(text) && /id = ANY\(\$1::text\[\]\)/.test(text)) {
+        const ids = new Set(values?.[0] as string[]);
+        const storeId = values?.[1] as string;
+        return {
+          rows: service.database.adCampaignDailyCosts
+            .filter((row: AdCampaignDailyCost) => ids.has(row.id) && row.storeId === storeId)
+            .map((row: AdCampaignDailyCost) => ({ id: row.id, payload: JSON.parse(JSON.stringify(row)) })),
+          rowCount: 0,
+        };
+      }
+      if (/FROM ad_campaign_daily_costs/.test(text) && /adCampaignSignatureId/.test(text)) {
+        const storeId = values?.[0] as string;
+        const signatureIds = new Set(values?.[1] as string[]);
+        const targetIds = new Set(values?.[2] as string[]);
+        return {
+          rows: service.database.adCampaignDailyCosts
+            .filter(
+              (row: AdCampaignDailyCost) =>
+                row.storeId === storeId &&
+                ((row.adCampaignSignatureId ? signatureIds.has(row.adCampaignSignatureId) : false) ||
+                  targetIds.has(row.id)),
+            )
+            .map((row: AdCampaignDailyCost) => ({ id: row.id, payload: JSON.parse(JSON.stringify(row)) })),
+          rowCount: 0,
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.pool = { connect: async () => client };
+  service.persistSnapshotToPostgres = async () => {
+    throw new Error("persistSnapshotToPostgres should not be called");
+  };
+
+  const result = await service.saveAdCampaignMappingsCommitted({
+    storeId: "store-1",
+    targetIds: [rowWithoutSignature.id],
+    action: {
+      type: "MANUAL_MAPPED",
+      canonicalSalesUnitId: "sales-direct",
+      timestamp: "2026-06-04T00:00:00.000Z",
+    },
+  });
+
+  const sqlText = queries.map((query) => query.text).join("\n");
+  assert.match(sqlText, /BEGIN/);
+  assert.match(sqlText, /COMMIT/);
+  assert.match(sqlText, /FROM ad_campaign_signatures/);
+  assert.match(sqlText, /FROM ad_campaign_daily_costs/);
+  assert.match(sqlText, /INSERT INTO ad_campaign_signatures/);
+  assert.match(sqlText, /UPDATE ad_campaign_daily_costs AS target/);
+  assert.match(sqlText, /payload_hash = EXCLUDED\.payload_hash/);
+  assert.match(sqlText, /payload_hash = source\.payload_hash/);
+  assert.equal(/storage_metadata|INSERT INTO orders|DELETE FROM orders|loadSnapshotFromPostgres/.test(sqlText), false);
+
+  const signatureUpsert = queries.find((query) => /INSERT INTO ad_campaign_signatures/.test(query.text));
+  const updatedSignaturePayload = JSON.parse((signatureUpsert?.values as unknown[])[1] as string) as AdCampaignSignature;
+  assert.equal(updatedSignaturePayload.canonicalSalesUnitId, "sales-direct");
+  assert.equal(updatedSignaturePayload.mappingReason, "MANUAL_MAPPED");
+  assert.equal((signatureUpsert?.values as unknown[])[2], hashPayload(updatedSignaturePayload));
+
+  const rowUpdate = queries.find((query) => /UPDATE ad_campaign_daily_costs AS target/.test(query.text));
+  const updatedRowPayload = JSON.parse((rowUpdate?.values as unknown[])[1] as string) as AdCampaignDailyCost;
+  assert.equal(updatedRowPayload.adCampaignSignatureId, "ad-signature-direct");
+  assert.equal(updatedRowPayload.canonicalSalesUnitId, "sales-direct");
+  assert.equal((rowUpdate?.values as unknown[])[2], hashPayload(updatedRowPayload));
+
+  assert.deepEqual(result.signatureIds, ["ad-signature-direct"]);
+  assert.equal(result.updatedAdCampaignDailyCostCount, 2);
+  assert.deepEqual(result.affectedDates, ["2026-04-01", "2026-04-02"]);
+  assert.equal(
+    service.database.adCampaignSignatures.find((item: AdCampaignSignature) => item.id === "ad-signature-direct")
+      ?.canonicalSalesUnitId,
+    "sales-direct",
+  );
+  assert.equal(
+    service.database.adCampaignDailyCosts.find((item: AdCampaignDailyCost) => item.id === rowWithoutSignature.id)
+      ?.adCampaignSignatureId,
+    "ad-signature-direct",
+  );
+  assert.equal(
+    service.database.adCampaignDailyCosts.find((item: AdCampaignDailyCost) => item.id === rowWithSignature.id)
+      ?.canonicalSalesUnitId,
+    "sales-direct",
+  );
+  assert.equal(
+    service.database.adCampaignDailyCosts.find((item: AdCampaignDailyCost) => item.id === untouchedRow.id)
+      ?.canonicalSalesUnitId,
+    null,
+  );
+});
+
+runAsync("DatabaseService PostgreSQL locks materialized ad signature for row-id mapping targets", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const targetRow = createConfirmedUploadRow({
+    uploadId: "upload-stale",
+    reportDate: "2026-04-05",
+    campaignId: "cmp-stale",
+    campaignName: "stale launch",
+    canonicalSalesUnitId: null,
+    totalCost: 100,
+  }) as AdCampaignDailyCost;
+  const staleMemorySignature = createAdCampaignSignature({
+    id: "ad-signature-stale",
+    campaignId: "cmp-stale",
+    campaignName: "stale launch",
+  }) as AdCampaignSignature;
+  staleMemorySignature.usageCount = 1;
+  staleMemorySignature.firstSeenDate = "2026-01-01";
+
+  const dbSignature = JSON.parse(JSON.stringify(staleMemorySignature)) as AdCampaignSignature;
+  dbSignature.usageCount = 9;
+  dbSignature.firstSeenDate = "2026-03-01";
+  dbSignature.lastSeenDate = "2026-03-10";
+  dbSignature.reasonNote = "fresh database payload";
+
+  service.database = createEmptyDatabase();
+  service.database.canonicalSalesUnits.push(createSalesUnit("sales-stale", "Fresh Unit", ["stale"]));
+  service.database.adCampaignSignatures.push(staleMemorySignature);
+  service.database.adCampaignDailyCosts.push(targetRow);
+
+  const dbSignatures = [dbSignature];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      if (/FROM ad_campaign_signatures/.test(text)) {
+        const ids = new Set(values?.[0] as string[]);
+        const storeId = values?.[1] as string;
+        return {
+          rows: dbSignatures
+            .filter((signature) => ids.has(signature.id) && signature.storeId === storeId)
+            .map((signature) => ({ id: signature.id, payload: JSON.parse(JSON.stringify(signature)) })),
+          rowCount: 0,
+        };
+      }
+      if (/FROM ad_campaign_daily_costs/.test(text) && /id = ANY\(\$1::text\[\]\)/.test(text)) {
+        const ids = new Set(values?.[0] as string[]);
+        const storeId = values?.[1] as string;
+        return {
+          rows: service.database.adCampaignDailyCosts
+            .filter((row: AdCampaignDailyCost) => ids.has(row.id) && row.storeId === storeId)
+            .map((row: AdCampaignDailyCost) => ({ id: row.id, payload: JSON.parse(JSON.stringify(row)) })),
+          rowCount: 0,
+        };
+      }
+      if (/FROM ad_campaign_daily_costs/.test(text) && /adCampaignSignatureId/.test(text)) {
+        const storeId = values?.[0] as string;
+        const targetIds = new Set(values?.[2] as string[]);
+        return {
+          rows: service.database.adCampaignDailyCosts
+            .filter((row: AdCampaignDailyCost) => row.storeId === storeId && targetIds.has(row.id))
+            .map((row: AdCampaignDailyCost) => ({ id: row.id, payload: JSON.parse(JSON.stringify(row)) })),
+          rowCount: 0,
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.pool = { connect: async () => client };
+  service.persistSnapshotToPostgres = async () => {
+    throw new Error("persistSnapshotToPostgres should not be called");
+  };
+
+  await service.saveAdCampaignMappingsCommitted({
+    storeId: "store-1",
+    targetIds: [targetRow.id],
+    action: {
+      type: "MANUAL_MAPPED",
+      canonicalSalesUnitId: "sales-stale",
+      timestamp: "2026-06-04T00:00:00.000Z",
+    },
+  });
+
+  const signatureSelects = queries.filter((query) => /FROM ad_campaign_signatures/.test(query.text));
+  assert.equal(signatureSelects.length, 2);
+  assert.deepEqual(signatureSelects[0].values, [[targetRow.id], "store-1"]);
+  assert.deepEqual(signatureSelects[1].values, [["ad-signature-stale"], "store-1"]);
+
+  const signatureUpsert = queries.find((query) => /INSERT INTO ad_campaign_signatures/.test(query.text));
+  const updatedSignaturePayload = JSON.parse((signatureUpsert?.values as unknown[])[1] as string) as AdCampaignSignature;
+  assert.equal(updatedSignaturePayload.canonicalSalesUnitId, "sales-stale");
+  assert.equal(updatedSignaturePayload.usageCount, 10);
+  assert.equal(updatedSignaturePayload.firstSeenDate, "2026-03-01");
+  assert.equal(updatedSignaturePayload.lastSeenDate, "2026-04-05");
+  assert.equal(
+    service.database.adCampaignSignatures.find((signature: AdCampaignSignature) => signature.id === "ad-signature-stale")
+      ?.usageCount,
+    10,
+  );
+  assert.equal(
+    service.database.adCampaignSignatures.find((signature: AdCampaignSignature) => signature.id === "ad-signature-stale")
+      ?.lastSeenDate,
+    "2026-04-05",
+  );
+});
+
+runAsync("DatabaseService file mode falls back to committed order manual mapping snapshot write", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const persistedSnapshots: ReturnType<typeof createEmptyDatabase>[] = [];
+  service.database = createEmptyDatabase();
+  service.database.orderSourceSignatures.push(createOrderSourceSignature("sig-1", "file unit"));
+  service.database.orderItems.push({
+    id: "item-1",
+    storeId: "store-1",
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: null,
+    paymentDate: "2026-04-01",
+    updatedAt: "before",
+  } as never);
+  service.storageMode = "file";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.persistSnapshotWithStatus = async (snapshot: ReturnType<typeof createEmptyDatabase>) => {
+    persistedSnapshots.push(JSON.parse(JSON.stringify(snapshot)));
+  };
+
+  const result = await service.saveOrderManualMappingsCommitted({
+    storeId: "store-1",
+    signatureIds: ["sig-1"],
+    canonicalSalesUnitId: "sales-1",
+    timestamp: "2026-06-04T00:00:00.000Z",
+  });
+
+  assert.equal(result.updatedOrderItemCount, 1);
+  assert.deepEqual(result.affectedDates, ["2026-04-01"]);
+  assert.equal(persistedSnapshots.length, 1);
+  assert.equal(service.database.orderSourceSignatures[0].canonicalSalesUnitId, "sales-1");
+  assert.equal(service.database.orderItems[0].canonicalSalesUnitId, "sales-1");
+  assert.equal(persistedSnapshots[0]?.orderItems[0]?.canonicalSalesUnitId, "sales-1");
+});
+
+runAsync("DatabaseService PostgreSQL replaces only scoped daily profit summary rows", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  const oldTarget = createStoredDailySalesUnitProfitForTest({
+    id: "old-target",
+    date: "2026-04-01",
+    totalRevenue: 10,
+  });
+  const otherDate = createStoredDailySalesUnitProfitForTest({
+    id: "other-date",
+    date: "2026-04-02",
+    totalRevenue: 20,
+  });
+  const otherStore = createStoredDailySalesUnitProfitForTest({
+    id: "other-store",
+    storeId: "store-2",
+    date: "2026-04-01",
+    totalRevenue: 30,
+  });
+  const newRows = [
+    createStoredDailySalesUnitProfitForTest({ id: "new-1", date: "2026-04-01", totalRevenue: 100 }),
+    createStoredDailySalesUnitProfitForTest({ id: "new-3", date: "2026-04-03", totalRevenue: 300 }),
+  ];
+  const newSummaries = [
+    createStoredDailyStoreSummaryForTest({ id: "summary-new-1", date: "2026-04-01", totalRevenue: 100 }),
+    createStoredDailyStoreSummaryForTest({ id: "summary-new-3", date: "2026-04-03", totalRevenue: 300 }),
+  ];
+  service.database = createEmptyDatabase();
+  service.database.dailySalesUnitProfits.push(oldTarget, otherDate, otherStore);
+  service.database.dailyStoreSummaries.push(
+    createStoredDailyStoreSummaryForTest({ id: "summary-old-target", date: "2026-04-01", totalRevenue: 10 }),
+    createStoredDailyStoreSummaryForTest({ id: "summary-other-date", date: "2026-04-02", totalRevenue: 20 }),
+    createStoredDailyStoreSummaryForTest({
+      id: "summary-other-store",
+      storeId: "store-2",
+      date: "2026-04-01",
+      totalRevenue: 30,
+    }),
+  );
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.pool = { connect: async () => client };
+  service.persistSnapshotToPostgres = async () => {
+    throw new Error("persistSnapshotToPostgres should not be called");
+  };
+
+  await service.replaceDailyProfitSummariesCommitted({
+    storeId: "store-1",
+    dates: ["2026-04-03", "2026-04-01", "2026-04-01"],
+    buildReplacement: () => ({
+      dailySalesUnitProfits: newRows,
+      dailyStoreSummaries: newSummaries,
+      result: undefined,
+    }),
+  });
+
+  const sqlText = queries.map((query) => query.text).join("\n");
+  assert.match(sqlText, /BEGIN/);
+  assert.match(sqlText, /DELETE FROM daily_sales_unit_profits/);
+  assert.match(sqlText, /DELETE FROM daily_store_summaries/);
+  assert.match(sqlText, /INSERT INTO daily_sales_unit_profits/);
+  assert.match(sqlText, /INSERT INTO daily_store_summaries/);
+  assert.match(sqlText, /payload_hash = EXCLUDED\.payload_hash/);
+  assert.equal(/storage_metadata|INSERT INTO orders|DELETE FROM orders/.test(sqlText), false);
+  assert.deepEqual(
+    queries.find((query) => /DELETE FROM daily_sales_unit_profits/.test(query.text))?.values,
+    ["store-1", ["2026-04-01", "2026-04-03"]],
+  );
+
+  const salesInsert = queries.find((query) => /INSERT INTO daily_sales_unit_profits/.test(query.text));
+  assert.equal((salesInsert?.values as unknown[])[0], "new-1");
+  assert.equal((salesInsert?.values as unknown[])[2], hashPayload(newRows[0]));
+
+  assert.deepEqual(
+    service.database.dailySalesUnitProfits.map((row: StoredDailySalesUnitProfit) => row.id).sort(),
+    ["new-1", "new-3", "other-date", "other-store"],
+  );
+  assert.deepEqual(
+    service.database.dailyStoreSummaries.map((row: StoredDailyStoreSummary) => row.id).sort(),
+    ["summary-new-1", "summary-new-3", "summary-other-date", "summary-other-store"],
+  );
+});
+
+runAsync("ProfitSummaryService PostgreSQL daily summary calculation waits for queued committed writes", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const date = "2026-04-09";
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  let releaseQueuedWrite!: () => void;
+
+  service.database = createEmptyDatabase();
+  service.database.stores.push(createStoreRecord("store-1", "Main Store"));
+  service.database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Queued Unit", ["queued"]));
+  service.storageMode = "postgres";
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.pool = { connect: async () => client };
+  service.persistenceQueue = new Promise<void>((resolve) => {
+    releaseQueuedWrite = () => {
+      service.database.orderItems.push({
+        id: "queued-order-item",
+        storeId: "store-1",
+        orderId: "queued-order",
+        orderSourceSignatureId: null,
+        canonicalSalesUnitId: "sales-1",
+        externalProductOrderId: "external-queued",
+        externalProductId: null,
+        packageNumber: null,
+        rawProductName: "queued unit",
+        rawOptionInfo: null,
+        normalizedProductName: normalizeText("queued unit"),
+        normalizedOptionInfo: "",
+        sourceSignature: createSourceSignature("queued unit", null),
+        quantity: 1,
+        productPaymentAmount: 100,
+        totalProductAmount: 100,
+        deliveryFeeAmount: 0,
+        paymentCommission: 0,
+        knowledgeShoppingSellingInterlockCommission: null,
+        saleCommission: null,
+        channelCommission: null,
+        orderDate: date,
+        paymentDate: date,
+        saleStatus: "SALE",
+        orderStatus: "DELIVERED",
+        isCanceled: false,
+        isReturned: false,
+        rawPayload: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      } as never);
+      resolve();
+    };
+  });
+
+  const summaryService = new ProfitSummaryService(service as DatabaseService);
+  const refreshPromise = summaryService.recalculateStoreDates({
+    storeId: "store-1",
+    dateFrom: date,
+    dateTo: date,
+    reason: "MAPPING_CHANGE",
+  });
+
+  await Promise.resolve();
+  assert.equal(queries.some((query) => /INSERT INTO daily_sales_unit_profits/.test(query.text)), false);
+
+  releaseQueuedWrite();
+  const result = await refreshPromise;
+  const salesInsert = queries.find((query) => /INSERT INTO daily_sales_unit_profits/.test(query.text));
+  const insertedSalesUnitRow = JSON.parse((salesInsert?.values as unknown[])[1] as string) as StoredDailySalesUnitProfit;
+
+  assert.equal(result.data.salesUnitRowCount, 1);
+  assert.equal(insertedSalesUnitRow.totalProductRevenue, 100);
+  assert.equal(service.database.dailySalesUnitProfits[0].totalProductRevenue, 100);
+  assert.equal(service.database.dailyStoreSummaries[0].totalProductRevenue, 100);
+});
+
+runAsync("DatabaseService file mode falls back to committed daily profit summary snapshot write", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const persistedSnapshots: ReturnType<typeof createEmptyDatabase>[] = [];
+  service.database = createEmptyDatabase();
+  service.database.dailySalesUnitProfits.push(
+    createStoredDailySalesUnitProfitForTest({ id: "old-target", date: "2026-04-01" }),
+    createStoredDailySalesUnitProfitForTest({ id: "other-date", date: "2026-04-02" }),
+  );
+  service.database.dailyStoreSummaries.push(
+    createStoredDailyStoreSummaryForTest({ id: "summary-old-target", date: "2026-04-01" }),
+    createStoredDailyStoreSummaryForTest({ id: "summary-other-date", date: "2026-04-02" }),
+  );
+  service.storageMode = "file";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.persistSnapshotWithStatus = async (snapshot: ReturnType<typeof createEmptyDatabase>) => {
+    persistedSnapshots.push(JSON.parse(JSON.stringify(snapshot)));
+  };
+
+  await service.replaceDailyProfitSummariesCommitted({
+    storeId: "store-1",
+    dates: ["2026-04-01"],
+    buildReplacement: () => ({
+      dailySalesUnitProfits: [createStoredDailySalesUnitProfitForTest({ id: "new-target", date: "2026-04-01" })],
+      dailyStoreSummaries: [createStoredDailyStoreSummaryForTest({ id: "summary-new-target", date: "2026-04-01" })],
+      result: undefined,
+    }),
+  });
+
+  assert.deepEqual(
+    service.database.dailySalesUnitProfits.map((row: StoredDailySalesUnitProfit) => row.id).sort(),
+    ["new-target", "other-date"],
+  );
+  assert.equal(persistedSnapshots.length, 1);
+  const persisted = persistedSnapshots[0]!;
+  assert.deepEqual(
+    persisted.dailyStoreSummaries.map((row: StoredDailyStoreSummary) => row.id).sort(),
+    ["summary-new-target", "summary-other-date"],
+  );
+});
+
+runAsync("DatabaseService PostgreSQL removes only scoped daily profit summary rows", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  service.database = createEmptyDatabase();
+  service.database.dailySalesUnitProfits.push(
+    createStoredDailySalesUnitProfitForTest({ id: "target", date: "2026-04-01" }),
+    createStoredDailySalesUnitProfitForTest({ id: "other-date", date: "2026-04-02" }),
+    createStoredDailySalesUnitProfitForTest({ id: "other-store", storeId: "store-2", date: "2026-04-01" }),
+  );
+  service.database.dailyStoreSummaries.push(
+    createStoredDailyStoreSummaryForTest({ id: "summary-target", date: "2026-04-01" }),
+    createStoredDailyStoreSummaryForTest({ id: "summary-other-date", date: "2026-04-02" }),
+    createStoredDailyStoreSummaryForTest({ id: "summary-other-store", storeId: "store-2", date: "2026-04-01" }),
+  );
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  service.pool = { connect: async () => client };
+  service.persistSnapshotToPostgres = async () => {
+    throw new Error("persistSnapshotToPostgres should not be called");
+  };
+
+  await service.removeDailyProfitSummariesCommitted({ storeId: "store-1", dates: ["2026-04-01"] });
+
+  const sqlText = queries.map((query) => query.text).join("\n");
+  assert.match(sqlText, /DELETE FROM daily_sales_unit_profits/);
+  assert.match(sqlText, /DELETE FROM daily_store_summaries/);
+  assert.equal(/INSERT INTO daily_sales_unit_profits|storage_metadata/.test(sqlText), false);
+  assert.deepEqual(
+    service.database.dailySalesUnitProfits.map((row: StoredDailySalesUnitProfit) => row.id).sort(),
+    ["other-date", "other-store"],
+  );
+  assert.deepEqual(
+    service.database.dailyStoreSummaries.map((row: StoredDailyStoreSummary) => row.id).sort(),
+    ["summary-other-date", "summary-other-store"],
+  );
 });
 
 runAsync("DatabaseService PostgreSQL persistence upserts rows and deletes missing ids without TRUNCATE", async () => {
@@ -2926,6 +4278,90 @@ run("createEmptyDatabase includes daily profit summary collections", () => {
 
   assert.deepEqual(database.dailySalesUnitProfits, []);
   assert.deepEqual(database.dailyStoreSummaries, []);
+});
+
+runAsync("ProfitSummaryService skips committed writes for empty date refresh", async () => {
+  const database = createEmptyDatabase();
+  database.stores.push(createStoreRecord("store-1", "Main Store"));
+  const databaseService = createMemoryDatabaseService(database);
+  const summaryService = new ProfitSummaryService(databaseService as never);
+
+  const result = await summaryService.refreshStoreDateListBestEffort({
+    storeId: "store-1",
+    dates: [],
+    reason: "MAPPING_CHANGE",
+  });
+
+  assert.deepEqual(result, {
+    recalculatedDateCount: 0,
+    salesUnitRowCount: 0,
+    storeSummaryRowCount: 0,
+    reason: "MAPPING_CHANGE",
+  });
+  assert.equal(databaseService.writeCommittedCalls, 0);
+});
+
+runAsync("ProfitSummaryService uses PostgreSQL daily summary direct replace path", async () => {
+  const database = createEmptyDatabase();
+  const date = "2026-04-08";
+  database.stores.push(createStoreRecord("store-1", "Main Store"));
+  const databaseService = createMemoryDatabaseService(database);
+  databaseService.storageMode = "postgres";
+  databaseService.writeCommitted = async () => {
+    throw new Error("writeCommitted should not be used in PostgreSQL daily summary recalculation");
+  };
+  const summaryService = new ProfitSummaryService(databaseService as never);
+
+  const result = await summaryService.recalculateStoreDates({
+    storeId: "store-1",
+    dateFrom: date,
+    dateTo: date,
+    reason: "MAPPING_CHANGE",
+  });
+
+  assert.equal(result.data.recalculatedDateCount, 1);
+  assert.equal(result.data.salesUnitRowCount, 0);
+  assert.equal(result.data.storeSummaryRowCount, 1);
+  assert.equal(databaseService.replaceDailyProfitSummariesCommittedCalls, 1);
+  assert.equal(databaseService.writeCommittedCalls, 0);
+  assert.equal(databaseService.getSnapshot().dailyStoreSummaries[0].date, date);
+});
+
+runAsync("ProfitSummaryService invalidates PostgreSQL daily summaries with scoped direct remove path", async () => {
+  const database = createEmptyDatabase();
+  database.stores.push(createStoreRecord("store-1", "Main Store"));
+  database.dailySalesUnitProfits.push(
+    createStoredDailySalesUnitProfitForTest({ id: "target", date: "2026-04-01" }),
+    createStoredDailySalesUnitProfitForTest({ id: "other-date", date: "2026-04-02" }),
+  );
+  database.dailyStoreSummaries.push(
+    createStoredDailyStoreSummaryForTest({ id: "summary-target", date: "2026-04-01" }),
+    createStoredDailyStoreSummaryForTest({ id: "summary-other-date", date: "2026-04-02" }),
+  );
+  const databaseService = createMemoryDatabaseService(database);
+  databaseService.storageMode = "postgres";
+  databaseService.replaceDailyProfitSummariesCommitted = async () => {
+    throw new Error("forced recalculation failure");
+  };
+  const summaryService = new ProfitSummaryService(databaseService as never);
+
+  const result = await summaryService.refreshStoreDateListBestEffort({
+    storeId: "store-1",
+    dates: ["2026-04-01"],
+    reason: "MAPPING_CHANGE",
+  });
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(result, null);
+  assert.equal(databaseService.removeDailyProfitSummariesCommittedCalls, 1);
+  assert.deepEqual(
+    snapshot.dailySalesUnitProfits.map((row: StoredDailySalesUnitProfit) => row.id),
+    ["other-date"],
+  );
+  assert.deepEqual(
+    snapshot.dailyStoreSummaries.map((row: StoredDailyStoreSummary) => row.id),
+    ["summary-other-date"],
+  );
 });
 
 runAsync("ProfitSummaryService stores calculation rows and ProfitService prefers them", async () => {
@@ -3801,6 +5237,145 @@ runAsync("AdsService saveManualMappings applies one sales unit to multiple rows"
     assert.equal(item.matchedRuleCount, 0);
     assert.equal(item.reasonNote, null);
     assert.equal(item.reasonNoteInherited, false);
+  });
+});
+
+runAsync("AdsService saveManualMappings skips profit summary refresh when affected dates are empty", async () => {
+  const { databaseService, adsService, profitSummaryService } = createAdsServiceHarness({
+    withProfitSummaryService: true,
+  });
+  const summaryService = profitSummaryService!;
+  let refreshCalls = 0;
+  const originalRefresh = summaryService.refreshStoreDateListBestEffort.bind(summaryService);
+  summaryService.refreshStoreDateListBestEffort = ((params) => {
+    refreshCalls += 1;
+    return originalRefresh(params);
+  }) as ProfitSummaryService["refreshStoreDateListBestEffort"];
+
+  databaseService.write((draft) => {
+    draft.stores.push(createStoreRecord("store-1", "Main Store"));
+    draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Signature Unit", ["signature"]));
+    draft.adCampaignSignatures.push(
+      createAdCampaignSignature({
+        id: "ad-signature-no-date",
+        campaignId: "cmp-no-date",
+        campaignName: "signature campaign",
+      }),
+    );
+  });
+
+  const writeCountBefore = databaseService.writeCommittedCalls;
+  const result = await adsService.saveManualMappings(["ad-signature-no-date"], {
+    canonicalSalesUnitId: "sales-1",
+  });
+  const snapshot = databaseService.getSnapshot();
+
+  assert.equal(result.data.updatedCount, 1);
+  assert.equal(
+    snapshot.adCampaignSignatures.find((item: { id: string }) => item.id === "ad-signature-no-date")
+      ?.canonicalSalesUnitId,
+    "sales-1",
+  );
+  assert.equal(refreshCalls, 0);
+  assert.equal(databaseService.writeCommittedCalls, writeCountBefore + 1);
+  assert.equal(snapshot.dailyStoreSummaries.length, 0);
+  assert.equal(snapshot.dailySalesUnitProfits.length, 0);
+});
+
+runAsync("AdsService PostgreSQL mapping APIs bypass writeCommitted snapshot persistence", async () => {
+  const { databaseService, adsService, profitSummaryService } = createAdsServiceHarness({
+    withProfitSummaryService: true,
+  });
+  const refreshCalls: Array<{ storeId: string; dates: string[]; reason: string }> = [];
+  profitSummaryService!.refreshStoreDateListBestEffort = ((params) => {
+    refreshCalls.push({ ...params });
+    return Promise.resolve(null);
+  }) as ProfitSummaryService["refreshStoreDateListBestEffort"];
+
+  databaseService.write((draft) => {
+    draft.stores.push(createStoreRecord("store-1", "Main Store"));
+    draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-direct", reportDate: "2026-04-01" }));
+    draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-direct-2", reportDate: "2026-04-02" }));
+    draft.canonicalSalesUnits.push(
+      createSalesUnit("sales-manual", "Manual Unit", ["manual"]),
+      createSalesUnit("sales-rule", "Rule Unit", ["direct"]),
+    );
+    draft.campaignMappings.push({
+      id: "campaign-rule-direct",
+      storeId: "store-1",
+      channel: "NAVER_DA",
+      canonicalSalesUnitId: "sales-rule",
+      campaignPattern: "direct",
+      normalizedCampaignPattern: normalizeText("direct"),
+      isActive: true,
+      deactivatedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    draft.adCampaignSignatures.push(
+      createAdCampaignSignature({
+        id: "ad-signature-direct",
+        campaignId: "cmp-direct",
+        campaignName: "direct launch",
+      }),
+    );
+    draft.adCampaignDailyCosts.push(
+      Object.assign(
+        createConfirmedUploadRow({
+          uploadId: "upload-direct",
+          reportDate: "2026-04-01",
+          campaignId: "cmp-direct",
+          campaignName: "direct launch",
+          canonicalSalesUnitId: null,
+          totalCost: 100,
+        }),
+        { adCampaignSignatureId: "ad-signature-direct" },
+      ) as never,
+      Object.assign(
+        createConfirmedUploadRow({
+          uploadId: "upload-direct-2",
+          reportDate: "2026-04-02",
+          campaignId: "cmp-direct",
+          campaignName: "direct launch",
+          canonicalSalesUnitId: null,
+          totalCost: 200,
+        }),
+        { adCampaignSignatureId: "ad-signature-direct" },
+      ) as never,
+    );
+  });
+
+  databaseService.storageMode = "postgres";
+  databaseService.writeCommitted = async () => {
+    throw new Error("writeCommitted should not be used for PostgreSQL ad campaign mapping");
+  };
+
+  await adsService.saveManualMappings(["ad-signature-direct"], { canonicalSalesUnitId: "sales-manual" });
+  await adsService.setIntentionalUnmappedMany(["ad-upload-direct-cmp-direct"], {
+    reasonNote: "brand spend hold",
+  });
+  const recalculateResult = await adsService.recalculateMappings(["ad-signature-direct"]);
+  const snapshot = databaseService.getSnapshot();
+  const signature = snapshot.adCampaignSignatures.find((item: { id: string }) => item.id === "ad-signature-direct")!;
+  const relatedRows = snapshot.adCampaignDailyCosts.filter(
+    (item: { adCampaignSignatureId: string | null }) => item.adCampaignSignatureId === "ad-signature-direct",
+  );
+
+  assert.equal(databaseService.writeCommittedCalls, 0);
+  assert.equal(databaseService.saveAdCampaignMappingsCommittedCalls, 3);
+  assert.equal(signature.mappingReason, "INTENTIONALLY_UNMAPPED");
+  assert.equal(signature.reasonNote, "brand spend hold");
+  assert.equal(recalculateResult.data.mappings[0].mappingReason, "INTENTIONALLY_UNMAPPED");
+  assert.deepEqual(
+    relatedRows.map((item: { mappingReason: string; reasonNote: string | null }) => [item.mappingReason, item.reasonNote]),
+    [
+      ["INTENTIONALLY_UNMAPPED", "brand spend hold"],
+      ["INTENTIONALLY_UNMAPPED", "brand spend hold"],
+    ],
+  );
+  assert.equal(refreshCalls.length, 3);
+  refreshCalls.forEach((call) => {
+    assert.deepEqual(call.dates, ["2026-04-01", "2026-04-02"]);
   });
 });
 

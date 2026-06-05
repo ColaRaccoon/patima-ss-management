@@ -88,7 +88,7 @@ export class OrderMappingService implements OnModuleInit {
       linkedProductIds: payload.linkedProductIds,
       linkedOptionCodes: payload.linkedOptionCodes,
       memo: payload.memo,
-    }, { skipOrderRecalculation: true });
+    }, { skipOrderRecalculation: true, skipAdRecalculation: true, skipProfitSummaryRecalculation: true });
     const created = createdResponse.data;
     const result = await this.saveMappingsInternal(signatureIds, { canonicalSalesUnitId: created.id });
     return formatApiSuccess({
@@ -129,30 +129,17 @@ export class OrderMappingService implements OnModuleInit {
       });
     }
 
-    const targetIds = new Set(dedupedIds);
     const timestamp = nowIso();
-    await this.databaseService.writeCommitted((draft) => {
-      draft.orderSourceSignatures.forEach((item) => {
-        if (!targetIds.has(item.id)) {
-          return;
-        }
-        item.canonicalSalesUnitId = payload.canonicalSalesUnitId;
-        item.mappingStatus = "MAPPED";
-        item.confirmedAt = timestamp;
-        item.updatedAt = timestamp;
-      });
-      draft.orderItems.forEach((item) => {
-        if (!item.orderSourceSignatureId || !targetIds.has(item.orderSourceSignatureId)) {
-          return;
-        }
-        item.canonicalSalesUnitId = payload.canonicalSalesUnitId;
-        item.updatedAt = timestamp;
-      });
+    const commitResult = await this.databaseService.saveOrderManualMappingsCommitted({
+      storeId,
+      signatureIds: dedupedIds,
+      canonicalSalesUnitId: payload.canonicalSalesUnitId,
+      timestamp,
     });
-    await this.recalculateProfitSummariesForOrderSignatures(storeId, dedupedIds);
+    await this.refreshProfitSummariesForDates(storeId, commitResult.affectedDates);
 
     return {
-      signatureIds: dedupedIds,
+      signatureIds: commitResult.signatureIds,
       operationId: null,
     };
   }
@@ -209,18 +196,11 @@ export class OrderMappingService implements OnModuleInit {
     };
   }
 
-  private async recalculateProfitSummariesForOrderSignatures(storeId: string, signatureIds: string[]) {
-    const signatureIdSet = new Set(signatureIds);
-    const dates = this.databaseService
-      .getSnapshot()
-      .orderItems.filter(
-        (item) =>
-          item.storeId === storeId &&
-          item.orderSourceSignatureId &&
-          signatureIdSet.has(item.orderSourceSignatureId) &&
-          item.paymentDate,
-      )
-      .map((item) => item.paymentDate!);
+  private async refreshProfitSummariesForDates(storeId: string, affectedDates: string[]) {
+    const dates = Array.from(new Set(affectedDates.filter(Boolean))).sort((left, right) => left.localeCompare(right));
+    if (dates.length === 0) {
+      return;
+    }
 
     await this.profitSummaryService?.refreshStoreDateListBestEffort({
       storeId,

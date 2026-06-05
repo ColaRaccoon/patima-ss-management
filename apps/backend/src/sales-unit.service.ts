@@ -30,6 +30,7 @@ interface SalesUnitPayload {
 interface SalesUnitCreateOptions {
   skipOrderRecalculation?: boolean;
   skipAdRecalculation?: boolean;
+  skipProfitSummaryRecalculation?: boolean;
 }
 
 @Injectable()
@@ -121,6 +122,7 @@ export class SalesUnitService {
     const displayName = payload.displayName.trim();
     const matchAliases = sanitizeMatchAliases(payload.matchAliases ?? []);
     ensureNormalizedLength(normalizeText(displayName), "displayName");
+    const timestamp = nowIso();
 
     const created: CanonicalSalesUnit = {
       id: createId(),
@@ -137,23 +139,22 @@ export class SalesUnitService {
       isStoreLevel: false,
       parentSalesUnitId: null,
       isGroup: false,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
+      createdAt: timestamp,
+      updatedAt: timestamp,
     };
 
     this.ensureUnique(created);
     assertGroupInvariants(created);
 
-    await this.databaseService.writeCommitted((draft) => {
-      ensureStoreExists(draft, payload.storeId);
-      draft.canonicalSalesUnits.push(created);
-      if (!options?.skipOrderRecalculation) {
-        recalculateOrderMappingsForStore(draft, payload.storeId);
-      }
-      if (!options?.skipAdRecalculation) {
-        recalculateAdMappingsForStore(draft, payload.storeId);
-      }
-      this.auditLogService.appendToDraft(draft, {
+    const shouldRecalculateOrders = !options?.skipOrderRecalculation;
+    const shouldRecalculateAds = !options?.skipAdRecalculation;
+    const shouldUseDirectCreate =
+      this.databaseService.getStorageMode() === "postgres" &&
+      !shouldRecalculateOrders &&
+      !shouldRecalculateAds;
+
+    if (shouldUseDirectCreate) {
+      const auditLog = this.auditLogService.createAuditLog({
         storeId: payload.storeId,
         domain: "SALES_UNIT",
         action: "CREATE",
@@ -162,8 +163,35 @@ export class SalesUnitService {
         beforeJson: null,
         afterJson: created,
       });
-    });
-    await this.recalculateProfitSummariesForStore(payload.storeId);
+      await this.databaseService.createCanonicalSalesUnitCommitted({
+        salesUnit: created,
+        auditLog,
+      });
+    } else {
+      await this.databaseService.writeCommitted((draft) => {
+        ensureStoreExists(draft, payload.storeId);
+        draft.canonicalSalesUnits.push(created);
+        if (shouldRecalculateOrders) {
+          recalculateOrderMappingsForStore(draft, payload.storeId);
+        }
+        if (shouldRecalculateAds) {
+          recalculateAdMappingsForStore(draft, payload.storeId);
+        }
+        this.auditLogService.appendToDraft(draft, {
+          storeId: payload.storeId,
+          domain: "SALES_UNIT",
+          action: "CREATE",
+          targetId: created.id,
+          actorIdentifier: "LOCALHOST_ADMIN",
+          beforeJson: null,
+          afterJson: created,
+        });
+      });
+    }
+
+    if (!options?.skipProfitSummaryRecalculation) {
+      await this.recalculateProfitSummariesForStore(payload.storeId);
+    }
 
     return formatApiSuccess(created);
   }

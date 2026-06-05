@@ -2,6 +2,7 @@ import { Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common"
 import {
   AdCampaignDailyCost,
   AdCampaignSignature,
+  CanonicalSalesUnit,
   DatabaseShape,
   DEFAULT_DELIVERY_UNIT_COST,
   MappingStatus,
@@ -9,13 +10,21 @@ import {
   OperationStatus,
   OperationType,
   OrderItem,
+  OrderSourceSignature,
   PaginationResult,
+  StoredDailySalesUnitProfit,
+  StoredDailyStoreSummary,
   normalizeText,
 } from "@patima/shared";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { Pool, PoolClient } from "pg";
+import {
+  applyAdCampaignSignatureToRows,
+  ensureAdCampaignSignaturesForStore,
+  recalculateAdCampaignSignaturesForStore,
+} from "./ad-mapping-engine";
 import {
   createEmptyDatabase,
   getActiveConfirmedUploadIds,
@@ -62,6 +71,36 @@ interface DuplicateKeyWarning {
 }
 
 type ListMappingStatus = "ALL" | MappingStatus;
+
+interface DailyProfitSummaryRows {
+  dailySalesUnitProfits: StoredDailySalesUnitProfit[];
+  dailyStoreSummaries: StoredDailyStoreSummary[];
+}
+
+interface DailyProfitSummaryReplacementResult<T> extends DailyProfitSummaryRows {
+  result: T;
+}
+
+export interface OrderManualMappingCommitResult {
+  signatureIds: string[];
+  updatedOrderItemCount: number;
+  affectedDates: string[];
+}
+
+export type AdCampaignMappingCommitAction =
+  | { type: "MANUAL_MAPPED"; canonicalSalesUnitId: string; timestamp: string }
+  | { type: "INTENTIONALLY_UNMAPPED"; reasonNote: string; timestamp: string }
+  | { type: "RECALCULATE" };
+
+export interface AdCampaignMappingCommitResult {
+  signatureIds: string[];
+  updatedAdCampaignDailyCostCount: number;
+  affectedDates: string[];
+}
+
+export interface CanonicalSalesUnitCreateCommitResult {
+  salesUnit: CanonicalSalesUnit;
+}
 
 export interface OperationListQuery {
   storeId: string;
@@ -1190,6 +1229,397 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return operation;
   }
 
+  async createCanonicalSalesUnitCommitted(params: {
+    salesUnit: CanonicalSalesUnit;
+    auditLog?: DatabaseShape["auditLogs"][number] | null;
+  }): Promise<CanonicalSalesUnitCreateCommitResult> {
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        const existingStore = draft.stores.find((store) => store.id === params.salesUnit.storeId);
+        if (!existingStore) {
+          throw new Error("STORE_NOT_FOUND");
+        }
+        draft.canonicalSalesUnits.push(this.cloneSnapshot(params.salesUnit));
+        if (params.auditLog) {
+          draft.auditLogs.push(this.cloneSnapshot(params.auditLog));
+        }
+        return { salesUnit: this.cloneSnapshot(params.salesUnit) };
+      });
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        const storeResult = await client.query("SELECT id FROM stores WHERE id = $1 FOR UPDATE", [
+          params.salesUnit.storeId,
+        ]);
+        if (storeResult.rows.length === 0) {
+          throw new Error("STORE_NOT_FOUND");
+        }
+
+        await this.upsertTableRows(
+          client,
+          { key: "canonicalSalesUnits", tableName: "canonical_sales_units" },
+          [params.salesUnit],
+        );
+        if (params.auditLog) {
+          await this.upsertTableRows(client, { key: "auditLogs", tableName: "audit_logs" }, [params.auditLog]);
+        }
+        await client.query("COMMIT");
+
+        this.upsertCanonicalSalesUnitInSnapshot(this.database, params.salesUnit);
+        if (params.auditLog) {
+          this.upsertAuditLogInSnapshot(this.database, params.auditLog);
+        }
+
+        return { salesUnit: this.cloneSnapshot(params.salesUnit) };
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async saveOrderManualMappingsCommitted(params: {
+    storeId: string;
+    signatureIds: string[];
+    canonicalSalesUnitId: string;
+    timestamp: string;
+  }): Promise<OrderManualMappingCommitResult> {
+    const signatureIds = this.normalizeCommittedIdList(params.signatureIds);
+    if (signatureIds.length === 0) {
+      return { signatureIds, updatedOrderItemCount: 0, affectedDates: [] };
+    }
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) =>
+        this.applyOrderManualMappingsToSnapshot(draft, {
+          ...params,
+          signatureIds,
+        }),
+      );
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        const signatureResult = await client.query<{ id: string; payload: OrderSourceSignature }>(
+          `SELECT id, payload
+           FROM order_source_signatures
+           WHERE id = ANY($1::text[])
+             AND payload->>'storeId' = $2
+           FOR UPDATE`,
+          [signatureIds, params.storeId],
+        );
+
+        if (signatureResult.rows.length !== signatureIds.length) {
+          throw new Error("ORDER_MANUAL_MAPPING_TARGET_NOT_FOUND");
+        }
+
+        const itemResult = await client.query<{ id: string; payload: OrderItem }>(
+          `SELECT id, payload
+           FROM order_items
+           WHERE payload->>'storeId' = $1
+             AND payload->>'orderSourceSignatureId' = ANY($2::text[])
+           FOR UPDATE`,
+          [params.storeId, signatureIds],
+        );
+
+        const targetIdSet = new Set(signatureIds);
+        const updatedSignatures = signatureResult.rows.map((row) => {
+          const signature = this.cloneSnapshot(row.payload);
+          if (!targetIdSet.has(signature.id) || signature.storeId !== params.storeId) {
+            throw new Error("ORDER_MANUAL_MAPPING_SCOPE_MISMATCH");
+          }
+          return this.applyOrderManualMappingToSignature(signature, params);
+        });
+        const updatedOrderItems = itemResult.rows.map((row) => {
+          const item = this.cloneSnapshot(row.payload);
+          if (
+            item.storeId !== params.storeId ||
+            !item.orderSourceSignatureId ||
+            !targetIdSet.has(item.orderSourceSignatureId)
+          ) {
+            throw new Error("ORDER_MANUAL_MAPPING_SCOPE_MISMATCH");
+          }
+          return this.applyOrderManualMappingToItem(item, params);
+        });
+
+        await this.updateTableRowsPayloads(client, "order_source_signatures", updatedSignatures);
+        await this.updateTableRowsPayloads(client, "order_items", updatedOrderItems);
+        await client.query("COMMIT");
+
+        this.upsertOrderManualMappingRowsInSnapshot(this.database, {
+          signatures: updatedSignatures,
+          orderItems: updatedOrderItems,
+        });
+
+        return {
+          signatureIds,
+          updatedOrderItemCount: updatedOrderItems.length,
+          affectedDates: this.collectAffectedPaymentDates(updatedOrderItems),
+        };
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async saveAdCampaignMappingsCommitted(params: {
+    storeId: string;
+    targetIds: string[];
+    action: AdCampaignMappingCommitAction;
+  }): Promise<AdCampaignMappingCommitResult> {
+    const targetIds = this.normalizeCommittedIdList(params.targetIds);
+    if (targetIds.length === 0) {
+      return { signatureIds: [], updatedAdCampaignDailyCostCount: 0, affectedDates: [] };
+    }
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) =>
+        this.applyAdCampaignMappingsToSnapshot(draft, {
+          ...params,
+          targetIds,
+        }),
+      );
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+
+        const targetSignatureResult = await client.query<{ id: string; payload: AdCampaignSignature }>(
+          `SELECT id, payload
+           FROM ad_campaign_signatures
+           WHERE id = ANY($1::text[])
+             AND payload->>'storeId' = $2
+           FOR UPDATE`,
+          [targetIds, params.storeId],
+        );
+        const targetRowResult = await client.query<{ id: string; payload: AdCampaignDailyCost }>(
+          `SELECT id, payload
+           FROM ad_campaign_daily_costs
+           WHERE id = ANY($1::text[])
+             AND payload->>'storeId' = $2
+           FOR UPDATE`,
+          [targetIds, params.storeId],
+        );
+
+        const foundTargetIds = new Set([
+          ...targetSignatureResult.rows.map((row) => row.id),
+          ...targetRowResult.rows.map((row) => row.id),
+        ]);
+        if (targetIds.some((id) => !foundTargetIds.has(id))) {
+          throw new Error("AD_CAMPAIGN_MAPPING_TARGET_NOT_FOUND");
+        }
+
+        const working = this.createAdCampaignMappingWorkingSnapshot({
+          storeId: params.storeId,
+          signatures: targetSignatureResult.rows.map((row) => this.cloneSnapshot(row.payload)),
+          rows: targetRowResult.rows.map((row) => this.cloneSnapshot(row.payload)),
+        });
+        const initiallyUnlinkedTargetRowIds = new Set(
+          targetRowResult.rows
+            .filter((row) => !row.payload.adCampaignSignatureId)
+            .map((row) => row.id),
+        );
+        const materializedSignatureIds = this.materializeAdCampaignSignatureIdsInSnapshot(
+          working,
+          params.storeId,
+          targetIds,
+        );
+        const materializedSignatureIdByInitiallyUnlinkedRowId = this.collectAdCampaignRowSignatureIds(
+          working,
+          initiallyUnlinkedTargetRowIds,
+        );
+        const lockedSignatureIds = new Set(targetSignatureResult.rows.map((row) => row.id));
+        const unlockedMaterializedSignatureIds = Array.from(materializedSignatureIds).filter(
+          (signatureId) => !lockedSignatureIds.has(signatureId),
+        );
+        const existingMaterializedSignatureIds = new Set(targetSignatureResult.rows.map((row) => row.id));
+        if (unlockedMaterializedSignatureIds.length > 0) {
+          const materializedSignatureResult = await client.query<{ id: string; payload: AdCampaignSignature }>(
+            `SELECT id, payload
+             FROM ad_campaign_signatures
+             WHERE id = ANY($1::text[])
+               AND payload->>'storeId' = $2
+            FOR UPDATE`,
+            [unlockedMaterializedSignatureIds, params.storeId],
+          );
+          materializedSignatureResult.rows.forEach((row) => existingMaterializedSignatureIds.add(row.id));
+          this.replaceAdCampaignSignaturesInWorkingSnapshot(
+            working,
+            materializedSignatureResult.rows.map((row) => this.cloneSnapshot(row.payload)),
+          );
+        }
+        const signatureIds = Array.from(materializedSignatureIds);
+
+        const relatedRowResult = await client.query<{ id: string; payload: AdCampaignDailyCost }>(
+          `SELECT id, payload
+           FROM ad_campaign_daily_costs
+           WHERE payload->>'storeId' = $1
+             AND (
+               payload->>'adCampaignSignatureId' = ANY($2::text[])
+               OR id = ANY($3::text[])
+             )
+           FOR UPDATE`,
+          [params.storeId, signatureIds, targetIds],
+        );
+        this.replaceAdCampaignRowsInWorkingSnapshot(
+          working,
+          relatedRowResult.rows.map((row) => this.cloneSnapshot(row.payload)),
+        );
+        this.reapplyAdCampaignMaterializationSideEffects(working, {
+          storeId: params.storeId,
+          materializedSignatureIdByRowId: materializedSignatureIdByInitiallyUnlinkedRowId,
+          signatureIds: existingMaterializedSignatureIds,
+        });
+        this.materializeAdCampaignSignatureIdsInSnapshot(working, params.storeId, targetIds);
+
+        const commitResult = this.applyAdCampaignMappingsToSnapshot(working, {
+          ...params,
+          targetIds,
+        });
+        const touchedCanonicalSalesUnits = this.collectNewCanonicalSalesUnits(working);
+        const updatedSignatures = working.adCampaignSignatures.filter((signature) =>
+          commitResult.signatureIds.includes(signature.id),
+        );
+        const updatedRows = working.adCampaignDailyCosts.filter(
+          (row) => row.adCampaignSignatureId && commitResult.signatureIds.includes(row.adCampaignSignatureId),
+        );
+
+        await this.upsertTableRows(
+          client,
+          { key: "adCampaignSignatures", tableName: "ad_campaign_signatures" },
+          updatedSignatures,
+        );
+        await this.updateTableRowsPayloads(client, "ad_campaign_daily_costs", updatedRows);
+        if (touchedCanonicalSalesUnits.length > 0) {
+          await this.upsertTableRows(
+            client,
+            { key: "canonicalSalesUnits", tableName: "canonical_sales_units" },
+            touchedCanonicalSalesUnits,
+          );
+        }
+        await client.query("COMMIT");
+
+        this.upsertAdCampaignMappingRowsInSnapshot(this.database, {
+          signatures: updatedSignatures,
+          adCampaignDailyCosts: updatedRows,
+          canonicalSalesUnits: touchedCanonicalSalesUnits,
+        });
+
+        return commitResult;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async replaceDailyProfitSummariesCommitted<T>(params: {
+    storeId: string;
+    dates: string[];
+    buildReplacement: (database: DatabaseShape) => DailyProfitSummaryReplacementResult<T>;
+  }): Promise<T | null> {
+    const dates = this.normalizeCommittedDateList(params.dates);
+    if (dates.length === 0) {
+      return null;
+    }
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        const replacement = this.buildDailyProfitSummaryReplacement(draft, {
+          storeId: params.storeId,
+          dates,
+          buildReplacement: params.buildReplacement,
+        });
+        this.replaceDailyProfitSummaryRowsInSnapshot(draft, {
+          storeId: params.storeId,
+          dates,
+          dailySalesUnitProfits: replacement.dailySalesUnitProfits,
+          dailyStoreSummaries: replacement.dailyStoreSummaries,
+        });
+        return replacement.result;
+      });
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const replacement = this.buildDailyProfitSummaryReplacement(this.database, {
+        storeId: params.storeId,
+        dates,
+        buildReplacement: params.buildReplacement,
+      });
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        await this.deleteDailyProfitSummaryRowsFromPostgres(client, params.storeId, dates);
+        await this.upsertTableRows(
+          client,
+          { key: "dailySalesUnitProfits", tableName: "daily_sales_unit_profits" },
+          replacement.dailySalesUnitProfits,
+        );
+        await this.upsertTableRows(
+          client,
+          { key: "dailyStoreSummaries", tableName: "daily_store_summaries" },
+          replacement.dailyStoreSummaries,
+        );
+        await client.query("COMMIT");
+        this.replaceDailyProfitSummaryRowsInSnapshot(this.database, {
+          storeId: params.storeId,
+          dates,
+          dailySalesUnitProfits: replacement.dailySalesUnitProfits,
+          dailyStoreSummaries: replacement.dailyStoreSummaries,
+        });
+        return replacement.result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
+  async removeDailyProfitSummariesCommitted(params: { storeId: string; dates: string[] }): Promise<void> {
+    const dates = this.normalizeCommittedDateList(params.dates);
+    if (dates.length === 0) {
+      return;
+    }
+
+    if (this.storageMode !== "postgres") {
+      await this.writeCommitted((draft) => {
+        this.removeDailyProfitSummaryRowsFromSnapshot(draft, params.storeId, dates);
+      });
+      return;
+    }
+
+    await this.runPostgresCommitted(async () => {
+      const client = await this.getPool().connect();
+      try {
+        await client.query("BEGIN");
+        await this.deleteDailyProfitSummaryRowsFromPostgres(client, params.storeId, dates);
+        await client.query("COMMIT");
+        this.removeDailyProfitSummaryRowsFromSnapshot(this.database, params.storeId, dates);
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
   private async runPostgresCommitted<T>(operationFactory: () => Promise<T>): Promise<T> {
     this.pendingWriteCount += 1;
 
@@ -1457,6 +1887,442 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       return;
     }
     this.database.operations[index] = this.cloneSnapshot(normalized);
+  }
+
+  private normalizeCommittedIdList(ids: string[]): string[] {
+    return Array.from(new Set(ids.filter(Boolean)));
+  }
+
+  private applyOrderManualMappingsToSnapshot(
+    snapshot: DatabaseShape,
+    params: {
+      storeId: string;
+      signatureIds: string[];
+      canonicalSalesUnitId: string;
+      timestamp: string;
+    },
+  ): OrderManualMappingCommitResult {
+    const targetIdSet = new Set(params.signatureIds);
+    const signatures = params.signatureIds.map((signatureId) =>
+      snapshot.orderSourceSignatures.find((item) => item.id === signatureId),
+    );
+    if (signatures.some((signature) => !signature || signature.storeId !== params.storeId)) {
+      throw new Error("ORDER_MANUAL_MAPPING_TARGET_NOT_FOUND");
+    }
+
+    signatures.forEach((signature) => {
+      this.applyOrderManualMappingToSignature(signature!, params);
+    });
+
+    const updatedOrderItems: OrderItem[] = [];
+    snapshot.orderItems.forEach((item) => {
+      if (
+        item.storeId !== params.storeId ||
+        !item.orderSourceSignatureId ||
+        !targetIdSet.has(item.orderSourceSignatureId)
+      ) {
+        return;
+      }
+      this.applyOrderManualMappingToItem(item, params);
+      updatedOrderItems.push(item);
+    });
+
+    return {
+      signatureIds: params.signatureIds,
+      updatedOrderItemCount: updatedOrderItems.length,
+      affectedDates: this.collectAffectedPaymentDates(updatedOrderItems),
+    };
+  }
+
+  private applyOrderManualMappingToSignature(
+    signature: OrderSourceSignature,
+    params: { canonicalSalesUnitId: string; timestamp: string },
+  ): OrderSourceSignature {
+    signature.canonicalSalesUnitId = params.canonicalSalesUnitId;
+    signature.mappingStatus = "MAPPED";
+    signature.confirmedAt = params.timestamp;
+    signature.updatedAt = params.timestamp;
+    return signature;
+  }
+
+  private applyOrderManualMappingToItem(
+    item: OrderItem,
+    params: { canonicalSalesUnitId: string; timestamp: string },
+  ): OrderItem {
+    item.canonicalSalesUnitId = params.canonicalSalesUnitId;
+    item.updatedAt = params.timestamp;
+    return item;
+  }
+
+  private collectAffectedPaymentDates(orderItems: OrderItem[]): string[] {
+    return Array.from(new Set(orderItems.map((item) => item.paymentDate).filter((date): date is string => Boolean(date))))
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  private upsertOrderManualMappingRowsInSnapshot(
+    snapshot: DatabaseShape,
+    params: {
+      signatures: OrderSourceSignature[];
+      orderItems: OrderItem[];
+    },
+  ): void {
+    params.signatures.forEach((signature) => {
+      const index = snapshot.orderSourceSignatures.findIndex((item) => item.id === signature.id);
+      if (index === -1) {
+        snapshot.orderSourceSignatures.push(this.cloneSnapshot(signature));
+        return;
+      }
+      Object.assign(snapshot.orderSourceSignatures[index], this.cloneSnapshot(signature));
+    });
+
+    params.orderItems.forEach((orderItem) => {
+      const index = snapshot.orderItems.findIndex((item) => item.id === orderItem.id);
+      if (index === -1) {
+        snapshot.orderItems.push(this.cloneSnapshot(orderItem));
+        return;
+      }
+      Object.assign(snapshot.orderItems[index], this.cloneSnapshot(orderItem));
+    });
+  }
+
+  private applyAdCampaignMappingsToSnapshot(
+    snapshot: DatabaseShape,
+    params: {
+      storeId: string;
+      targetIds: string[];
+      action: AdCampaignMappingCommitAction;
+    },
+  ): AdCampaignMappingCommitResult {
+    const signatureIds = this.materializeAdCampaignSignatureIdsInSnapshot(
+      snapshot,
+      params.storeId,
+      params.targetIds,
+    );
+    const targetSignatureIdSet = new Set(signatureIds);
+
+    const action = params.action;
+    if (action.type === "RECALCULATE") {
+      recalculateAdCampaignSignaturesForStore(snapshot, params.storeId, {
+        signatureIds: targetSignatureIdSet,
+        applyToRows: true,
+      });
+    } else {
+      snapshot.adCampaignSignatures.forEach((signature) => {
+        if (!targetSignatureIdSet.has(signature.id)) {
+          return;
+        }
+
+        if (action.type === "MANUAL_MAPPED") {
+          signature.canonicalSalesUnitId = action.canonicalSalesUnitId;
+          signature.mappingReason = "MANUAL_MAPPED";
+          signature.reasonNote = null;
+        } else {
+          signature.canonicalSalesUnitId = null;
+          signature.mappingReason = "INTENTIONALLY_UNMAPPED";
+          signature.reasonNote = action.reasonNote;
+        }
+        signature.matchedRuleCount = 0;
+        signature.reasonNoteInherited = false;
+        signature.confirmedAt = action.timestamp;
+        signature.updatedAt = action.timestamp;
+      });
+      applyAdCampaignSignatureToRows(snapshot, {
+        storeId: params.storeId,
+        signatureIds: targetSignatureIdSet,
+      });
+    }
+
+    const updatedRows = snapshot.adCampaignDailyCosts.filter(
+      (row) => row.storeId === params.storeId && row.adCampaignSignatureId && targetSignatureIdSet.has(row.adCampaignSignatureId),
+    );
+
+    return {
+      signatureIds: Array.from(targetSignatureIdSet),
+      updatedAdCampaignDailyCostCount: updatedRows.length,
+      affectedDates: this.collectAffectedAdReportDates(updatedRows),
+    };
+  }
+
+  private materializeAdCampaignSignatureIdsInSnapshot(
+    snapshot: DatabaseShape,
+    storeId: string,
+    ids: string[],
+  ): Set<string> {
+    const directSignatureIds = new Set(
+      ids.filter((id) =>
+        snapshot.adCampaignSignatures.some((signature) => signature.id === id && signature.storeId === storeId),
+      ),
+    );
+    const rowIds = ids.filter((id) =>
+      snapshot.adCampaignDailyCosts.some((row) => row.id === id && row.storeId === storeId),
+    );
+    const materializedFromRows = ensureAdCampaignSignaturesForStore(snapshot, storeId, rowIds);
+
+    snapshot.adCampaignDailyCosts.forEach((row) => {
+      if (row.storeId === storeId && rowIds.includes(row.id) && row.adCampaignSignatureId) {
+        materializedFromRows.add(row.adCampaignSignatureId);
+      }
+    });
+
+    return new Set([...directSignatureIds, ...materializedFromRows]);
+  }
+
+  private createAdCampaignMappingWorkingSnapshot(params: {
+    storeId: string;
+    signatures: AdCampaignSignature[];
+    rows: AdCampaignDailyCost[];
+  }): DatabaseShape {
+    const snapshot = createEmptyDatabase();
+    snapshot.stores = this.database.stores
+      .filter((store) => store.id === params.storeId)
+      .map((store) => this.cloneSnapshot(store));
+    snapshot.canonicalSalesUnits = this.database.canonicalSalesUnits
+      .filter((salesUnit) => salesUnit.storeId === params.storeId)
+      .map((salesUnit) => this.cloneSnapshot(salesUnit));
+    snapshot.campaignMappings = this.database.campaignMappings
+      .filter((mapping) => mapping.storeId === params.storeId)
+      .map((mapping) => this.cloneSnapshot(mapping));
+
+    const signatureById = new Map<string, AdCampaignSignature>();
+    params.signatures.forEach((signature) => signatureById.set(signature.id, this.cloneSnapshot(signature)));
+    const rowSignatureIds = new Set(
+      params.rows.map((row) => row.adCampaignSignatureId).filter((id): id is string => Boolean(id)),
+    );
+    const rowSignatureKeys = new Set(params.rows.map((row) => this.getAdCampaignRowSignatureKey(row)));
+    this.database.adCampaignSignatures.forEach((signature) => {
+      if (
+        signature.storeId === params.storeId &&
+        (rowSignatureIds.has(signature.id) || rowSignatureKeys.has(this.getAdCampaignSignatureKey(signature)))
+      ) {
+        signatureById.set(signature.id, this.cloneSnapshot(signature));
+      }
+    });
+
+    snapshot.adCampaignSignatures = Array.from(signatureById.values());
+    snapshot.adCampaignDailyCosts = params.rows.map((row) => this.cloneSnapshot(row));
+    return snapshot;
+  }
+
+  private replaceAdCampaignRowsInWorkingSnapshot(
+    snapshot: DatabaseShape,
+    rows: AdCampaignDailyCost[],
+  ): void {
+    const materializedSignatureIdsByRowId = new Map(
+      snapshot.adCampaignDailyCosts
+        .filter((row) => row.adCampaignSignatureId)
+        .map((row) => [row.id, row.adCampaignSignatureId!]),
+    );
+
+    snapshot.adCampaignDailyCosts = rows.map((row) => {
+      const next = this.cloneSnapshot(row);
+      next.adCampaignSignatureId = next.adCampaignSignatureId ?? materializedSignatureIdsByRowId.get(next.id) ?? null;
+      return next;
+    });
+  }
+
+  private replaceAdCampaignSignaturesInWorkingSnapshot(
+    snapshot: DatabaseShape,
+    signatures: AdCampaignSignature[],
+  ): void {
+    signatures.forEach((signature) => {
+      const index = snapshot.adCampaignSignatures.findIndex((item) => item.id === signature.id);
+      if (index === -1) {
+        snapshot.adCampaignSignatures.push(this.cloneSnapshot(signature));
+        return;
+      }
+      snapshot.adCampaignSignatures[index] = this.cloneSnapshot(signature);
+    });
+  }
+
+  private collectAdCampaignRowSignatureIds(
+    snapshot: DatabaseShape,
+    rowIds: Set<string>,
+  ): Map<string, string> {
+    const signatureIdsByRowId = new Map<string, string>();
+    snapshot.adCampaignDailyCosts.forEach((row) => {
+      if (rowIds.has(row.id) && row.adCampaignSignatureId) {
+        signatureIdsByRowId.set(row.id, row.adCampaignSignatureId);
+      }
+    });
+    return signatureIdsByRowId;
+  }
+
+  private reapplyAdCampaignMaterializationSideEffects(
+    snapshot: DatabaseShape,
+    params: {
+      storeId: string;
+      materializedSignatureIdByRowId: Map<string, string>;
+      signatureIds: Set<string>;
+    },
+  ): void {
+    const rowIdsToRematerialize = Array.from(params.materializedSignatureIdByRowId.entries())
+      .filter(([, signatureId]) => params.signatureIds.has(signatureId))
+      .map(([rowId]) => rowId);
+    if (rowIdsToRematerialize.length === 0) {
+      return;
+    }
+
+    const rowIdSet = new Set(rowIdsToRematerialize);
+    snapshot.adCampaignDailyCosts.forEach((row) => {
+      if (row.storeId === params.storeId && rowIdSet.has(row.id)) {
+        row.adCampaignSignatureId = null;
+      }
+    });
+    ensureAdCampaignSignaturesForStore(snapshot, params.storeId, rowIdSet);
+  }
+
+  private collectNewCanonicalSalesUnits(snapshot: DatabaseShape): CanonicalSalesUnit[] {
+    const existingIds = new Set(this.database.canonicalSalesUnits.map((salesUnit) => salesUnit.id));
+    return snapshot.canonicalSalesUnits
+      .filter((salesUnit) => !existingIds.has(salesUnit.id))
+      .map((salesUnit) => this.cloneSnapshot(salesUnit));
+  }
+
+  private upsertCanonicalSalesUnitInSnapshot(snapshot: DatabaseShape, salesUnit: CanonicalSalesUnit): void {
+    const index = snapshot.canonicalSalesUnits.findIndex((item) => item.id === salesUnit.id);
+    if (index === -1) {
+      snapshot.canonicalSalesUnits.push(this.cloneSnapshot(salesUnit));
+      return;
+    }
+    Object.assign(snapshot.canonicalSalesUnits[index], this.cloneSnapshot(salesUnit));
+  }
+
+  private upsertAuditLogInSnapshot(snapshot: DatabaseShape, auditLog: DatabaseShape["auditLogs"][number]): void {
+    const index = snapshot.auditLogs.findIndex((item) => item.id === auditLog.id);
+    if (index === -1) {
+      snapshot.auditLogs.push(this.cloneSnapshot(auditLog));
+      return;
+    }
+    Object.assign(snapshot.auditLogs[index], this.cloneSnapshot(auditLog));
+  }
+
+  private collectAffectedAdReportDates(rows: AdCampaignDailyCost[]): string[] {
+    return Array.from(new Set(rows.map((row) => row.reportDate).filter(Boolean))).sort((left, right) =>
+      left.localeCompare(right),
+    );
+  }
+
+  private upsertAdCampaignMappingRowsInSnapshot(
+    snapshot: DatabaseShape,
+    params: {
+      signatures: AdCampaignSignature[];
+      adCampaignDailyCosts: AdCampaignDailyCost[];
+      canonicalSalesUnits: CanonicalSalesUnit[];
+    },
+  ): void {
+    params.canonicalSalesUnits.forEach((salesUnit) => {
+      const index = snapshot.canonicalSalesUnits.findIndex((item) => item.id === salesUnit.id);
+      if (index === -1) {
+        snapshot.canonicalSalesUnits.push(this.cloneSnapshot(salesUnit));
+        return;
+      }
+      Object.assign(snapshot.canonicalSalesUnits[index], this.cloneSnapshot(salesUnit));
+    });
+
+    params.signatures.forEach((signature) => {
+      const index = snapshot.adCampaignSignatures.findIndex((item) => item.id === signature.id);
+      if (index === -1) {
+        snapshot.adCampaignSignatures.push(this.cloneSnapshot(signature));
+        return;
+      }
+      Object.assign(snapshot.adCampaignSignatures[index], this.cloneSnapshot(signature));
+    });
+
+    params.adCampaignDailyCosts.forEach((row) => {
+      const index = snapshot.adCampaignDailyCosts.findIndex((item) => item.id === row.id);
+      if (index === -1) {
+        snapshot.adCampaignDailyCosts.push(this.cloneSnapshot(row));
+        return;
+      }
+      Object.assign(snapshot.adCampaignDailyCosts[index], this.cloneSnapshot(row));
+    });
+  }
+
+  private normalizeCommittedDateList(dates: string[]): string[] {
+    return Array.from(new Set(dates.filter(Boolean))).sort((left, right) => left.localeCompare(right));
+  }
+
+  private assertDailyProfitSummaryScope(
+    storeId: string,
+    dates: string[],
+    dailySalesUnitProfits: StoredDailySalesUnitProfit[],
+    dailyStoreSummaries: StoredDailyStoreSummary[],
+  ): void {
+    const dateSet = new Set(dates);
+    const isOutOfScopeSalesUnitRow = dailySalesUnitProfits.some(
+      (row) => row.storeId !== storeId || !dateSet.has(row.date),
+    );
+    const isOutOfScopeStoreSummaryRow = dailyStoreSummaries.some(
+      (row) => row.storeId !== storeId || !dateSet.has(row.date),
+    );
+    if (isOutOfScopeSalesUnitRow || isOutOfScopeStoreSummaryRow) {
+      throw new Error("DAILY_PROFIT_SUMMARY_SCOPE_MISMATCH");
+    }
+  }
+
+  private buildDailyProfitSummaryReplacement<T>(
+    snapshot: DatabaseShape,
+    params: {
+      storeId: string;
+      dates: string[];
+      buildReplacement: (database: DatabaseShape) => DailyProfitSummaryReplacementResult<T>;
+    },
+  ): DailyProfitSummaryReplacementResult<T> {
+    const replacement = params.buildReplacement(snapshot);
+    this.assertDailyProfitSummaryScope(
+      params.storeId,
+      params.dates,
+      replacement.dailySalesUnitProfits,
+      replacement.dailyStoreSummaries,
+    );
+    return replacement;
+  }
+
+  private async deleteDailyProfitSummaryRowsFromPostgres(
+    client: PoolClient,
+    storeId: string,
+    dates: string[],
+  ): Promise<void> {
+    await client.query(
+      `DELETE FROM daily_sales_unit_profits
+       WHERE payload->>'storeId' = $1
+         AND payload->>'date' = ANY($2::text[])`,
+      [storeId, dates],
+    );
+    await client.query(
+      `DELETE FROM daily_store_summaries
+       WHERE payload->>'storeId' = $1
+         AND payload->>'date' = ANY($2::text[])`,
+      [storeId, dates],
+    );
+  }
+
+  private replaceDailyProfitSummaryRowsInSnapshot(
+    snapshot: DatabaseShape,
+    params: {
+      storeId: string;
+      dates: string[];
+      dailySalesUnitProfits: StoredDailySalesUnitProfit[];
+      dailyStoreSummaries: StoredDailyStoreSummary[];
+    },
+  ): void {
+    this.removeDailyProfitSummaryRowsFromSnapshot(snapshot, params.storeId, params.dates);
+    snapshot.dailySalesUnitProfits.push(...this.cloneSnapshot(params.dailySalesUnitProfits));
+    snapshot.dailyStoreSummaries.push(...this.cloneSnapshot(params.dailyStoreSummaries));
+  }
+
+  private removeDailyProfitSummaryRowsFromSnapshot(
+    snapshot: DatabaseShape,
+    storeId: string,
+    dates: string[],
+  ): void {
+    const dateSet = new Set(dates);
+    snapshot.dailySalesUnitProfits = snapshot.dailySalesUnitProfits.filter(
+      (row) => row.storeId !== storeId || !dateSet.has(row.date),
+    );
+    snapshot.dailyStoreSummaries = snapshot.dailyStoreSummaries.filter(
+      (row) => row.storeId !== storeId || !dateSet.has(row.date),
+    );
   }
 
   private normalizeOperationRecord(operation: OperationRecord | Partial<OperationRecord>): OperationRecord {
@@ -2083,6 +2949,36 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
              payload_hash = EXCLUDED.payload_hash,
              updated_at = NOW()
          WHERE ${table.tableName}.payload_hash IS DISTINCT FROM EXCLUDED.payload_hash`,
+        values,
+      );
+    }
+  }
+
+  private async updateTableRowsPayloads(
+    client: PoolClient,
+    tableName: string,
+    rows: Array<{ id: string }>,
+  ): Promise<void> {
+    for (let offset = 0; offset < rows.length; offset += POSTGRES_UPSERT_BATCH_SIZE) {
+      const batch = rows.slice(offset, offset + POSTGRES_UPSERT_BATCH_SIZE);
+      if (batch.length === 0) {
+        continue;
+      }
+
+      const values: unknown[] = [];
+      const tuples = batch.map((row, index) => {
+        const parameterIndex = index * 3;
+        values.push(row.id, JSON.stringify(row), hashPayload(row));
+        return `($${parameterIndex + 1}, $${parameterIndex + 2}::jsonb, $${parameterIndex + 3})`;
+      });
+
+      await client.query(
+        `UPDATE ${tableName} AS target
+         SET payload = source.payload,
+             payload_hash = source.payload_hash,
+             updated_at = NOW()
+         FROM (VALUES ${tuples.join(", ")}) AS source(id, payload, payload_hash)
+         WHERE target.id = source.id`,
         values,
       );
     }

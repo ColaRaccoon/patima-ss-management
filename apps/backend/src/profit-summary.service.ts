@@ -156,41 +156,85 @@ export class ProfitSummaryService {
   }) {
     const dates = this.normalizeDates(params.dates);
     ensureStoreExists(this.databaseService.getSnapshot(), params.storeId);
+    if (dates.length === 0) {
+      return formatApiSuccess({
+        recalculatedDateCount: 0,
+        salesUnitRowCount: 0,
+        storeSummaryRowCount: 0,
+        reason: params.reason,
+      });
+    }
+
     const calculatedAt = nowIso();
     let salesUnitRowCount = 0;
     let storeSummaryRowCount = 0;
 
-    await this.databaseService.writeCommitted((draft) => {
-      const salesUnitRows = dates.flatMap((date) =>
-        this.createStoredSalesUnitRows({
-          database: draft,
-          storeId: params.storeId,
-          date,
-          calculatedAt,
-        }),
-      );
-      const storeSummaryRows = dates.map((date) =>
-        this.createStoredStoreSummaryRow({
-          database: draft,
-          storeId: params.storeId,
-          date,
-          calculatedAt,
-        }),
-      );
+    if (this.databaseService.getStorageMode() === "postgres") {
+      const result = await this.databaseService.replaceDailyProfitSummariesCommitted({
+        storeId: params.storeId,
+        dates,
+        buildReplacement: (database) => {
+          const dailySalesUnitProfits = dates.flatMap((date) =>
+            this.createStoredSalesUnitRows({
+              database,
+              storeId: params.storeId,
+              date,
+              calculatedAt,
+            }),
+          );
+          const dailyStoreSummaries = dates.map((date) =>
+            this.createStoredStoreSummaryRow({
+              database,
+              storeId: params.storeId,
+              date,
+              calculatedAt,
+            }),
+          );
+          return {
+            dailySalesUnitProfits,
+            dailyStoreSummaries,
+            result: {
+              salesUnitRowCount: dailySalesUnitProfits.length,
+              storeSummaryRowCount: dailyStoreSummaries.length,
+            },
+          };
+        },
+      });
+      salesUnitRowCount = result?.salesUnitRowCount ?? 0;
+      storeSummaryRowCount = result?.storeSummaryRowCount ?? 0;
+    } else {
+      await this.databaseService.writeCommitted((draft) => {
+        const salesUnitRows = dates.flatMap((date) =>
+          this.createStoredSalesUnitRows({
+            database: draft,
+            storeId: params.storeId,
+            date,
+            calculatedAt,
+          }),
+        );
+        const storeSummaryRows = dates.map((date) =>
+          this.createStoredStoreSummaryRow({
+            database: draft,
+            storeId: params.storeId,
+            date,
+            calculatedAt,
+          }),
+        );
 
-      const dateSet = new Set(dates);
-      draft.dailySalesUnitProfits = draft.dailySalesUnitProfits.filter(
-        (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
-      );
-      draft.dailyStoreSummaries = draft.dailyStoreSummaries.filter(
-        (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
-      );
+        const dateSet = new Set(dates);
+        draft.dailySalesUnitProfits = draft.dailySalesUnitProfits.filter(
+          (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
+        );
+        draft.dailyStoreSummaries = draft.dailyStoreSummaries.filter(
+          (row) => row.storeId !== params.storeId || !dateSet.has(row.date),
+        );
 
-      draft.dailySalesUnitProfits.push(...salesUnitRows);
-      draft.dailyStoreSummaries.push(...storeSummaryRows);
-      salesUnitRowCount = salesUnitRows.length;
-      storeSummaryRowCount = storeSummaryRows.length;
-    });
+        draft.dailySalesUnitProfits.push(...salesUnitRows);
+        draft.dailyStoreSummaries.push(...storeSummaryRows);
+        salesUnitRowCount = salesUnitRows.length;
+        storeSummaryRowCount = storeSummaryRows.length;
+      });
+    }
 
     return formatApiSuccess({
       recalculatedDateCount: dates.length,
@@ -209,6 +253,17 @@ export class ProfitSummaryService {
     if (dates.length === 0) {
       return formatApiSuccess({
         invalidatedDateCount: 0,
+        reason: params.reason,
+      });
+    }
+
+    if (this.databaseService.getStorageMode() === "postgres") {
+      await this.databaseService.removeDailyProfitSummariesCommitted({
+        storeId: params.storeId,
+        dates,
+      });
+      return formatApiSuccess({
+        invalidatedDateCount: dates.length,
         reason: params.reason,
       });
     }

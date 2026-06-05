@@ -65,8 +65,10 @@ Add `--yes` only after creating a fresh snapshot and stopping the backend.
 
 - If `DATABASE_URL` exists, PostgreSQL is the primary storage provider.
 - If `DATABASE_URL` is missing, the backend falls back to `apps/backend/data/database.json`.
-- Write APIs use committed persistence for the main mutation paths: a successful PostgreSQL write response means the snapshot transaction committed, and file fallback writes through a temporary file before rename.
-- PostgreSQL runtime persistence keeps the `id + payload JSONB` tables but writes changed snapshots with row-level upsert/delete and `payload_hash`; full PC sync remains `scripts/db-export.mjs` / `scripts/db-import.mjs`.
+- Runtime PostgreSQL storage is one row per record in `id + payload JSONB + payload_hash + updated_at` tables. The backend still loads a `DatabaseShape` memory snapshot on startup for shared business logic and file-mode parity.
+- General write APIs use committed persistence: a successful PostgreSQL write response means the snapshot transaction committed, and file fallback writes through a temporary file before rename.
+- Manual order/ad mapping hot paths now bypass full `DatabaseShape` snapshot persistence in PostgreSQL mode. They lock and update only selected signature/row payloads, update `payload_hash`, refresh the same rows in memory, and replace only affected daily profit summary dates.
+- PostgreSQL runtime snapshot persistence keeps the JSONB payload tables but writes changed snapshots with row-level upsert/delete and `payload_hash`; full PC sync remains `scripts/db-export.mjs` / `scripts/db-import.mjs`.
 - DB maintenance scripts cover size reporting, manual order raw payload pruning, audit log archiving, operation archiving, and restore rehearsal. See `scripts/README.md` and `DB_RESTORE_RUNBOOK.md`.
 - If matching `NAVER_*` values exist, the backend bootstraps a Smart Store record and seller credential automatically.
 - Credential test now issues a real SELLER token and checks seller account/channel endpoints.
