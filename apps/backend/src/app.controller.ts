@@ -30,7 +30,34 @@ import { ProfitService } from "./profit.service";
 import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
-import { formatApiSuccess } from "./helpers";
+import { ensureStoreExists, formatApiSuccess } from "./helpers";
+
+const formatCompactExportDate = (date: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!match) {
+    return date.replace(/\D/g, "").slice(-6) || date;
+  }
+
+  return `${match[1].slice(2)}${match[2]}${match[3]}`;
+};
+
+const sanitizeExportFilenamePart = (value: string | null | undefined, fallback: string) => {
+  const sanitized = (value ?? fallback)
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/[\r\n\t]/g, " ")
+    .replace(/\s+/g, " ");
+
+  return sanitized || fallback;
+};
+
+const buildExportContentDisposition = (filename: string) => {
+  const fallback = filename
+    .replace(/[^\x20-\x7e]/g, "_")
+    .replace(/["\\]/g, "_");
+
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+};
 
 const normalizeFakePurchaseAmount = (value: number | string | null | undefined): number => {
   if (value == null || value === "") {
@@ -607,7 +634,12 @@ export class AppController {
     );
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename=profit-daily-rows-${storeId}-${dateFrom}-${dateTo}.xlsx`,
+      buildExportContentDisposition(
+        `${formatCompactExportDate(dateTo)}_${sanitizeExportFilenamePart(
+          ensureStoreExists(this.databaseService.getSnapshot(), storeId).name,
+          storeId,
+        )}_성과.xlsx`,
+      ),
     );
     res.setHeader("Content-Length", buffer.length.toString());
     res.end(buffer);

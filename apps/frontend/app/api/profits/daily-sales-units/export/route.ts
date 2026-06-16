@@ -1,8 +1,36 @@
 import { buildUpstreamEndpoint } from "@/lib/api/upstream";
 
+const formatCompactDate = (date: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!match) {
+    return date.replace(/\D/g, "").slice(-6) || date;
+  }
+
+  return `${match[1].slice(2)}${match[2]}${match[3]}`;
+};
+
+const sanitizeFilenamePart = (value: string | null, fallback: string) => {
+  const sanitized = (value ?? fallback)
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/[\r\n\t]/g, " ")
+    .replace(/\s+/g, " ");
+
+  return sanitized || fallback;
+};
+
+const buildContentDisposition = (filename: string) => {
+  const fallback = filename
+    .replace(/[^\x20-\x7e]/g, "_")
+    .replace(/["\\]/g, "_");
+
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+};
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const storeId = searchParams.get("storeId");
+  const storeName = searchParams.get("storeName");
   const dateFrom = searchParams.get("dateFrom");
   const dateTo = searchParams.get("dateTo");
   const canonicalSalesUnitId = searchParams.get("canonicalSalesUnitId");
@@ -33,13 +61,13 @@ export async function GET(request: Request) {
   }
 
   const buffer = await response.arrayBuffer();
-  const filename = `profit-daily-rows-${storeId}-${dateFrom}-${dateTo}.xlsx`;
+  const filename = `${formatCompactDate(dateTo)}_${sanitizeFilenamePart(storeName, storeId)}_성과.xlsx`;
 
   return new Response(buffer, {
     status: 200,
     headers: {
       "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Disposition": buildContentDisposition(filename),
     },
   });
 }

@@ -135,7 +135,7 @@ export function TopHeader({ shellData }: { shellData: ShellData }) {
               선택 스토어
             </div>
             <select
-              className="input-shell mt-2 h-9 text-sm"
+              className="input-shell mt-2 min-h-11 text-sm leading-5"
               value={store?.id ?? ""}
               onChange={(event) => handleStoreChange(event.target.value)}
               disabled={shellData.stores.length === 0}

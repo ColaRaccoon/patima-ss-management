@@ -102,6 +102,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
 
     const searchParams = new URLSearchParams({
       storeId: data.primaryStore.id,
+      storeName: data.primaryStore.name,
       dateFrom: data.dateFrom,
       dateTo: data.dateTo,
     });
