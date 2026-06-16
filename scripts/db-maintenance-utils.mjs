@@ -8,7 +8,7 @@ dotenv.config();
 
 export const SNAPSHOT_SCHEMA_VERSION = 3;
 export const SNAPSHOT_FORMAT = 'jsonb-payload-v2';
-export const DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS = 90;
+export const DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS = 0;
 export const DEFAULT_AUDIT_LOG_RETENTION_DAYS = 180;
 export const DEFAULT_OPERATION_RETENTION_DAYS = 90;
 export const DEFAULT_ARCHIVE_DIR = './backups/archive';
@@ -267,4 +267,3 @@ export const formatBytes = (bytes) => `${Number(bytes || 0).toLocaleString()} by
 export const printDryRunBanner = (isDryRun) => {
   console.log(isDryRun ? 'Mode: dry-run (no changes; add --yes to execute)' : 'Mode: EXECUTE (--yes)');
 };
-

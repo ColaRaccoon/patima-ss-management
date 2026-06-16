@@ -362,7 +362,10 @@ export class CampaignMappingService implements OnModuleInit {
 
   async recalculate(storeId: string) {
     await this.databaseService.writeCommitted((draft) => {
-      recalculateAdCampaignSignaturesForStore(draft, storeId, { onlyUnconfirmed: true });
+      recalculateAdCampaignSignaturesForStore(draft, storeId, {
+        onlyUnconfirmed: true,
+        applyToRows: true,
+      });
     });
     await this.recalculateProfitSummariesForAdDates(storeId);
 

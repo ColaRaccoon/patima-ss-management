@@ -46,7 +46,7 @@ export interface SyncedOrderItemInput {
   rawStatus: string;
   saleStatus: SaleStatus;
   packageNumber: string | null;
-  rawPayload: Record<string, unknown>;
+  rawPayload: Record<string, unknown> | null;
 }
 
 interface CachedSellerToken {
@@ -273,7 +273,12 @@ export class NaverCommerceService {
     };
   }
 
-  async fetchOrderItems(storeId: string, dateFrom: string, dateTo: string): Promise<SyncedOrderItemInput[]> {
+  async fetchOrderItems(
+    storeId: string,
+    dateFrom: string,
+    dateTo: string,
+    options?: { includeRawPayload?: boolean },
+  ): Promise<SyncedOrderItemInput[]> {
     const resolved = this.getResolvedConfiguration(storeId);
     if (!resolved) {
       throw new BadRequestException("NAVER_CREDENTIALS_NOT_CONFIGURED");
@@ -299,8 +304,10 @@ export class NaverCommerceService {
 
     const details = await this.fetchOrderDetails(resolved.store, resolved.credential, uniqueIds);
 
+    const includeRawPayload = options?.includeRawPayload === true;
+
     return details
-      .map((detail) => this.normalizeOrderDetail(detail, undefined))
+      .map((detail) => this.normalizeOrderDetail(detail, undefined, { includeRawPayload }))
       .filter((item): item is SyncedOrderItemInput => !!item);
   }
 
@@ -474,6 +481,7 @@ export class NaverCommerceService {
   private normalizeOrderDetail(
     detailEnvelope: JsonRecord,
     changedOrder: JsonRecord | undefined,
+    options?: { includeRawPayload?: boolean },
   ): SyncedOrderItemInput | null {
     const productOrder = isRecord(detailEnvelope.productOrder) ? detailEnvelope.productOrder : detailEnvelope;
     const order = isRecord(detailEnvelope.order)
@@ -576,10 +584,12 @@ export class NaverCommerceService {
       rawStatus,
       saleStatus: saleStatusFromNaverState(productOrderStatus, claimStatus),
       packageNumber: pickString(productOrder.packageNumber, delivery?.packageNumber, detailEnvelope.packageNumber),
-      rawPayload: {
-        changedOrder: changedOrder ?? null,
-        detail: detailEnvelope,
-      },
+      rawPayload: options?.includeRawPayload === true
+        ? {
+            changedOrder: changedOrder ?? null,
+            detail: detailEnvelope,
+          }
+        : null,
     };
 
     // optionManageCode가 있으면 추가 (빈 문자열은 제외)

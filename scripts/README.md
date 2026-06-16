@@ -96,8 +96,8 @@ node scripts/report-db-size.mjs > backups/db-size-baseline.txt
 기본은 dry-run입니다.
 
 ```powershell
-node scripts/prune-order-raw-payloads.mjs --days 90
-node scripts/prune-order-raw-payloads.mjs --days 90 --yes
+node scripts/prune-order-raw-payloads.mjs --days 0
+node scripts/prune-order-raw-payloads.mjs --days 0 --yes
 ```
 
 동작:
@@ -113,8 +113,8 @@ node scripts/prune-order-raw-payloads.mjs --days 90 --yes
 
 1. 백업/export: `node scripts/db-export.mjs`로 최신 snapshot을 남기고, 필요하면 `node scripts/report-db-size.mjs > backups/db-size-before-raw-payload-prune.txt`도 저장합니다.
 2. backend 중지: `--yes` 실행 중에는 runtime write와 겹치지 않도록 backend를 중지하는 것을 권장합니다. 스크립트도 localhost backend 응답을 감지하면 경고합니다.
-3. dry-run: `node scripts/prune-order-raw-payloads.mjs --days 90`으로 대상 row 수를 확인합니다.
-4. 승인 실행: dry-run 결과와 백업을 확인한 뒤에만 `node scripts/prune-order-raw-payloads.mjs --days 90 --yes`를 실행합니다.
+3. dry-run: `node scripts/prune-order-raw-payloads.mjs --days 0`으로 대상 row 수를 확인합니다.
+4. 승인 실행: dry-run 결과와 백업을 확인한 뒤에만 `node scripts/prune-order-raw-payloads.mjs --days 0 --yes`를 실행합니다.
 5. 실행 후 report: `node scripts/report-db-size.mjs`로 `orders` / `order_items` rawPayload null/non-null count와 payload size 변화를 확인합니다.
 
 `--yes`는 실제 DB payload를 변경하므로 자동화나 검증 작업에서 임의로 실행하지 않습니다.
@@ -149,7 +149,7 @@ node scripts/prune-operations.mjs --days 90 --prune-failed --yes
 ## 환경변수
 
 ```env
-ORDER_RAW_PAYLOAD_RETENTION_DAYS=90
+ORDER_RAW_PAYLOAD_RETENTION_DAYS=0
 AUDIT_LOG_RETENTION_DAYS=180
 OPERATION_RETENTION_DAYS=90
 DB_ARCHIVE_DIR=./backups/archive

@@ -231,13 +231,16 @@ export class OrderSyncService implements OnModuleInit {
         throw new BadRequestException("NAVER_CREDENTIALS_NOT_CONFIGURED");
       }
 
-      const liveEntries = liveEnabled
-        ? await this.naverCommerceService.fetchOrderItems(storeId, dateFrom, dateTo)
-        : null;
-      const entries = liveEntries ?? this.generateMockItems(dateFrom, dateTo);
-      const syncSource = liveEnabled ? "NAVER_LIVE" : "MOCK_FALLBACK";
       const rawPayloadRetentionDays = getOrderRawPayloadRetentionDays();
       const rawPayloadRetentionCutoffDate = getKstRetentionCutoffDate(rawPayloadRetentionDays);
+      const includeRawPayload = rawPayloadRetentionDays > 0;
+      const liveEntries = liveEnabled
+        ? await this.naverCommerceService.fetchOrderItems(storeId, dateFrom, dateTo, {
+            includeRawPayload,
+          })
+        : null;
+      const entries = liveEntries ?? this.generateMockItems(dateFrom, dateTo, { includeRawPayload });
+      const syncSource = liveEnabled ? "NAVER_LIVE" : "MOCK_FALLBACK";
 
       let ordersUpserted = 0;
       let orderItemsUpserted = 0;
@@ -253,13 +256,15 @@ export class OrderSyncService implements OnModuleInit {
 
         entries.forEach((entry) => {
           const rawPayloadReferenceDate = getSyncedOrderItemRetentionDate(entry);
-          const retainedRawPayload = shouldRetainOrderRawPayload(
-            rawPayloadReferenceDate,
-            rawPayloadRetentionCutoffDate,
-            rawPayloadRetentionDays,
-          )
-            ? entry.rawPayload
-            : null;
+          const retainedRawPayload =
+            entry.rawPayload &&
+            shouldRetainOrderRawPayload(
+              rawPayloadReferenceDate,
+              rawPayloadRetentionCutoffDate,
+              rawPayloadRetentionDays,
+            )
+              ? entry.rawPayload
+              : null;
           const product = this.upsertProduct(draft, storeId, entry);
           const existingSignature = draft.orderSourceSignatures.find(
             (item) =>
@@ -710,7 +715,11 @@ export class OrderSyncService implements OnModuleInit {
     };
   }
 
-  private generateMockItems(dateFrom: string, dateTo: string): SyncedOrderItemInput[] {
+  private generateMockItems(
+    dateFrom: string,
+    dateTo: string,
+    options?: { includeRawPayload?: boolean },
+  ): SyncedOrderItemInput[] {
     const start = new Date(`${dateFrom}T00:00:00+09:00`);
     const end = new Date(`${dateTo}T00:00:00+09:00`);
     const items: SyncedOrderItemInput[] = [];
@@ -761,11 +770,13 @@ export class OrderSyncService implements OnModuleInit {
           rawStatus,
           saleStatus,
           packageNumber: `PKG-${externalOrderId}`,
-          rawPayload: {
-            originalOrderStatus: rawStatus,
-            claimStatus: rawStatus === "CANCEL_REQUEST" ? "CANCEL_REQUEST" : null,
-            productOrderStatus: rawStatus,
-          },
+          rawPayload: options?.includeRawPayload === true
+            ? {
+                originalOrderStatus: rawStatus,
+                claimStatus: rawStatus === "CANCEL_REQUEST" ? "CANCEL_REQUEST" : null,
+                productOrderStatus: rawStatus,
+              }
+            : null,
         });
       });
     }

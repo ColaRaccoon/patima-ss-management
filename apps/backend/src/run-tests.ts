@@ -864,6 +864,12 @@ const createOrderSyncServiceHarness = (params?: {
     operationType: string;
     requestJson: Record<string, unknown>;
   }> = [];
+  const fetchOrderItemsCalls: Array<{
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+    options?: { includeRawPayload?: boolean };
+  }> = [];
   const retryExecutors = new Map<string, (operation: Record<string, unknown>) => unknown>();
   const configuredStoreIds = new Set(params?.configuredStoreIds ?? ["store-live"]);
   const inFlightStoreIds = new Set(params?.inFlightStoreIds ?? []);
@@ -907,7 +913,13 @@ const createOrderSyncServiceHarness = (params?: {
     {
       getResolvedConfiguration: (storeId: string) =>
         configuredStoreIds.has(storeId) ? { store: { id: storeId }, credential: {} } : null,
-      fetchOrderItems: () => {
+      fetchOrderItems: (
+        storeId: string,
+        dateFrom: string,
+        dateTo: string,
+        options?: { includeRawPayload?: boolean },
+      ) => {
+        fetchOrderItemsCalls.push({ storeId, dateFrom, dateTo, options });
         if (params?.liveOrderItems) {
           return params.liveOrderItems;
         }
@@ -917,7 +929,14 @@ const createOrderSyncServiceHarness = (params?: {
     profitSummaryService,
   );
 
-  return { databaseService, orderSyncService, enqueueCalls, retryExecutors, profitSummaryService };
+  return {
+    databaseService,
+    orderSyncService,
+    enqueueCalls,
+    fetchOrderItemsCalls,
+    retryExecutors,
+    profitSummaryService,
+  };
 };
 
 const createSyncedOrderItemInput = (params: {
@@ -925,7 +944,7 @@ const createSyncedOrderItemInput = (params: {
   externalProductOrderId: string;
   date: string;
   paymentDate?: string | null;
-  rawPayload?: Record<string, unknown>;
+  rawPayload?: Record<string, unknown> | null;
   rawProductName?: string;
   optionCode?: string | null;
   optionManageCode?: string;
@@ -961,7 +980,7 @@ const createSyncedOrderItemInput = (params: {
     rawStatus: "DELIVERED",
     saleStatus: "SALE",
     packageNumber: `PKG-${params.externalOrderId}`,
-    rawPayload: params.rawPayload ?? { source: params.externalProductOrderId },
+    rawPayload: params.rawPayload === undefined ? { source: params.externalProductOrderId } : params.rawPayload,
   };
 };
 
@@ -1565,6 +1584,20 @@ runAsync("OrderSyncService enqueueSyncAll rejects manual ranges over 30 days", a
   await assert.rejects(() => orderSyncService.enqueueSyncAll("2026-01-01", "2026-02-01"));
 });
 
+run("ORDER_RAW_PAYLOAD_RETENTION_DAYS defaults to zero", () => {
+  const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+  try {
+    delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+    assert.equal(getOrderRawPayloadRetentionDays(), 0);
+  } finally {
+    if (original === undefined) {
+      delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+    } else {
+      process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = original;
+    }
+  }
+});
+
 run("ORDER_RAW_PAYLOAD_RETENTION_DAYS accepts only non-negative integers", () => {
   const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
   try {
@@ -1593,7 +1626,7 @@ runAsync("OrderSyncService retains recent rawPayloads and prunes only expired st
   const recentDate = getKstRetentionCutoffDate(0);
   const oldDate = getKstRetentionCutoffDate(2);
   const cutoffDate = getKstRetentionCutoffDate(1);
-  const { databaseService, orderSyncService } = createOrderSyncServiceHarness({
+  const { databaseService, orderSyncService, fetchOrderItemsCalls } = createOrderSyncServiceHarness({
     stores: [createStoreRecord("store-1", "Main Store"), createStoreRecord("store-2", "Other Store")],
     configuredStoreIds: ["store-1"],
     liveOrderItems: [
@@ -1795,6 +1828,7 @@ runAsync("OrderSyncService retains recent rawPayloads and prunes only expired st
 
     assert.equal(result.rawPayloadRetentionDays, 1);
     assert.equal(result.rawPayloadRetentionCutoffDate, cutoffDate);
+    assert.equal(fetchOrderItemsCalls[0]?.options?.includeRawPayload, true);
     assert.equal(result.rawPayloadPrunedOrderCount, 1);
     assert.equal(result.rawPayloadPrunedOrderItemCount, 1);
     assert.equal(snapshot.orders.find((item: { id: string }) => item.id === "prune-order-old")?.rawPayload, null);
@@ -1833,11 +1867,11 @@ runAsync("OrderSyncService retains recent rawPayloads and prunes only expired st
   }
 });
 
-runAsync("OrderSyncService does not save new rawPayloads when retention days is zero", async () => {
+runAsync("OrderSyncService does not save new rawPayloads when retention days defaults to zero", async () => {
   const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
-  process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "0";
+  delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
   const today = getKstRetentionCutoffDate(0);
-  const { databaseService, orderSyncService } = createOrderSyncServiceHarness({
+  const { databaseService, orderSyncService, fetchOrderItemsCalls } = createOrderSyncServiceHarness({
     stores: [createStoreRecord("store-1", "Main Store")],
     configuredStoreIds: ["store-1"],
     liveOrderItems: [
@@ -1854,6 +1888,7 @@ runAsync("OrderSyncService does not save new rawPayloads when retention days is 
     const result = await orderSyncService.performSync("store-1", today, today, "MANUAL");
     const snapshot = databaseService.getSnapshot();
     assert.equal(result.rawPayloadRetentionDays, 0);
+    assert.equal(fetchOrderItemsCalls[0]?.options?.includeRawPayload, false);
     assert.equal(
       snapshot.orders.find((item: { externalOrderId: string }) => item.externalOrderId === "order-zero-retention")
         ?.rawPayload,
@@ -1865,6 +1900,34 @@ runAsync("OrderSyncService does not save new rawPayloads when retention days is 
       )?.rawPayload,
       null,
     );
+  } finally {
+    if (original === undefined) {
+      delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+    } else {
+      process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = original;
+    }
+  }
+});
+
+runAsync("OrderSyncService mock fallback omits rawPayloads when retention days is zero", async () => {
+  const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
+  process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "0";
+  const today = getKstRetentionCutoffDate(0);
+  const { databaseService, orderSyncService } = createOrderSyncServiceHarness({
+    stores: [createStoreRecord("store-1", "Main Store")],
+    configuredStoreIds: [],
+  });
+
+  try {
+    const result = await orderSyncService.performSync("store-1", today, today, "MANUAL");
+    const snapshot = databaseService.getSnapshot();
+
+    assert.equal(result.syncSource, "MOCK_FALLBACK");
+    assert.equal(result.rawPayloadRetentionDays, 0);
+    assert.equal(snapshot.orders.length > 0, true);
+    assert.equal(snapshot.orderItems.length > 0, true);
+    assert.equal(snapshot.orders.every((item: { rawPayload: unknown }) => item.rawPayload === null), true);
+    assert.equal(snapshot.orderItems.every((item: { rawPayload: unknown }) => item.rawPayload === null), true);
   } finally {
     if (original === undefined) {
       delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
@@ -3039,6 +3102,67 @@ run("recalculateAdCampaignSignaturesForStore without row apply leaves ad cost ro
   assert.equal(database.adCampaignDailyCosts[0].canonicalSalesUnitId, null);
   assert.equal(database.adCampaignDailyCosts[0].mappingReason, "NO_RULE");
   assert.equal(database.adCampaignDailyCosts[0].updatedAt, originalUpdatedAt);
+});
+
+run("recalculateAdCampaignSignaturesForStore with row apply syncs ad cost rows", () => {
+  const database = createEmptyDatabase();
+  const originalUpdatedAt = "2026-04-01T00:00:00.000Z";
+  database.canonicalSalesUnits.push(createSalesUnit("sales-1", "Launch Unit", ["launch"]));
+  database.campaignMappings.push({
+    id: "campaign-rule-1",
+    storeId: "store-1",
+    channel: "NAVER_DA",
+    canonicalSalesUnitId: "sales-1",
+    campaignPattern: "launch",
+    normalizedCampaignPattern: normalizeText("launch"),
+    isActive: true,
+    deactivatedAt: null,
+    createdAt: originalUpdatedAt,
+    updatedAt: originalUpdatedAt,
+  });
+  database.adCampaignSignatures.push({
+    id: "ad-signature-1",
+    storeId: "store-1",
+    channel: "NAVER_DA",
+    campaignId: "cmp-1",
+    campaignNameSnapshot: "launch campaign",
+    normalizedCampaignName: normalizeText("launch campaign"),
+    canonicalSalesUnitId: null,
+    mappingReason: "NO_RULE",
+    matchedRuleCount: 0,
+    reasonNote: "?쇱튂?섎뒗 洹쒖튃???놁뒿?덈떎.",
+    reasonNoteInherited: false,
+    confirmedAt: null,
+    usageCount: 1,
+    firstSeenDate: "2026-04-01",
+    lastSeenDate: "2026-04-01",
+    lastAutoMappedAt: null,
+    mappingRuleHash: null,
+    createdAt: originalUpdatedAt,
+    updatedAt: originalUpdatedAt,
+  });
+  const row = createConfirmedUploadRow({
+    uploadId: "upload-1",
+    reportDate: "2026-04-01",
+    campaignId: "cmp-1",
+    campaignName: "launch campaign",
+    canonicalSalesUnitId: null,
+    totalCost: 100,
+  }) as Record<string, unknown>;
+  row.adCampaignSignatureId = "ad-signature-1";
+  row.updatedAt = originalUpdatedAt;
+  database.adCampaignDailyCosts.push(row as never);
+
+  recalculateAdCampaignSignaturesForStore(database, "store-1", {
+    onlyUnconfirmed: true,
+    applyToRows: true,
+  });
+
+  assert.equal(database.adCampaignSignatures[0].canonicalSalesUnitId, "sales-1");
+  assert.equal(database.adCampaignSignatures[0].mappingReason, "RULE_MATCHED");
+  assert.equal(database.adCampaignDailyCosts[0].canonicalSalesUnitId, "sales-1");
+  assert.equal(database.adCampaignDailyCosts[0].mappingReason, "RULE_MATCHED");
+  assert.notEqual(database.adCampaignDailyCosts[0].updatedAt, originalUpdatedAt);
 });
 
 run("DatabaseService normalizeSnapshot keeps conflicting manual ad rows as signature conflict", () => {

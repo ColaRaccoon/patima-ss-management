@@ -477,6 +477,22 @@ export const applyAdCampaignSignatureToRows = (
       if (!signature) {
         return;
       }
+      const nextCanonicalSalesUnitId = signature.canonicalSalesUnitId;
+      const nextMatchedRuleCount = signature.matchedRuleCount;
+      const nextMappingReason = signature.mappingReason;
+      const nextReasonNote = signature.reasonNote;
+      const nextReasonNoteInherited = signature.reasonNoteInherited;
+
+      if (
+        row.canonicalSalesUnitId === nextCanonicalSalesUnitId &&
+        row.matchedRuleCount === nextMatchedRuleCount &&
+        row.mappingReason === nextMappingReason &&
+        row.reasonNote === nextReasonNote &&
+        row.reasonNoteInherited === nextReasonNoteInherited
+      ) {
+        return;
+      }
+
       row.canonicalSalesUnitId = signature.canonicalSalesUnitId;
       row.matchedRuleCount = signature.matchedRuleCount;
       row.mappingReason = signature.mappingReason;
@@ -622,8 +638,21 @@ export const recalculateAdCampaignSignaturesForStore = (
         ? database.canonicalSalesUnits.find((u) => u.storeId === storeId && u.isStoreLevel === true)
         : null;
 
-    signature.canonicalSalesUnitId =
+    const nextCanonicalSalesUnitId =
       mapping.needsStoreLevelUnit === true ? storeLevelUnit?.id ?? null : mapping.canonicalSalesUnitId;
+
+    if (
+      signature.canonicalSalesUnitId === nextCanonicalSalesUnitId &&
+      signature.matchedRuleCount === mapping.matchedRuleCount &&
+      signature.mappingReason === mapping.mappingReason &&
+      signature.reasonNote === mapping.reasonNote &&
+      signature.reasonNoteInherited === mapping.reasonNoteInherited &&
+      signature.mappingRuleHash === ruleHash
+    ) {
+      return;
+    }
+
+    signature.canonicalSalesUnitId = nextCanonicalSalesUnitId;
     signature.matchedRuleCount = mapping.matchedRuleCount;
     signature.mappingReason = mapping.mappingReason;
     signature.reasonNote = mapping.reasonNote;

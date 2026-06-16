@@ -1,7 +1,7 @@
 import type { DatabaseShape, OrderItem, OrderRecord } from "@patima/shared";
 import type { SyncedOrderItemInput } from "./naver-commerce.service";
 
-export const DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS = 90;
+export const DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS = 0;
 
 const KST_TIME_ZONE = "Asia/Seoul";
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;

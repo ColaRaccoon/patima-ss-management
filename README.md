@@ -23,7 +23,7 @@ The backend now supports three layers for Naver Commerce integration:
 - PostgreSQL persistence through `DATABASE_URL`
 - Environment-driven Naver solution credentials through `NAVER_*`
 - Store + credential bootstrap on startup when all required `NAVER_*` values exist
-- Order raw payload retention through `ORDER_RAW_PAYLOAD_RETENTION_DAYS` (default `90`)
+- Order raw payload retention through `ORDER_RAW_PAYLOAD_RETENTION_DAYS` (default `0`)
 
 Required Naver values:
 
@@ -39,22 +39,22 @@ NAVER_CALLBACK_URL=
 Optional storage controls:
 
 ```env
-ORDER_RAW_PAYLOAD_RETENTION_DAYS=90
+ORDER_RAW_PAYLOAD_RETENTION_DAYS=0
 AUDIT_LOG_RETENTION_DAYS=180
 OPERATION_RETENTION_DAYS=90
 DB_ARCHIVE_DIR=./backups/archive
 ```
 
-`ORDER_RAW_PAYLOAD_RETENTION_DAYS` keeps `OrderRecord.rawPayload` and `OrderItem.rawPayload`
-only for recent KST order/payment dates. It must be a non-negative integer; invalid values fall
-back to `90`. Set it to `0` to avoid storing new order raw payloads and prune existing payloads
-for the synced store.
+`ORDER_RAW_PAYLOAD_RETENTION_DAYS` defaults to `0`, so new order syncs store
+`OrderRecord.rawPayload` and `OrderItem.rawPayload` as `null`. Set a positive integer, such as
+`30` or `90`, only when raw Naver order JSON needs to be retained temporarily for recent KST
+order/payment dates. Invalid values fall back to `0`.
 
 Maintenance scripts are dry-run by default:
 
 ```bash
 node scripts/report-db-size.mjs
-node scripts/prune-order-raw-payloads.mjs --days 90
+node scripts/prune-order-raw-payloads.mjs --days 0
 node scripts/prune-audit-logs.mjs --days 180
 node scripts/prune-operations.mjs --days 90 --keep-failed
 ```
@@ -73,7 +73,7 @@ Add `--yes` only after creating a fresh snapshot and stopping the backend.
 - If matching `NAVER_*` values exist, the backend bootstraps a Smart Store record and seller credential automatically.
 - Credential test now issues a real SELLER token and checks seller account/channel endpoints.
 - Order sync now prefers live Naver Commerce API calls.
-- Order sync prunes only expired order/order-item `rawPayload` values for the synced store; order rows, item rows, option codes, fees, delivery fees, sales amounts, and mapping fields are preserved.
+- Order sync stores order/order-item `rawPayload` only when `ORDER_RAW_PAYLOAD_RETENTION_DAYS` is greater than `0`; pruning preserves order rows, item rows, option codes, fees, delivery fees, sales amounts, and mapping fields.
 - If no live Naver credential is available for the store, order sync falls back to the existing mock generator.
 - If live Naver sync is configured but the API call fails, the sync is marked as failed instead of silently using mock data.
 
