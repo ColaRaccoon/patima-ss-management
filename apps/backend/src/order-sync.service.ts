@@ -12,6 +12,7 @@ import {
   nowIso,
   paginate,
   rawToSourceSignature,
+  stripOrderItemRepeatedTextFields,
 } from "./helpers";
 import { NaverCommerceService, SyncedOrderItemInput } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
@@ -335,11 +336,6 @@ export class OrderSyncService implements OnModuleInit {
             externalProductId: product.externalProductId,
             optionCode: entry.optionCode,
             packageNumber: entry.packageNumber,
-            rawProductName: entry.rawProductName,
-            rawOptionInfo: entry.rawOptionInfo,
-            normalizedProductName: normalizeText(entry.rawProductName),
-            normalizedOptionInfo: normalizeText(entry.rawOptionInfo ?? ""),
-            sourceSignature: rawToSourceSignature(entry.rawProductName, entry.rawOptionInfo),
             quantity: entry.quantity,
             productPaymentAmount: entry.productPaymentAmount,
             totalProductAmount: entry.totalProductAmount,
@@ -368,8 +364,9 @@ export class OrderSyncService implements OnModuleInit {
 
           if (existingItem) {
             Object.assign(existingItem, payload);
+            stripOrderItemRepeatedTextFields(existingItem);
           } else {
-            draft.orderItems.push(payload);
+            draft.orderItems.push(stripOrderItemRepeatedTextFields(payload));
           }
           touchedOrderItemIds.add(payload.id);
           orderItemsUpserted += 1;

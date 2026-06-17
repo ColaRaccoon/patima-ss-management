@@ -119,6 +119,30 @@ node scripts/prune-order-raw-payloads.mjs --days 0 --yes
 
 `--yes`는 실제 DB payload를 변경하므로 자동화나 검증 작업에서 임의로 실행하지 않습니다.
 
+## order_items 반복 텍스트 필드 prune
+
+기본은 dry-run이며, 주문 row는 유지하고 `order_items.payload`의 반복 텍스트 key만 제거합니다.
+
+```powershell
+node scripts/prune-order-item-repeated-text-fields.mjs
+node scripts/prune-order-item-repeated-text-fields.mjs --full
+node scripts/prune-order-item-repeated-text-fields.mjs --full --yes
+```
+
+동작:
+
+- 기본 모드는 `normalizedProductName`, `normalizedOptionInfo`, `sourceSignature`만 제거합니다.
+- `--full`은 위 필드에 더해 `rawProductName`, `rawOptionInfo`까지 제거합니다.
+- 실제 변경 시 `payload_hash`는 null로 두어 다음 backend 기동/쓰기 또는 export 시 실제 payload 기준으로 다시 계산되게 합니다.
+- 원문 표시/검색은 `orderSourceSignatureId`로 연결된 `order_source_signatures` snapshot을 기준으로 보강됩니다.
+
+권장 운영 순서:
+
+1. `node scripts/db-export.mjs`와 `node scripts/report-db-size.mjs`로 백업과 기준 크기를 남깁니다.
+2. `node scripts/prune-order-item-repeated-text-fields.mjs --full`로 대상 row 수와 예상 절감량을 확인합니다.
+3. backend를 중지한 뒤 dry-run 결과를 확인하고 `--yes`를 붙여 실행합니다.
+4. `node scripts/report-db-size.mjs`와 backend 테스트로 payload 감소와 기능 회귀를 확인합니다.
+
 ## audit log 보존/archive
 
 기본 보존 기간은 180일입니다.

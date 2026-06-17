@@ -118,17 +118,7 @@ export async function enrichSignatureDisplayName(
     );
   }
 
-  // Step 2: Check order_items rawProductName
-  for (const item of relatedItems) {
-    if (isMeaningfulName(item.rawProductName, item.rawOptionInfo)) {
-      return {
-        fallbackProductName: item.rawProductName,
-        fallbackProductNameSource: "orderItem",
-      };
-    }
-  }
-
-  // Step 3: Parse rawOptionInfo (signature level first)
+  // Step 2: Parse rawOptionInfo from the signature snapshot.
   const extractedFromSignature =
     extractNameFromOptionInfo(signature.rawOptionInfoSnapshot || "");
   if (extractedFromSignature && isMeaningfulName(extractedFromSignature)) {
@@ -138,18 +128,7 @@ export async function enrichSignatureDisplayName(
     };
   }
 
-  // Also try order_items rawOptionInfo
-  for (const item of relatedItems) {
-    const extracted = extractNameFromOptionInfo(item.rawOptionInfo || "");
-    if (extracted && isMeaningfulName(extracted)) {
-      return {
-        fallbackProductName: extracted,
-        fallbackProductNameSource: "optionInfo",
-      };
-    }
-  }
-
-  // Step 4: Check products table via externalProductId
+  // Step 3: Check products table via externalProductId.
   for (const item of relatedItems) {
     if (item.externalProductId) {
       let product: { productName: string | null } | undefined;
@@ -172,6 +151,26 @@ export async function enrichSignatureDisplayName(
           fallbackProductNameSource: "product",
         };
       }
+    }
+  }
+
+  // Step 4: Legacy order_items raw fields fallback for sparse historical signatures.
+  for (const item of relatedItems) {
+    if (isMeaningfulName(item.rawProductName, item.rawOptionInfo)) {
+      return {
+        fallbackProductName: item.rawProductName ?? null,
+        fallbackProductNameSource: "orderItem",
+      };
+    }
+  }
+
+  for (const item of relatedItems) {
+    const extracted = extractNameFromOptionInfo(item.rawOptionInfo || "");
+    if (extracted && isMeaningfulName(extracted)) {
+      return {
+        fallbackProductName: extracted,
+        fallbackProductNameSource: "optionInfo",
+      };
     }
   }
 

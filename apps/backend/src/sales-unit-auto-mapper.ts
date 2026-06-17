@@ -5,7 +5,7 @@ import {
   OrderSourceSignature,
   OrderItem,
 } from "@patima/shared";
-import { getSignatureMappingStatus, isSalesUnitAssignable, nowIso } from "./helpers";
+import { coalesceNonBlankText, getSignatureMappingStatus, isSalesUnitAssignable, nowIso } from "./helpers";
 
 interface AutoMatchResolution {
   canonicalSalesUnitId: string | null;
@@ -252,8 +252,9 @@ const recalculateOrderMappings = (
         resolvedUnitId = signature.canonicalSalesUnitId;
         mappingMethod = "signature-confirmed";
       } else {
-        // 함께배송 아이템인지 판별 (rawOptionInfo에 "[함께배송" 포함)
-        const isBundledItem = item.rawOptionInfo?.includes("[함께배송") ?? false;
+        const rawOptionInfo = coalesceNonBlankText(signature?.rawOptionInfoSnapshot, item.rawOptionInfo);
+        // 함께배송 아이템인지 판별 (signature snapshot 우선, legacy item fallback)
+        const isBundledItem = rawOptionInfo?.includes("[함께배송") ?? false;
 
         // 우선순위 2: ID 매핑 시도 (optionManageCode → linkedManageCodes)
         if (isBundledItem && item.optionManageCode) {

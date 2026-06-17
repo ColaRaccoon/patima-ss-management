@@ -501,6 +501,61 @@ export const getOrderItemMappingStatus = (
   return item.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED";
 };
 
+const ORDER_ITEM_REPEATED_TEXT_FIELD_KEYS = [
+  "rawProductName",
+  "rawOptionInfo",
+  "normalizedProductName",
+  "normalizedOptionInfo",
+  "sourceSignature",
+] as const;
+
+type OrderItemRepeatedTextFieldKey = typeof ORDER_ITEM_REPEATED_TEXT_FIELD_KEYS[number];
+
+export const stripOrderItemRepeatedTextFields = <T extends Partial<OrderItem>>(item: T): T => {
+  ORDER_ITEM_REPEATED_TEXT_FIELD_KEYS.forEach((key) => {
+    delete (item as Partial<Record<OrderItemRepeatedTextFieldKey, unknown>>)[key];
+  });
+  return item;
+};
+
+export const coalesceNonBlankText = (
+  ...values: Array<string | null | undefined>
+): string | null => {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return null;
+};
+
+export const resolveOrderItemSignatureDisplay = (
+  database: DatabaseShape,
+  item: Pick<OrderItem, "orderSourceSignatureId"> &
+    Partial<
+      Pick<
+        OrderItem,
+        | "rawProductName"
+        | "rawOptionInfo"
+        | "normalizedProductName"
+        | "normalizedOptionInfo"
+        | "sourceSignature"
+      >
+    >,
+) => {
+  const signature = item.orderSourceSignatureId
+    ? getSignatureIndex(database).get(item.orderSourceSignatureId)
+    : null;
+
+  return {
+    rawProductName: coalesceNonBlankText(signature?.rawProductNameSnapshot, item.rawProductName) ?? "",
+    rawOptionInfo: coalesceNonBlankText(signature?.rawOptionInfoSnapshot, item.rawOptionInfo),
+    sourceSignature: coalesceNonBlankText(signature?.sourceSignature, item.sourceSignature) ?? "",
+    normalizedProductName: coalesceNonBlankText(signature?.normalizedProductName, item.normalizedProductName) ?? "",
+    normalizedOptionInfo: coalesceNonBlankText(signature?.normalizedOptionInfo, item.normalizedOptionInfo) ?? "",
+  };
+};
+
 export const getAdMappingStatus = (
   item: Pick<AdCampaignDailyCost | AdCampaignSignature, "canonicalSalesUnitId" | "mappingReason">,
 ): MappingStatus => {
@@ -1090,15 +1145,16 @@ export const mapOrderItemResponse = (
   item: OrderItem,
 ) => {
   const salesUnit = database.canonicalSalesUnits.find((entry) => entry.id === item.canonicalSalesUnitId);
+  const display = resolveOrderItemSignatureDisplay(database, item);
   return {
     id: item.id,
     orderRecordId: item.orderId,
     externalOrderId: database.orders.find((entry) => entry.id === item.orderId)?.externalOrderId ?? item.orderId,
     orderSourceSignatureId: item.orderSourceSignatureId,
     canonicalSalesUnitId: item.canonicalSalesUnitId,
-    rawProductName: item.rawProductName,
-    rawOptionInfo: item.rawOptionInfo,
-    sourceSignature: item.sourceSignature,
+    rawProductName: display.rawProductName,
+    rawOptionInfo: display.rawOptionInfo,
+    sourceSignature: display.sourceSignature,
     displayName: salesUnit?.displayName ?? null,
     quantity: item.quantity,
     productPaymentAmount: item.productPaymentAmount,

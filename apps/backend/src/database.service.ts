@@ -26,14 +26,17 @@ import {
   recalculateAdCampaignSignaturesForStore,
 } from "./ad-mapping-engine";
 import {
+  coalesceNonBlankText,
   createEmptyDatabase,
   getActiveConfirmedUploadIds,
   getAdMappingStatus,
   getOrderItemMappingStatus,
+  getSignatureIndex,
   getSignatureMappingStatus,
   migrateCanonicalSalesUnit,
   paginate,
   repairMojibakeText,
+  stripOrderItemRepeatedTextFields,
 } from "./helpers";
 import { buildPaginationResult, createSqlBuilder, normalizePagination } from "./query-builders";
 
@@ -886,12 +889,18 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
     const keywordProduct = query.productName ? normalizeText(query.productName) : null;
     if (keywordProduct) {
-      builder.addCondition("COALESCE(items.payload->>'normalizedProductName', '') LIKE {param} ESCAPE '\\'", likePattern(keywordProduct));
+      builder.addCondition(
+        "COALESCE(NULLIF(signatures.payload->>'normalizedProductName', ''), items.payload->>'normalizedProductName', '') LIKE {param} ESCAPE '\\'",
+        likePattern(keywordProduct),
+      );
     }
 
     const keywordOption = query.optionInfo ? normalizeText(query.optionInfo) : null;
     if (keywordOption) {
-      builder.addCondition("COALESCE(items.payload->>'normalizedOptionInfo', '') LIKE {param} ESCAPE '\\'", likePattern(keywordOption));
+      builder.addCondition(
+        "COALESCE(NULLIF(signatures.payload->>'normalizedOptionInfo', ''), items.payload->>'normalizedOptionInfo', '') LIKE {param} ESCAPE '\\'",
+        likePattern(keywordOption),
+      );
     }
 
     if (query.mappingStatus && query.mappingStatus !== "ALL") {
@@ -1052,6 +1061,14 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   private queryOrderItemsFromSnapshot(query: OrderItemListQuery): PaginationResult<OrderItem> {
     const keywordProduct = query.productName ? normalizeText(query.productName) : null;
     const keywordOption = query.optionInfo ? normalizeText(query.optionInfo) : null;
+    const signaturesById = getSignatureIndex(this.database);
+    const getSearchText = (item: OrderItem) => {
+      const signature = item.orderSourceSignatureId ? signaturesById.get(item.orderSourceSignatureId) : null;
+      return {
+        normalizedProductName: coalesceNonBlankText(signature?.normalizedProductName, item.normalizedProductName) ?? "",
+        normalizedOptionInfo: coalesceNonBlankText(signature?.normalizedOptionInfo, item.normalizedOptionInfo) ?? "",
+      };
+    };
     const items = this.database.orderItems
       .filter((item) => item.storeId === query.storeId)
       .filter((item) =>
@@ -1059,8 +1076,8 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
           ? !!item.paymentDate && item.paymentDate >= query.dateFrom && item.paymentDate <= query.dateTo
           : true,
       )
-      .filter((item) => (keywordProduct ? item.normalizedProductName.includes(keywordProduct) : true))
-      .filter((item) => (keywordOption ? item.normalizedOptionInfo.includes(keywordOption) : true))
+      .filter((item) => (keywordProduct ? getSearchText(item).normalizedProductName.includes(keywordProduct) : true))
+      .filter((item) => (keywordOption ? getSearchText(item).normalizedOptionInfo.includes(keywordOption) : true))
       .filter((item) =>
         query.mappingStatus && query.mappingStatus !== "ALL"
           ? getOrderItemMappingStatus(this.database, item) === query.mappingStatus
@@ -1951,7 +1968,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   ): OrderItem {
     item.canonicalSalesUnitId = params.canonicalSalesUnitId;
     item.updatedAt = params.timestamp;
-    return item;
+    return stripOrderItemRepeatedTextFields(item);
   }
 
   private collectAffectedPaymentDates(orderItems: OrderItem[]): string[] {
@@ -1981,7 +1998,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         snapshot.orderItems.push(this.cloneSnapshot(orderItem));
         return;
       }
-      Object.assign(snapshot.orderItems[index], this.cloneSnapshot(orderItem));
+      snapshot.orderItems[index] = this.cloneSnapshot(orderItem);
     });
   }
 

@@ -1,9 +1,10 @@
 import { Injectable } from "@nestjs/common";
-import { CanonicalSalesUnit, normalizeMatchAlias, normalizeText } from "@patima/shared";
+import { CanonicalSalesUnit, OrderItem, OrderSourceSignature, normalizeMatchAlias, normalizeText } from "@patima/shared";
 import { recalculateAdMappingsForStore } from "./ad-mapping-engine";
 import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import {
+  coalesceNonBlankText,
   createId,
   ensureStoreExists,
   formatApiSuccess,
@@ -68,6 +69,20 @@ export class MappingSeedService {
     if (validItems.length === 0) {
       return { createdCount: 0, mergedCount: 0, totalProcessed: 0, details: [] };
     }
+    const signaturesById = new Map<string, OrderSourceSignature>(
+      snapshot.orderSourceSignatures.map((signature) => [signature.id, signature]),
+    );
+    const getOrderItemRawText = (item: OrderItem) => {
+      const signature = item.orderSourceSignatureId ? signaturesById.get(item.orderSourceSignatureId) : null;
+      return {
+        rawProductName: coalesceNonBlankText(
+          signature?.rawProductNameSnapshot,
+          item.rawProductName,
+          item.externalProductId,
+        ) ?? "",
+        rawOptionInfo: coalesceNonBlankText(signature?.rawOptionInfoSnapshot, item.rawOptionInfo),
+      };
+    };
 
     // ──────────────────────────────────────────────
     // Step 0: 기존 자동 생성 판매단위 초기화 (멱등성 보장)
@@ -114,10 +129,11 @@ export class MappingSeedService {
 
     validItems.forEach((item) => {
       const externalProductId = item.externalProductId!;
-      const isShippedTogether = item.rawOptionInfo?.includes("[함께배송");
+      const { rawProductName, rawOptionInfo } = getOrderItemRawText(item);
+      const isShippedTogether = rawOptionInfo?.includes("[함께배송");
 
-      if (isShippedTogether && item.rawOptionInfo) {
-        const parsed = this.parseShippedTogetherOption(item.rawOptionInfo);
+      if (isShippedTogether && rawOptionInfo) {
+        const parsed = this.parseShippedTogetherOption(rawOptionInfo);
 
         if (parsed.length > 0) {
           parsed.forEach(({ category }) => {
@@ -139,15 +155,15 @@ export class MappingSeedService {
             if (item.optionManageCode) {
               group.manageCodes.add(item.optionManageCode);
             }
-            group.rawProductNames.add(item.rawProductName);
+            group.rawProductNames.add(rawProductName);
           });
         } else {
           // 파싱 실패 → 일반 상품 그룹으로 fallback
-          console.warn(`[MappingSeed] Failed to parse 함께배송 pattern: ${item.rawOptionInfo}`);
+          console.warn(`[MappingSeed] Failed to parse 함께배송 pattern: ${rawOptionInfo}`);
           bundledParseFailures.push({
             externalProductId,
-            rawOptionInfo: item.rawOptionInfo,
-            rawProductName: item.rawProductName,
+            rawOptionInfo,
+            rawProductName,
             productId: item.productId,
           });
         }
@@ -156,7 +172,7 @@ export class MappingSeedService {
         if (!regularGroups.has(externalProductId)) {
           regularGroups.set(externalProductId, {
             externalProductId,
-            bestRawProductName: item.rawProductName,
+            bestRawProductName: rawProductName,
             productIds: new Set(),
           });
         }
@@ -164,8 +180,8 @@ export class MappingSeedService {
         // linkedProductIds는 externalProductId를 저장해야 auto-mapper가 매칭 가능
         group.productIds.add(externalProductId);
         // 가장 긴 이름을 대표명으로 (프로모션 문구 제거 전 기준)
-        if (item.rawProductName.length > group.bestRawProductName.length) {
-          group.bestRawProductName = item.rawProductName;
+        if (rawProductName.length > group.bestRawProductName.length) {
+          group.bestRawProductName = rawProductName;
         }
       }
     });

@@ -148,11 +148,11 @@ export interface OrderItem {
   optionCode: string | null;
   optionManageCode?: string;
   packageNumber: string | null;
-  rawProductName: string;
-  rawOptionInfo: string | null;
-  normalizedProductName: string;
-  normalizedOptionInfo: string;
-  sourceSignature: string;
+  rawProductName?: string;
+  rawOptionInfo?: string | null;
+  normalizedProductName?: string;
+  normalizedOptionInfo?: string;
+  sourceSignature?: string;
   quantity: number;
   productPaymentAmount: number;
   totalProductAmount: number | null;

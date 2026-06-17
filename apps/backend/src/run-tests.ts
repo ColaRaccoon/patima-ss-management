@@ -31,12 +31,14 @@ import {
   calculateStoreDeliverySummary,
   calculateVatAmount,
   calculateVatAdjustedRevenue,
+  coalesceNonBlankText,
   createEmptyDatabase,
   getActiveConfirmedUploadIds,
   getAdMappingStatus,
   getOrderItemMappingStatus,
   getSignatureIndex,
   getWeekdayNameKo,
+  mapOrderItemResponse,
   paginate,
   repairMojibakeText,
   resolvePackageKey,
@@ -46,6 +48,7 @@ import {
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { NaverCommerceService, createNaverClientSecretSign } from "./naver-commerce.service";
 import type { SyncedOrderItemInput } from "./naver-commerce.service";
+import { MappingSeedService } from "./mapping-seed.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
 import { OperationService } from "./operation.service";
@@ -586,6 +589,14 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   }) {
     const keywordProduct = query.productName ? normalizeText(query.productName) : null;
     const keywordOption = query.optionInfo ? normalizeText(query.optionInfo) : null;
+    const signaturesById = getSignatureIndex(this.database);
+    const getSearchText = (item: OrderItem) => {
+      const signature = item.orderSourceSignatureId ? signaturesById.get(item.orderSourceSignatureId) : null;
+      return {
+        normalizedProductName: coalesceNonBlankText(signature?.normalizedProductName, item.normalizedProductName) ?? "",
+        normalizedOptionInfo: coalesceNonBlankText(signature?.normalizedOptionInfo, item.normalizedOptionInfo) ?? "",
+      };
+    };
     const items = this.database.orderItems
       .filter((item) => item.storeId === query.storeId)
       .filter((item) =>
@@ -593,8 +604,8 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
           ? !!item.paymentDate && item.paymentDate >= query.dateFrom && item.paymentDate <= query.dateTo
           : true,
       )
-      .filter((item) => (keywordProduct ? item.normalizedProductName.includes(keywordProduct) : true))
-      .filter((item) => (keywordOption ? item.normalizedOptionInfo.includes(keywordOption) : true))
+      .filter((item) => (keywordProduct ? getSearchText(item).normalizedProductName.includes(keywordProduct) : true))
+      .filter((item) => (keywordOption ? getSearchText(item).normalizedOptionInfo.includes(keywordOption) : true))
       .filter((item) =>
         query.mappingStatus && query.mappingStatus !== "ALL"
           ? getOrderItemMappingStatus(this.database, item) === query.mappingStatus
@@ -1349,6 +1360,10 @@ runAsync("DatabaseService queryOrderItems pushes filters into PostgreSQL", async
   assert.equal(result.items[0].id, "item-1");
   assert.match(queries[0].text, /LEFT JOIN order_source_signatures signatures/);
   assert.match(queries[0].text, /items\.payload->>'paymentDate' >= \$2/);
+  assert.match(queries[0].text, /signatures\.payload->>'normalizedProductName'/);
+  assert.match(queries[0].text, /signatures\.payload->>'normalizedOptionInfo'/);
+  assert.match(queries[0].text, /items\.payload->>'normalizedProductName'/);
+  assert.match(queries[0].text, /items\.payload->>'normalizedOptionInfo'/);
   assert.equal(queries[0].text.includes("Needle_%"), false);
   assert.match(queries[0].text, /LIKE \$4 ESCAPE/);
   assert.deepEqual(queries[0].params, [
@@ -1361,6 +1376,270 @@ runAsync("DatabaseService queryOrderItems pushes filters into PostgreSQL", async
     "PAYED",
     "SALE",
   ]);
+});
+
+runAsync("DatabaseService queryOrderItems searches signature fields when item text fields are absent", async () => {
+  const database = createEmptyDatabase();
+  const signature = createOrderSourceSignature("sig-1", "Signature Product") as OrderSourceSignature;
+  signature.rawOptionInfoSnapshot = "Signature Option";
+  signature.normalizedOptionInfo = normalizeText("Signature Option");
+  signature.sourceSignature = createSourceSignature("Signature Product", "Signature Option");
+  database.orderSourceSignatures.push(signature);
+  database.orderItems.push({
+    id: "item-no-repeat",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "external-item-no-repeat",
+    externalProductId: null,
+    optionCode: null,
+    packageNumber: null,
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: 10000,
+    deliveryFeeAmount: 0,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: "2026-04-03",
+    paymentDate: "2026-04-03",
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  } as OrderItem);
+  const service = Object.create(DatabaseService.prototype) as {
+    database: typeof database;
+    storageMode: "file";
+    queryOrderItems: DatabaseService["queryOrderItems"];
+  };
+  service.database = database;
+  service.storageMode = "file";
+
+  const result = await service.queryOrderItems({
+    storeId: "store-1",
+    productName: "Signature Product",
+    optionInfo: "Signature Option",
+  });
+
+  assert.equal(result.totalCount, 1);
+  assert.equal(result.items[0].id, "item-no-repeat");
+});
+
+runAsync("DatabaseService queryOrderItems falls back to legacy item text for sparse signatures", async () => {
+  const database = createEmptyDatabase();
+  database.orderSourceSignatures.push({
+    id: "sig-sparse",
+    storeId: "store-1",
+    sourceSignature: "",
+    rawProductNameSnapshot: "",
+    rawOptionInfoSnapshot: "",
+    normalizedProductName: "",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED",
+    confirmedAt: null,
+    usageCount: 0,
+    firstSeenAt: null,
+    lastSeenAt: null,
+    sampleExternalProductId: null,
+    sampleOptionCode: null,
+    sampleOptionManageCode: null,
+    lastAutoMappedAt: null,
+    mappingRuleHash: null,
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  });
+  database.orderItems.push({
+    id: "item-legacy-text",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-sparse",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "external-item-legacy-text",
+    externalProductId: null,
+    optionCode: null,
+    packageNumber: null,
+    rawProductName: "Legacy Product",
+    rawOptionInfo: "Legacy Option",
+    normalizedProductName: normalizeText("Legacy Product"),
+    normalizedOptionInfo: normalizeText("Legacy Option"),
+    sourceSignature: createSourceSignature("Legacy Product", "Legacy Option"),
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: 10000,
+    deliveryFeeAmount: 0,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: "2026-04-03",
+    paymentDate: "2026-04-03",
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  });
+  const service = Object.create(DatabaseService.prototype) as {
+    database: typeof database;
+    storageMode: "file";
+    queryOrderItems: DatabaseService["queryOrderItems"];
+  };
+  service.database = database;
+  service.storageMode = "file";
+
+  const result = await service.queryOrderItems({
+    storeId: "store-1",
+    productName: "Legacy Product",
+    optionInfo: "Legacy Option",
+  });
+
+  assert.equal(result.totalCount, 1);
+  assert.equal(result.items[0].id, "item-legacy-text");
+});
+
+run("mapOrderItemResponse resolves display text from order source signature", () => {
+  const database = createEmptyDatabase();
+  database.orders.push({
+    id: "order-1",
+    storeId: "store-1",
+    externalOrderId: "external-order-1",
+    orderDatetime: null,
+    paymentDatetime: null,
+    orderStatus: "PAYED",
+    rawPayload: null,
+    syncedAt: "2026-04-03T00:00:00.000Z",
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  });
+  const signature = createOrderSourceSignature("sig-1", "Signature Product") as OrderSourceSignature;
+  signature.rawOptionInfoSnapshot = "Signature Option";
+  signature.normalizedOptionInfo = normalizeText("Signature Option");
+  signature.sourceSignature = createSourceSignature("Signature Product", "Signature Option");
+  database.orderSourceSignatures.push(signature);
+  const item = {
+    id: "item-no-repeat",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "external-item-no-repeat",
+    externalProductId: null,
+    optionCode: null,
+    packageNumber: null,
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: 10000,
+    deliveryFeeAmount: 0,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: "2026-04-03",
+    paymentDate: "2026-04-03",
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  } as OrderItem;
+
+  const response = mapOrderItemResponse(database, item);
+
+  assert.equal(response.rawProductName, "Signature Product");
+  assert.equal(response.rawOptionInfo, "Signature Option");
+  assert.equal(response.sourceSignature, createSourceSignature("Signature Product", "Signature Option"));
+});
+
+run("mapOrderItemResponse falls back to legacy item text for sparse signatures", () => {
+  const database = createEmptyDatabase();
+  database.orders.push({
+    id: "order-1",
+    storeId: "store-1",
+    externalOrderId: "external-order-1",
+    orderDatetime: null,
+    paymentDatetime: null,
+    orderStatus: "PAYED",
+    rawPayload: null,
+    syncedAt: "2026-04-03T00:00:00.000Z",
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  });
+  database.orderSourceSignatures.push({
+    id: "sig-sparse",
+    storeId: "store-1",
+    sourceSignature: "",
+    rawProductNameSnapshot: "",
+    rawOptionInfoSnapshot: "",
+    normalizedProductName: "",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED",
+    confirmedAt: null,
+    usageCount: 0,
+    firstSeenAt: null,
+    lastSeenAt: null,
+    sampleExternalProductId: null,
+    sampleOptionCode: null,
+    sampleOptionManageCode: null,
+    lastAutoMappedAt: null,
+    mappingRuleHash: null,
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  });
+  const item = {
+    id: "item-legacy-text",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-sparse",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "external-item-legacy-text",
+    externalProductId: null,
+    optionCode: null,
+    packageNumber: null,
+    rawProductName: "Legacy Product",
+    rawOptionInfo: "Legacy Option",
+    normalizedProductName: normalizeText("Legacy Product"),
+    normalizedOptionInfo: normalizeText("Legacy Option"),
+    sourceSignature: createSourceSignature("Legacy Product", "Legacy Option"),
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: 10000,
+    deliveryFeeAmount: 0,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: "2026-04-03",
+    paymentDate: "2026-04-03",
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: "2026-04-03T00:00:00.000Z",
+    updatedAt: "2026-04-03T00:00:00.000Z",
+  } as OrderItem;
+
+  const response = mapOrderItemResponse(database, item);
+
+  assert.equal(response.rawProductName, "Legacy Product");
+  assert.equal(response.rawOptionInfo, "Legacy Option");
+  assert.equal(response.sourceSignature, createSourceSignature("Legacy Product", "Legacy Option"));
 });
 
 runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and returns page summaries", async () => {
@@ -1900,6 +2179,18 @@ runAsync("OrderSyncService does not save new rawPayloads when retention days def
       )?.rawPayload,
       null,
     );
+    const syncedItem = snapshot.orderItems.find((item: { externalProductOrderId: string }) =>
+      item.externalProductOrderId === "item-zero-retention"
+    ) as Record<string, unknown>;
+    assert.equal(Object.prototype.hasOwnProperty.call(syncedItem, "rawProductName"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(syncedItem, "rawOptionInfo"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(syncedItem, "normalizedProductName"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(syncedItem, "normalizedOptionInfo"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(syncedItem, "sourceSignature"), false);
+    const listed = await orderSyncService.listOrderItems({ storeId: "store-1" });
+    assert.equal(listed.data.items[0].rawProductName, "Retention Test Product");
+    assert.equal(listed.data.items[0].rawOptionInfo, "Color: Black");
+    assert.equal(listed.data.items[0].sourceSignature, createSourceSignature("Retention Test Product", "Color: Black"));
   } finally {
     if (original === undefined) {
       delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
@@ -2576,6 +2867,113 @@ run("recalculateOrderMappingsForTouchedItems updates only touched order items", 
   assert.equal(database.orderSourceSignatures.find((item) => item.id === "sig-2")?.canonicalSalesUnitId, null);
 });
 
+run("recalculateOrderMappingsForStore detects bundled items from signature raw option snapshot", () => {
+  const database = createEmptyDatabase();
+  const mainUnit = createSalesUnit("sales-main", "Main Product", []) as Record<string, unknown>;
+  mainUnit.linkedProductIds = ["product-shared"];
+  const bundledUnit = createSalesUnit("sales-bundled", "Bundled Option", []) as Record<string, unknown>;
+  bundledUnit.linkedManageCodes = ["manage-bundled"];
+  database.canonicalSalesUnits.push(mainUnit as never, bundledUnit as never);
+  const bundledSignature = createOrderSourceSignature("sig-bundled", "Main Product") as OrderSourceSignature;
+  bundledSignature.rawOptionInfoSnapshot = "[함께배송] Bundled Option: Black";
+  bundledSignature.normalizedOptionInfo = normalizeText("[함께배송] Bundled Option: Black");
+  bundledSignature.sourceSignature = createSourceSignature("Main Product", "[함께배송] Bundled Option: Black");
+  database.orderSourceSignatures.push(bundledSignature);
+  database.orderItems.push({
+    id: "item-bundled",
+    storeId: "store-1",
+    orderId: "order-bundled",
+    orderSourceSignatureId: "sig-bundled",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "external-bundled",
+    externalProductId: "product-shared",
+    optionCode: null,
+    optionManageCode: "manage-bundled",
+    packageNumber: null,
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: null,
+    deliveryFeeAmount: null,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: "2026-04-01",
+    paymentDate: "2026-04-01",
+    saleStatus: "SALE",
+    orderStatus: "DELIVERED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as OrderItem);
+
+  recalculateOrderMappingsForStore(database, "store-1");
+
+  assert.equal(database.orderItems[0].canonicalSalesUnitId, "sales-bundled");
+  assert.equal(database.orderSourceSignatures[0].canonicalSalesUnitId, "sales-bundled");
+});
+
+runAsync("MappingSeedService uses signature snapshots when order item raw text fields are absent", async () => {
+  const databaseService = createMemoryDatabaseService();
+  const service = new MappingSeedService(
+    databaseService as never,
+    { ensureWritable: () => undefined } as never,
+    createAuditLogServiceDouble() as never,
+  );
+
+  databaseService.write((draft) => {
+    draft.stores.push(createStoreRecord("store-1", "Main Store"));
+    const seedSignature = createOrderSourceSignature("sig-seed", "Main Product") as OrderSourceSignature;
+    seedSignature.rawOptionInfoSnapshot = "[함께배송] Care Band: Black";
+    seedSignature.normalizedOptionInfo = normalizeText("[함께배송] Care Band: Black");
+    seedSignature.sourceSignature = createSourceSignature("Main Product", "[함께배송] Care Band: Black");
+    draft.orderSourceSignatures.push(seedSignature);
+    draft.orderItems.push({
+      id: "item-seed",
+      storeId: "store-1",
+      orderId: "order-seed",
+      productId: null,
+      orderSourceSignatureId: "sig-seed",
+      canonicalSalesUnitId: null,
+      externalProductOrderId: "external-seed",
+      externalProductId: "product-seed",
+      optionCode: "option-seed",
+      optionManageCode: "manage-seed",
+      packageNumber: null,
+      quantity: 1,
+      productPaymentAmount: 10000,
+      totalProductAmount: null,
+      deliveryFeeAmount: null,
+      paymentCommission: null,
+      knowledgeShoppingSellingInterlockCommission: null,
+      saleCommission: null,
+      channelCommission: null,
+      orderDate: "2026-04-01",
+      paymentDate: "2026-04-01",
+      saleStatus: "SALE",
+      orderStatus: "DELIVERED",
+      isCanceled: false,
+      isReturned: false,
+      rawPayload: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as OrderItem);
+  });
+
+  const result = await service.generateInitialMappings("store-1");
+  const snapshot = databaseService.getSnapshot();
+  const created = snapshot.canonicalSalesUnits.find((unit: { displayName: string }) =>
+    unit.displayName === "Care Band"
+  );
+
+  assert.equal(result.createdCount, 1);
+  assert.equal(created?.linkedOptionCodes.includes("option-seed"), true);
+  assert.equal(created?.linkedManageCodes.includes("manage-seed"), true);
+  assert.equal(snapshot.orderItems[0].canonicalSalesUnitId, created?.id);
+});
+
 runAsync("OrderMappingService saveMappings deduplicates signatures without recalculation", async () => {
   const { databaseService, orderMappingService, enqueueCalls } = createOrderMappingServiceHarness();
 
@@ -3243,12 +3641,48 @@ runAsync("DatabaseService file mode writes committed snapshots atomically under 
 
     await service.writeCommitted((draft) => {
       draft.stores.push({ id: "store-atomic" } as never);
+      draft.orderItems.push({
+        id: "item-atomic",
+        orderId: "order-atomic",
+        storeId: "store-atomic",
+        productId: null,
+        orderSourceSignatureId: null,
+        canonicalSalesUnitId: null,
+        externalProductOrderId: "external-atomic",
+        externalProductId: null,
+        optionCode: null,
+        packageNumber: null,
+        rawProductName: "Atomic Product",
+        rawOptionInfo: "Atomic Option",
+        normalizedProductName: "atomic product",
+        normalizedOptionInfo: "atomic option",
+        sourceSignature: "atomic product || atomic option",
+        quantity: 1,
+        productPaymentAmount: 100,
+        totalProductAmount: 100,
+        deliveryFeeAmount: 0,
+        paymentCommission: null,
+        knowledgeShoppingSellingInterlockCommission: null,
+        saleCommission: null,
+        channelCommission: null,
+        orderDate: "2026-04-01",
+        paymentDate: "2026-04-01",
+        saleStatus: "SALE",
+        orderStatus: "PAYED",
+        isCanceled: false,
+        isReturned: false,
+        rawPayload: null,
+        createdAt: "2026-04-01T00:00:00.000Z",
+        updatedAt: "2026-04-01T00:00:00.000Z",
+      } as never);
     });
 
     const filePath = join(tempDir, "database.json");
+    const saved = JSON.parse(readFileSync(filePath, "utf-8"));
     assert.equal(existsSync(filePath), true);
     assert.equal(readdirSync(tempDir).some((fileName) => fileName.includes(".tmp-")), false);
-    assert.equal(JSON.parse(readFileSync(filePath, "utf-8")).stores[0].id, "store-atomic");
+    assert.equal(saved.stores[0].id, "store-atomic");
+    assert.equal(saved.orderItems[0].id, "item-atomic");
   } finally {
     if (originalDatabaseUrl === undefined) {
       delete process.env.DATABASE_URL;
@@ -3402,6 +3836,11 @@ runAsync("DatabaseService PostgreSQL saves order manual mappings with row-level 
   const itemUpdate = queries.find((query) => /UPDATE order_items AS target/.test(query.text));
   const updatedItemPayload = JSON.parse((itemUpdate?.values as unknown[])[1] as string) as OrderItem;
   assert.equal(updatedItemPayload.canonicalSalesUnitId, "sales-1");
+  assert.equal(Object.prototype.hasOwnProperty.call(updatedItemPayload, "rawProductName"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(updatedItemPayload, "rawOptionInfo"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(updatedItemPayload, "normalizedProductName"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(updatedItemPayload, "normalizedOptionInfo"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(updatedItemPayload, "sourceSignature"), false);
   assert.equal((itemUpdate?.values as unknown[])[2], hashPayload(updatedItemPayload));
 
   assert.deepEqual(result.signatureIds, ["sig-1", "sig-2"]);
@@ -3411,6 +3850,13 @@ runAsync("DatabaseService PostgreSQL saves order manual mappings with row-level 
   assert.equal(service.database.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-other")?.canonicalSalesUnitId, null);
   assert.equal(service.database.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-store-2")?.canonicalSalesUnitId, null);
   assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-1")?.canonicalSalesUnitId, "sales-1");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      service.database.orderItems.find((item: OrderItem) => item.id === "item-1"),
+      "rawProductName",
+    ),
+    false,
+  );
   assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-2")?.canonicalSalesUnitId, "sales-1");
   assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-3")?.canonicalSalesUnitId, "sales-1");
   assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-other")?.canonicalSalesUnitId, null);
@@ -5893,6 +6339,75 @@ run("enrichSignatureDisplayName matches product by externalProductId", async () 
 
   const result = await enrichSignatureDisplayName(database, signature);
   assert.equal(result.fallbackProductName, "고급 러닝화");
+  assert.equal(result.fallbackProductNameSource, "product");
+});
+
+runAsync("enrichSignatureDisplayName prefers product fallback before legacy order item raw fields", async () => {
+  const database = createEmptyDatabase();
+  const signature = {
+    id: "sig-1",
+    storeId: "store-1",
+    sourceSignature: "sig",
+    rawProductNameSnapshot: "",
+    rawOptionInfoSnapshot: null,
+    normalizedProductName: "",
+    normalizedOptionInfo: "",
+    canonicalSalesUnitId: null,
+    mappingStatus: "UNMAPPED" as const,
+    confirmedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never;
+  database.orderItems.push({
+    id: "item-1",
+    orderId: "order-1",
+    storeId: "store-1",
+    productId: null,
+    orderSourceSignatureId: "sig-1",
+    canonicalSalesUnitId: null,
+    externalProductOrderId: "ext-1",
+    externalProductId: "prod-123",
+    optionCode: null,
+    packageNumber: null,
+    rawProductName: "Legacy Raw Product",
+    rawOptionInfo: null,
+    normalizedProductName: "legacy raw product",
+    normalizedOptionInfo: "",
+    sourceSignature: "sig",
+    quantity: 1,
+    productPaymentAmount: 10000,
+    totalProductAmount: null,
+    deliveryFeeAmount: null,
+    paymentCommission: null,
+    knowledgeShoppingSellingInterlockCommission: null,
+    saleCommission: null,
+    channelCommission: null,
+    orderDate: null,
+    paymentDate: null,
+    saleStatus: "SALE",
+    orderStatus: "PAYED",
+    isCanceled: false,
+    isReturned: false,
+    rawPayload: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as never);
+  database.products.push({
+    id: "p-1",
+    storeId: "store-1",
+    externalProductId: "prod-123",
+    productName: "Catalog Product",
+    normalizedProductName: "catalog product",
+    status: null,
+    firstSeenAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  const result = await enrichSignatureDisplayName(database, signature);
+
+  assert.equal(result.fallbackProductName, "Catalog Product");
   assert.equal(result.fallbackProductNameSource, "product");
 });
 

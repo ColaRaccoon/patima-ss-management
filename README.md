@@ -55,6 +55,7 @@ Maintenance scripts are dry-run by default:
 ```bash
 node scripts/report-db-size.mjs
 node scripts/prune-order-raw-payloads.mjs --days 0
+node scripts/prune-order-item-repeated-text-fields.mjs --full
 node scripts/prune-audit-logs.mjs --days 180
 node scripts/prune-operations.mjs --days 90 --keep-failed
 ```
@@ -74,6 +75,7 @@ Add `--yes` only after creating a fresh snapshot and stopping the backend.
 - Credential test now issues a real SELLER token and checks seller account/channel endpoints.
 - Order sync now prefers live Naver Commerce API calls.
 - Order sync stores order/order-item `rawPayload` only when `ORDER_RAW_PAYLOAD_RETENTION_DAYS` is greater than `0`; pruning preserves order rows, item rows, option codes, fees, delivery fees, sales amounts, and mapping fields.
+- Order item display/search text is resolved from `order_source_signatures`; new order syncs avoid repeating product/option/signature text in `order_items.payload`.
 - If no live Naver credential is available for the store, order sync falls back to the existing mock generator.
 - If live Naver sync is configured but the API call fails, the sync is marked as failed instead of silently using mock data.
 
