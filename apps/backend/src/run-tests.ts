@@ -4850,6 +4850,78 @@ run("createEmptyDatabase includes daily profit summary collections", () => {
   assert.deepEqual(database.dailyStoreSummaries, []);
 });
 
+run("ProfitService Excel export shows total ad cost and sales quantity above the detail table", () => {
+  const database = createEmptyDatabase();
+  const date = "2026-04-02";
+  database.dailySalesUnitProfits.push(
+    createStoredDailySalesUnitProfitForTest({
+      id: "group-profit",
+      date,
+      canonicalSalesUnitId: "group-1",
+      displayName: "Group Unit",
+      totalQuantity: 5,
+      totalAdCost: 100,
+      isGroup: true,
+      childRows: [
+        createStoredDailySalesUnitProfitForTest({
+          id: "child-profit-1",
+          date,
+          canonicalSalesUnitId: "child-1",
+          totalQuantity: 2,
+          totalAdCost: 40,
+          parentSalesUnitId: "group-1",
+        }),
+        createStoredDailySalesUnitProfitForTest({
+          id: "child-profit-2",
+          date,
+          canonicalSalesUnitId: "child-2",
+          totalQuantity: 3,
+          totalAdCost: 60,
+          parentSalesUnitId: "group-1",
+        }),
+      ],
+    }),
+    createStoredDailySalesUnitProfitForTest({
+      id: "standalone-profit",
+      date,
+      canonicalSalesUnitId: "standalone-1",
+      totalQuantity: 4,
+      totalAdCost: 20,
+    }),
+    createStoredDailySalesUnitProfitForTest({
+      id: "store-level-profit",
+      date,
+      canonicalSalesUnitId: "store-level",
+      totalQuantity: 99,
+      totalAdCost: 30,
+      isStoreLevel: true,
+    }),
+  );
+  database.dailyStoreSummaries.push(
+    createStoredDailyStoreSummaryForTest({ date, totalAdCost: 150 }),
+  );
+  const databaseService = createMemoryDatabaseService(database);
+  const profitService = new ProfitService(
+    databaseService as never,
+    new ProfitSummaryService(databaseService as never),
+  );
+
+  const buffer = profitService.exportDailySalesUnitsExcel({
+    storeId: "store-1",
+    dateFrom: date,
+    dateTo: date,
+  });
+  const workbook = XLSX.read(buffer, { type: "buffer" });
+  const sheet = workbook.Sheets.DailyProfitRows;
+
+  assert.equal(sheet.A1?.v, "전체 광고비");
+  assert.equal(sheet.B1?.v, 150);
+  assert.equal(sheet.C1?.v, "전체 판매수");
+  assert.equal(sheet.D1?.v, 9);
+  assert.equal(sheet.A2, undefined);
+  assert.equal(sheet.A3?.v, "일자");
+});
+
 runAsync("ProfitSummaryService skips committed writes for empty date refresh", async () => {
   const database = createEmptyDatabase();
   database.stores.push(createStoreRecord("store-1", "Main Store"));

@@ -144,6 +144,11 @@ export class ProfitService {
       rows.map((row) => row.date),
     );
     const flatRows = this.flattenDailyProfitRowsForExport(rows, dailyStoreSummaries);
+    const totalAdCost = rows.reduce((total, row) => total + row.totalAdCost, 0);
+    const totalSalesQuantity = rows.reduce(
+      (total, row) => total + (row.isStoreLevel ? 0 : row.totalQuantity),
+      0,
+    );
     const headers = [
       "일자",
       "판매단위명",
@@ -162,7 +167,12 @@ export class ProfitService {
       "스토어 배송마진",
       "스토어 전체 순이익",
     ];
-    const data: unknown[][] = [headers, ...flatRows];
+    const data: unknown[][] = [
+      ["전체 광고비", totalAdCost, "전체 판매수", totalSalesQuantity],
+      [],
+      headers,
+      ...flatRows,
+    ];
 
     const workbook = XLSX.utils.book_new();
     const sheet = XLSX.utils.aoa_to_sheet(data);

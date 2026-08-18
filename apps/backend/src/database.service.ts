@@ -566,7 +566,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     return this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         await client.query(
@@ -604,7 +604,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     return this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         const result = await client.query<{ payload: OperationRecord }>(
@@ -659,7 +659,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     return this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         const result = await client.query<{ id: string; payload: OperationRecord }>(
@@ -840,7 +840,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       };
     }
 
-    const client = await this.getPool().connect();
+    const client = await this.acquirePostgresClient();
     const result = await client.query<{ locked: boolean }>(
       "SELECT pg_try_advisory_lock(hashtext($1)) AS locked",
       [lockName],
@@ -1265,7 +1265,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     return this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         const storeResult = await client.query("SELECT id FROM stores WHERE id = $1 FOR UPDATE", [
@@ -1321,7 +1321,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     return this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         const signatureResult = await client.query<{ id: string; payload: OrderSourceSignature }>(
@@ -1409,7 +1409,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     return this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
 
@@ -1577,7 +1577,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         dates,
         buildReplacement: params.buildReplacement,
       });
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         await this.deleteDailyProfitSummaryRowsFromPostgres(client, params.storeId, dates);
@@ -1622,7 +1622,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     await this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         await this.deleteDailyProfitSummaryRowsFromPostgres(client, params.storeId, dates);
@@ -1690,7 +1690,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     return this.runPostgresCommitted(async () => {
-      const client = await this.getPool().connect();
+      const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
         const result = await client.query<{ payload: OperationRecord }>(
@@ -2398,6 +2398,9 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       connectionString: process.env.DATABASE_URL,
       max: 4,
     });
+    this.pool.on("error", (error) => {
+      console.error(`[DatabaseService] PostgreSQL idle client error: ${this.getErrorMessage(error)}`);
+    });
 
     await this.pool.query("SELECT 1");
     await this.ensurePostgresSchema();
@@ -2903,11 +2906,39 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return error instanceof Error ? error.message : String(error);
   }
 
+  private async acquirePostgresClient(): Promise<PoolClient> {
+    const client = await this.getPool().connect();
+    if (typeof client.on !== "function") {
+      return client;
+    }
+
+    let hasConnectionError = false;
+    const handleClientError = (error: Error) => {
+      hasConnectionError = true;
+      console.error(`[DatabaseService] PostgreSQL checked-out client error: ${this.getErrorMessage(error)}`);
+    };
+    const releaseClient = client.release.bind(client);
+    let released = false;
+
+    client.on("error", handleClientError);
+    client.release = ((error?: Error | boolean) => {
+      if (released) {
+        return;
+      }
+
+      released = true;
+      client.off?.("error", handleClientError);
+      releaseClient(error ?? (hasConnectionError ? true : undefined));
+    }) as PoolClient["release"];
+
+    return client;
+  }
+
   private async persistSnapshotToPostgres(
     snapshot: DatabaseShape,
     options: { includeQueueOwnedTables?: boolean } = {},
   ) {
-    const client = await this.getPool().connect();
+    const client = await this.acquirePostgresClient();
 
     try {
       await client.query("BEGIN");
