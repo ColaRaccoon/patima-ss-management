@@ -1,5 +1,6 @@
 import {
   Body,
+  HttpCode,
   BadRequestException,
   Controller,
   Delete,
@@ -24,6 +25,10 @@ import { DatabaseService } from "./database.service";
 import { FakePurchaseService } from "./fake-purchase.service";
 import { MappingSeedService } from "./mapping-seed.service";
 import { OrderMappingService } from "./order-mapping.service";
+import {
+  OrderSyncBatchService,
+  OrderSyncRequest,
+} from "./order-sync-batch.service";
 import { OrderSyncService } from "./order-sync.service";
 import { OperationService } from "./operation.service";
 import { ProfitService } from "./profit.service";
@@ -41,7 +46,10 @@ const formatCompactExportDate = (date: string) => {
   return `${match[1].slice(2)}${match[2]}${match[3]}`;
 };
 
-const sanitizeExportFilenamePart = (value: string | null | undefined, fallback: string) => {
+const sanitizeExportFilenamePart = (
+  value: string | null | undefined,
+  fallback: string,
+) => {
   const sanitized = (value ?? fallback)
     .trim()
     .replace(/[\\/:*?"<>|]/g, "_")
@@ -59,7 +67,9 @@ const buildExportContentDisposition = (filename: string) => {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 };
 
-const normalizeFakePurchaseAmount = (value: number | string | null | undefined): number => {
+const normalizeFakePurchaseAmount = (
+  value: number | string | null | undefined,
+): number => {
   if (value == null || value === "") {
     return 0;
   }
@@ -93,11 +103,17 @@ export class AppController {
     private readonly operationService: OperationService,
     private readonly mappingSeedService: MappingSeedService,
     private readonly databaseService: DatabaseService,
+    private readonly orderSyncBatchService: OrderSyncBatchService = new OrderSyncBatchService(
+      databaseService,
+    ),
   ) {}
 
   @Get("health")
   health() {
-    return formatApiSuccess({ ok: true, persistence: this.databaseService.getPersistenceStatus() });
+    return formatApiSuccess({
+      ok: true,
+      persistence: this.databaseService.getPersistenceStatus(),
+    });
   }
 
   @Get("stores")
@@ -106,12 +122,30 @@ export class AppController {
   }
 
   @Post("stores")
-  createStore(@Body() body: { name: string; sellerAccountId: string; channelNo: string; platformType?: "NAVER_SMARTSTORE" }) {
+  createStore(
+    @Body()
+    body: {
+      name: string;
+      sellerAccountId: string;
+      channelNo: string;
+      platformType?: "NAVER_SMARTSTORE";
+    },
+  ) {
     return this.storeService.create(body);
   }
 
   @Patch("stores/:storeId")
-  updateStore(@Param("storeId") storeId: string, @Body() body: { name: string; sellerAccountId: string; channelNo: string; memo?: string | null; deliveryUnitCost?: number }) {
+  updateStore(
+    @Param("storeId") storeId: string,
+    @Body()
+    body: {
+      name: string;
+      sellerAccountId: string;
+      channelNo: string;
+      memo?: string | null;
+      deliveryUnitCost?: number;
+    },
+  ) {
     return this.storeService.update(storeId, body);
   }
 
@@ -133,7 +167,8 @@ export class AppController {
   @Post("stores/:storeId/commerce-credentials")
   upsertCredentials(
     @Param("storeId") storeId: string,
-    @Body() body: { clientId: string; clientSecret: string; accessType?: "SELLER" },
+    @Body()
+    body: { clientId: string; clientSecret: string; accessType?: "SELLER" },
   ) {
     return this.credentialService.upsert(storeId, body);
   }
@@ -149,16 +184,110 @@ export class AppController {
   }
 
   @Post("stores/order-sync-all")
-  orderSyncAll(@Body() body: { dateFrom?: string; dateTo?: string }) {
-    return this.orderSyncService.enqueueSyncAll(body.dateFrom, body.dateTo);
+  @HttpCode(202)
+  orderSyncAll(@Body() body: OrderSyncRequest) {
+    return this.orderSyncService.enqueueSyncAll(
+      body.dateFrom,
+      body.dateTo,
+      body,
+    );
   }
 
   @Post("stores/:storeId/order-sync")
-  orderSync(
-    @Param("storeId") storeId: string,
-    @Body() body: { dateFrom?: string; dateTo?: string },
+  @HttpCode(202)
+  orderSync(@Param("storeId") storeId: string, @Body() body: OrderSyncRequest) {
+    return this.orderSyncService.enqueueSync(
+      storeId,
+      body.dateFrom,
+      body.dateTo,
+      body,
+    );
+  }
+
+  @Get("order-sync-batches")
+  async listOrderSyncBatches(
+    @Query("active") active?: string,
+    @Query("page") page?: string,
+    @Query("pageSize") pageSize?: string,
   ) {
-    return this.orderSyncService.enqueueSync(storeId, body.dateFrom, body.dateTo);
+    await this.databaseService.assertStatusReadable();
+    return formatApiSuccess(
+      this.orderSyncBatchService.list(
+        active === "true",
+        Number(page ?? 1),
+        Number(pageSize ?? 20),
+      ),
+    );
+  }
+
+  @Get("order-sync-batches/:id")
+  async getOrderSyncBatch(@Param("id") id: string) {
+    await this.databaseService.assertStatusReadable();
+    return formatApiSuccess(this.orderSyncBatchService.get(id));
+  }
+
+  @Post("order-sync-batches/:id/retry-failed")
+  @HttpCode(202)
+  async retryOrderSyncBatch(
+    @Param("id") id: string,
+    @Body() body: { idempotencyKey: string },
+  ) {
+    if (!body.idempotencyKey)
+      throw new BadRequestException("IDEMPOTENCY_KEY_REQUIRED");
+    return formatApiSuccess(
+      await this.orderSyncBatchService.enqueue(
+        { idempotencyKey: body.idempotencyKey },
+        undefined,
+        id,
+      ),
+    );
+  }
+
+  @Post("order-sync-batches/:id/acknowledge-coverage-gap")
+  async acknowledgeOrderSyncCoverage(
+    @Param("id") id: string,
+    @Body() body: { acknowledge?: boolean },
+  ) {
+    if (body.acknowledge !== true)
+      throw new BadRequestException("COVERAGE_ACKNOWLEDGEMENT_REQUIRED");
+    return formatApiSuccess(
+      await this.orderSyncBatchService.acknowledgeCoverageGap(id),
+    );
+  }
+
+  @Post("order-sync-batches/:id/retry-summary")
+  async retryOrderSyncSummary(@Param("id") id: string) {
+    const service = this.orderSyncBatchService;
+    const batch = service.get(id);
+    for (const item of batch.items) {
+      if (item.result?.summaryStatus !== "WARNING" || !item.operationId)
+        continue;
+      const dates = Array.isArray(item.result.affectedDates)
+        ? item.result.affectedDates.filter(
+            (date): date is string => typeof date === "string",
+          )
+        : [];
+      const result =
+        await this.profitSummaryService.refreshStoreDateListBestEffort({
+          storeId: item.storeId,
+          dates,
+          reason: "ORDER_SYNC",
+        });
+      if (result)
+        await this.databaseService.commitOrderSync((draft) => {
+          const operation = draft.operations.find(
+            (candidate) => candidate.id === item.operationId,
+          );
+          if (operation?.resultJson)
+            Object.assign(operation.resultJson, {
+              summaryStatus: "SUCCEEDED",
+              summaryWarning: null,
+              summaryRecalculation: result,
+              summaryUpdatedAt: new Date().toISOString(),
+            });
+        });
+    }
+    return formatApiSuccess(service.get(id));
   }
 
   @Get("order-items")
@@ -168,10 +297,12 @@ export class AppController {
     @Query("dateTo") dateTo?: string,
     @Query("productName") productName?: string,
     @Query("optionInfo") optionInfo?: string,
-    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
+    @Query("mappingStatus")
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("orderStatus") orderStatus?: string,
     @Query("saleStatus") saleStatus?: string,
-    @Query("paymentDateStatus") paymentDateStatus?: "ALL" | "PRESENT" | "MISSING",
+    @Query("paymentDateStatus")
+    paymentDateStatus?: "ALL" | "PRESENT" | "MISSING",
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
@@ -193,7 +324,8 @@ export class AppController {
   @Get("order-source-signatures")
   async getOrderSourceSignatures(
     @Query("storeId") storeId: string,
-    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
+    @Query("mappingStatus")
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("q") q?: string,
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
@@ -210,7 +342,8 @@ export class AppController {
   @Post("order-source-signatures/:signatureId/mapping")
   saveOrderMapping(
     @Param("signatureId") signatureId: string,
-    @Body() body:
+    @Body()
+    body:
       | { canonicalSalesUnitId: string }
       | {
           displayName: string;
@@ -226,7 +359,8 @@ export class AppController {
 
   @Post("order-source-signatures/batch-mapping")
   saveOrderMappings(
-    @Body() body:
+    @Body()
+    body:
       | { signatureIds: string[]; canonicalSalesUnitId: string }
       | {
           signatureIds: string[];
@@ -250,7 +384,8 @@ export class AppController {
 
   @Post("mapping-seed/:storeId")
   async generateInitialMappingSeed(@Param("storeId") storeId: string) {
-    const result = await this.mappingSeedService.generateInitialMappings(storeId);
+    const result =
+      await this.mappingSeedService.generateInitialMappings(storeId);
     return formatApiSuccess(result);
   }
 
@@ -261,18 +396,40 @@ export class AppController {
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
-    return this.salesUnitService.list(storeId, q, page ? Number(page) : undefined, pageSize ? Number(pageSize) : undefined);
+    return this.salesUnitService.list(
+      storeId,
+      q,
+      page ? Number(page) : undefined,
+      pageSize ? Number(pageSize) : undefined,
+    );
   }
 
   @Post("canonical-sales-units")
-  createSalesUnit(@Body() body: { storeId: string; displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null }) {
+  createSalesUnit(
+    @Body()
+    body: {
+      storeId: string;
+      displayName: string;
+      matchAliases?: string[] | null;
+      linkedProductIds?: string[] | null;
+      linkedOptionCodes?: string[] | null;
+      memo?: string | null;
+    },
+  ) {
     return this.salesUnitService.create(body);
   }
 
   @Patch("canonical-sales-units/:salesUnitId")
   updateSalesUnit(
     @Param("salesUnitId") salesUnitId: string,
-    @Body() body: { displayName: string; matchAliases?: string[] | null; linkedProductIds?: string[] | null; linkedOptionCodes?: string[] | null; memo?: string | null },
+    @Body()
+    body: {
+      displayName: string;
+      matchAliases?: string[] | null;
+      linkedProductIds?: string[] | null;
+      linkedOptionCodes?: string[] | null;
+      memo?: string | null;
+    },
   ) {
     return this.salesUnitService.update(salesUnitId, body);
   }
@@ -289,9 +446,18 @@ export class AppController {
 
   @Post("canonical-sales-units/group/create")
   createSalesUnitGroup(
-    @Body() body: { storeId: string; displayName: string; childSalesUnitIds: string[] },
+    @Body()
+    body: {
+      storeId: string;
+      displayName: string;
+      childSalesUnitIds: string[];
+    },
   ) {
-    return this.salesUnitService.createSalesUnitGroup(body.storeId, body.displayName, body.childSalesUnitIds);
+    return this.salesUnitService.createSalesUnitGroup(
+      body.storeId,
+      body.displayName,
+      body.childSalesUnitIds,
+    );
   }
 
   @Post("canonical-sales-units/group/:groupId/attach-child")
@@ -299,7 +465,11 @@ export class AppController {
     @Param("groupId") groupId: string,
     @Body() body: { storeId: string; childId: string },
   ) {
-    return this.salesUnitService.attachChildToGroup(body.storeId, groupId, body.childId);
+    return this.salesUnitService.attachChildToGroup(
+      body.storeId,
+      groupId,
+      body.childId,
+    );
   }
 
   @Post("canonical-sales-units/group/:childId/detach-child")
@@ -334,7 +504,11 @@ export class AppController {
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
-    return this.adsService.listPreviewRows(uploadId, page ? Number(page) : undefined, pageSize ? Number(pageSize) : undefined);
+    return this.adsService.listPreviewRows(
+      uploadId,
+      page ? Number(page) : undefined,
+      pageSize ? Number(pageSize) : undefined,
+    );
   }
 
   @Get("ad-uploads")
@@ -343,7 +517,11 @@ export class AppController {
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
-    return this.adsService.listUploads(storeId, page ? Number(page) : undefined, pageSize ? Number(pageSize) : undefined);
+    return this.adsService.listUploads(
+      storeId,
+      page ? Number(page) : undefined,
+      pageSize ? Number(pageSize) : undefined,
+    );
   }
 
   @Post("ad-uploads/:uploadId/confirm")
@@ -361,7 +539,8 @@ export class AppController {
     @Query("storeId") storeId: string,
     @Query("dateFrom") dateFrom?: string,
     @Query("dateTo") dateTo?: string,
-    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
+    @Query("mappingStatus")
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
@@ -376,12 +555,17 @@ export class AppController {
   }
 
   @Post("ad-campaign-costs/:adCostId/intentional-unmapped")
-  setIntentionalUnmapped(@Param("adCostId") adCostId: string, @Body() body: { reasonNote: string }) {
+  setIntentionalUnmapped(
+    @Param("adCostId") adCostId: string,
+    @Body() body: { reasonNote: string },
+  ) {
     return this.adsService.setIntentionalUnmapped(adCostId, body);
   }
 
   @Post("ad-campaign-costs/batch-intentional-unmapped")
-  setIntentionalUnmappedMany(@Body() body: { adCostIds: string[]; reasonNote: string }) {
+  setIntentionalUnmappedMany(
+    @Body() body: { adCostIds: string[]; reasonNote: string },
+  ) {
     return this.adsService.setIntentionalUnmappedMany(body.adCostIds, body);
   }
 
@@ -394,7 +578,9 @@ export class AppController {
   }
 
   @Post("ad-campaign-costs/batch-mapping")
-  saveAdCampaignMappings(@Body() body: { adCostIds: string[]; canonicalSalesUnitId: string }) {
+  saveAdCampaignMappings(
+    @Body() body: { adCostIds: string[]; canonicalSalesUnitId: string },
+  ) {
     return this.adsService.saveManualMappings(body.adCostIds, body);
   }
 
@@ -413,7 +599,8 @@ export class AppController {
     @Query("storeId") storeId: string,
     @Query("dateFrom") dateFrom?: string,
     @Query("dateTo") dateTo?: string,
-    @Query("mappingStatus") mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
+    @Query("mappingStatus")
+    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
     @Query("q") q?: string,
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
@@ -430,17 +617,23 @@ export class AppController {
   }
 
   @Post("ad-campaign-signatures/batch-mapping")
-  saveAdCampaignSignatureMappings(@Body() body: { signatureIds: string[]; canonicalSalesUnitId: string }) {
+  saveAdCampaignSignatureMappings(
+    @Body() body: { signatureIds: string[]; canonicalSalesUnitId: string },
+  ) {
     return this.adsService.saveManualMappings(body.signatureIds, body);
   }
 
   @Post("ad-campaign-signatures/batch-intentional-unmapped")
-  setAdCampaignSignaturesIntentionalUnmapped(@Body() body: { signatureIds: string[]; reasonNote: string }) {
+  setAdCampaignSignaturesIntentionalUnmapped(
+    @Body() body: { signatureIds: string[]; reasonNote: string },
+  ) {
     return this.adsService.setIntentionalUnmappedMany(body.signatureIds, body);
   }
 
   @Post("ad-campaign-signatures/batch-recalculate-mapping")
-  recalculateAdCampaignSignatureMappings(@Body() body: { signatureIds: string[] }) {
+  recalculateAdCampaignSignatureMappings(
+    @Body() body: { signatureIds: string[] },
+  ) {
     return this.adsService.recalculateMappings(body.signatureIds);
   }
 
@@ -450,11 +643,22 @@ export class AppController {
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
-    return this.campaignMappingService.list(storeId, page ? Number(page) : undefined, pageSize ? Number(pageSize) : undefined);
+    return this.campaignMappingService.list(
+      storeId,
+      page ? Number(page) : undefined,
+      pageSize ? Number(pageSize) : undefined,
+    );
   }
 
   @Post("campaign-mappings")
-  createCampaignMapping(@Body() body: { storeId: string; canonicalSalesUnitId: string; campaignPattern: string }) {
+  createCampaignMapping(
+    @Body()
+    body: {
+      storeId: string;
+      canonicalSalesUnitId: string;
+      campaignPattern: string;
+    },
+  ) {
     return this.campaignMappingService.create(body);
   }
 
@@ -502,13 +706,22 @@ export class AppController {
   @Patch("sales-unit-cost-settings/:costSettingId")
   updateCostSetting(
     @Param("costSettingId") costSettingId: string,
-    @Body() body: { unitCost: number; feeRate: number | null; otherCost: number; effectiveFrom: string },
+    @Body()
+    body: {
+      unitCost: number;
+      feeRate: number | null;
+      otherCost: number;
+      effectiveFrom: string;
+    },
   ) {
     return this.costService.update(costSettingId, body);
   }
 
   @Post("sales-unit-cost-settings/:costSettingId/close")
-  closeCostSetting(@Param("costSettingId") costSettingId: string, @Body() body: { effectiveTo: string }) {
+  closeCostSetting(
+    @Param("costSettingId") costSettingId: string,
+    @Body() body: { effectiveTo: string },
+  ) {
     return this.costService.close(costSettingId, body);
   }
 
@@ -523,7 +736,11 @@ export class AppController {
     @Body() body: { storeId: string; effectiveFrom: string },
     @UploadedFile() file: Express.Multer.File,
   ) {
-    const result = await this.costService.importExcelSnapshot(body.storeId, body.effectiveFrom, file);
+    const result = await this.costService.importExcelSnapshot(
+      body.storeId,
+      body.effectiveFrom,
+      file,
+    );
     return formatApiSuccess(result);
   }
 
@@ -533,7 +750,11 @@ export class AppController {
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
-    const result = this.costService.listSnapshots(storeId, page ? Number(page) : undefined, pageSize ? Number(pageSize) : undefined);
+    const result = this.costService.listSnapshots(
+      storeId,
+      page ? Number(page) : undefined,
+      pageSize ? Number(pageSize) : undefined,
+    );
     return formatApiSuccess(result);
   }
 
@@ -572,7 +793,12 @@ export class AppController {
 
   @Put("daily-fake-purchases")
   async upsertDailyFakePurchase(
-    @Body() body: { storeId: string; date: string; amount?: number | string | null },
+    @Body()
+    body: {
+      storeId: string;
+      date: string;
+      amount?: number | string | null;
+    },
   ) {
     return formatApiSuccess(
       await this.fakePurchaseService.upsert({
@@ -584,7 +810,10 @@ export class AppController {
   }
 
   @Get("dashboard/summary")
-  getDashboardSummary(@Query("storeId") storeId: string, @Query("date") date: string) {
+  getDashboardSummary(
+    @Query("storeId") storeId: string,
+    @Query("date") date: string,
+  ) {
     return this.profitService.getDashboardSummary(storeId, date);
   }
 
@@ -652,7 +881,12 @@ export class AppController {
       storeId: string;
       dateFrom: string;
       dateTo: string;
-      reason?: "ORDER_SYNC" | "AD_UPLOAD" | "COST_CHANGE" | "MAPPING_CHANGE" | "MANUAL";
+      reason?:
+        | "ORDER_SYNC"
+        | "AD_UPLOAD"
+        | "COST_CHANGE"
+        | "MAPPING_CHANGE"
+        | "MANUAL";
     },
   ) {
     return this.profitSummaryService.recalculateStoreDates({
@@ -669,7 +903,11 @@ export class AppController {
     @Query("storeId") storeId: string,
     @Query("date") date: string,
   ) {
-    return this.profitService.getDailySalesUnitDetail(storeId, salesUnitId, date);
+    return this.profitService.getDailySalesUnitDetail(
+      storeId,
+      salesUnitId,
+      date,
+    );
   }
 
   @Get("profits/unmapped-summary")
@@ -684,7 +922,12 @@ export class AppController {
   @Get("operations")
   getOperations(
     @Query("storeId") storeId: string,
-    @Query("operationType") operationType?: "ORDER_SYNC" | "AD_UPLOAD_CONFIRM" | "RECALCULATE_ORDER_MAPPING" | "RECALCULATE_AD_MAPPING",
+    @Query("operationType")
+    operationType?:
+      | "ORDER_SYNC"
+      | "AD_UPLOAD_CONFIRM"
+      | "RECALCULATE_ORDER_MAPPING"
+      | "RECALCULATE_AD_MAPPING",
     @Query("status") status?: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED",
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
@@ -704,7 +947,10 @@ export class AppController {
   }
 
   @Post("operations/:operationId/retry")
-  retryOperation(@Param("operationId") operationId: string) {
-    return this.operationService.retry(operationId);
+  retryOperation(
+    @Param("operationId") operationId: string,
+    @Body() body?: { idempotencyKey?: string },
+  ) {
+    return this.operationService.retry(operationId, body?.idempotencyKey);
   }
 }

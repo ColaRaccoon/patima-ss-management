@@ -274,6 +274,10 @@ export interface OperationDetail {
   errorMessage: string | null;
   requestSummary: Record<string, unknown> | null;
   resultSummary: Record<string, unknown> | null;
+  attemptCount?: number;
+  maxAttempts?: number;
+  runAfter?: string | null;
+  progressJson?: Record<string, unknown> | null;
 }
 
 export interface OrderSyncAllResult {

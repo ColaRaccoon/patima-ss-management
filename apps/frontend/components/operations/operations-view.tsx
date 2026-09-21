@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useRef, useState, useTransition } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
@@ -15,25 +15,138 @@ import { toneForOperationStatus } from "@/lib/status-tone";
 
 export function OperationsView({ data }: { data: OperationsPageData }) {
   const router = useRouter();
+  const requestedOperationId = useSearchParams().get("operationId");
   const [selectedOperationId, setSelectedOperationId] = useState<string | null>(
-    data.selectedOperation?.operationId ?? data.operations[0]?.operationId ?? null,
+    requestedOperationId ??
+      data.selectedOperation?.operationId ??
+      data.operations[0]?.operationId ??
+      null,
   );
-  const [selectedOperation, setSelectedOperation] = useState<OperationDetail | null>(
-    data.selectedOperation,
-  );
+  const [selectedOperation, setSelectedOperation] =
+    useState<OperationDetail | null>(data.selectedOperation);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
-
+  const retryKeys = useRef(new Map<string, string>());
+  const retryInFlight = useRef(false);
   useEffect(() => {
-    const fallbackId = data.selectedOperation?.operationId ?? data.operations[0]?.operationId ?? null;
-    if (!selectedOperationId || !data.operations.some((item) => item.operationId === selectedOperationId)) {
-      setSelectedOperationId(fallbackId);
+    try {
+      const saved: unknown = JSON.parse(
+        sessionStorage.getItem("order-sync-operation-retry-keys") ?? "{}",
+      );
+      if (saved && typeof saved === "object") {
+        for (const [id, key] of Object.entries(saved))
+          if (typeof key === "string") retryKeys.current.set(id, key);
+      }
+    } catch {
+      /* Persistence is optional; the server remains the operation ledger. */
+    }
+  }, []);
+  const persistRetryKeys = () => {
+    try {
+      sessionStorage.setItem(
+        "order-sync-operation-retry-keys",
+        JSON.stringify(Object.fromEntries(retryKeys.current)),
+      );
+    } catch {
+      /* optional */
+    }
+  };
+
+  const selectedStore = useRef(data.primaryStore?.id);
+  useEffect(() => {
+    if (requestedOperationId) setSelectedOperationId(requestedOperationId);
+  }, [requestedOperationId]);
+  useEffect(() => {
+    if (selectedStore.current !== data.primaryStore?.id) {
+      selectedStore.current = data.primaryStore?.id;
+      setSelectedOperationId(
+        data.selectedOperation?.operationId ??
+          data.operations[0]?.operationId ??
+          null,
+      );
       setSelectedOperation(data.selectedOperation);
     }
-  }, [data.operations, data.selectedOperation, selectedOperationId]);
+  }, [data.primaryStore?.id, data.operations, data.selectedOperation]);
+
+  useEffect(() => {
+    if (!selectedOperationId) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let inFlight = false;
+    let failures = 0;
+    let terminal = false;
+    let observedActive = false;
+    let controller: AbortController | undefined;
+    setSelectedOperation((current) =>
+      current?.operationId === selectedOperationId ? current : null,
+    );
+    const poll = async () => {
+      if (stopped || inFlight || terminal) return;
+      inFlight = true;
+      controller = new AbortController();
+      const timeout = setTimeout(() => controller?.abort(), 30_000);
+      setIsLoadingDetail(true);
+      try {
+        const detail = await readApiResponse<OperationDetail>(
+          await fetch(
+            `/api/operations/${encodeURIComponent(selectedOperationId)}`,
+            { cache: "no-store", signal: controller.signal },
+          ),
+          "작업 상세 조회에 실패했습니다.",
+        );
+        if (
+          !detail ||
+          detail.operationId !== selectedOperationId ||
+          !["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"].includes(detail.status)
+        )
+          throw new Error("작업 상태 응답이 올바르지 않습니다.");
+        if (!stopped) {
+          setSelectedOperation(detail);
+          setErrorMessage(null);
+          failures = 0;
+          terminal =
+            detail.status === "SUCCEEDED" || detail.status === "FAILED";
+          if (terminal && observedActive) router.refresh();
+          observedActive ||= !terminal;
+        }
+      } catch {
+        if (!stopped) {
+          failures++;
+          setErrorMessage(
+            "연결이 끊겨 상태를 확인할 수 없습니다. 마지막 상태를 유지하며 다시 연결합니다.",
+          );
+        }
+      } finally {
+        clearTimeout(timeout);
+        inFlight = false;
+        if (!stopped) {
+          setIsLoadingDetail(false);
+          if (!terminal)
+            timer = setTimeout(
+              poll,
+              document.hidden ? 15_000 : Math.min(30_000, 2500 * 2 ** failures),
+            );
+        }
+      }
+    };
+    const resume = () => {
+      if (!document.hidden) {
+        clearTimeout(timer);
+        void poll();
+      }
+    };
+    document.addEventListener("visibilitychange", resume);
+    void poll();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      controller?.abort();
+      document.removeEventListener("visibilitychange", resume);
+    };
+  }, [selectedOperationId, router]);
 
   if (!data.primaryStore) {
     return (
@@ -73,35 +186,15 @@ export function OperationsView({ data }: { data: OperationsPageData }) {
                   <button
                     className="button-shell button-ghost"
                     type="button"
-                    onClick={async () => {
-                      if (row.operationId === selectedOperationId && selectedOperation) {
-                        return;
-                      }
-
+                    onClick={() => {
                       setErrorMessage(null);
                       setSuccessMessage(null);
                       setSelectedOperationId(row.operationId);
-                      setIsLoadingDetail(true);
-                      try {
-                        const detail = await readApiResponse<OperationDetail>(
-                          await fetch(`/api/operations/${row.operationId}`, {
-                            cache: "no-store",
-                          }),
-                          "작업 상세 조회에 실패했습니다.",
-                        );
-                        setSelectedOperation(detail);
-                      } catch (error) {
-                        setErrorMessage(
-                          error instanceof Error
-                            ? error.message
-                            : "작업 상세 조회 중 오류가 발생했습니다.",
-                        );
-                      } finally {
-                        setIsLoadingDetail(false);
-                      }
                     }}
                   >
-                    {row.operationId === selectedOperationId ? "선택됨" : "선택"}
+                    {row.operationId === selectedOperationId
+                      ? "선택됨"
+                      : "선택"}
                   </button>
                 ),
               },
@@ -125,7 +218,9 @@ export function OperationsView({ data }: { data: OperationsPageData }) {
                 render: (row) => (
                   <div>
                     <p>{formatDateTime(row.createdAt)}</p>
-                    <p className="mt-1 text-xs text-ink/55">{formatDateTime(row.finishedAt)}</p>
+                    <p className="mt-1 text-xs text-ink/55">
+                      {formatDateTime(row.finishedAt)}
+                    </p>
                   </div>
                 ),
               },
@@ -159,43 +254,109 @@ export function OperationsView({ data }: { data: OperationsPageData }) {
           {selectedOperation ? (
             <div className="space-y-4 text-sm leading-6 text-ink/65">
               <div className="flex items-center justify-between gap-3">
-                <p className="font-semibold text-ink">{selectedOperation.operationType}</p>
-                <StatusBadge tone={toneForOperationStatus(selectedOperation.status)}>
-                  {selectedOperation.status}
+                <p className="font-semibold text-ink">
+                  {selectedOperation.operationType}
+                </p>
+                <StatusBadge
+                  tone={toneForOperationStatus(selectedOperation.status)}
+                >
+                  {selectedOperation.status === "QUEUED" &&
+                  (selectedOperation.attemptCount ?? 0) > 0
+                    ? "자동 재시도 대기"
+                    : selectedOperation.status}
                 </StatusBadge>
               </div>
               <p>createdAt {formatDateTime(selectedOperation.createdAt)}</p>
               <p>startedAt {formatDateTime(selectedOperation.startedAt)}</p>
               <p>finishedAt {formatDateTime(selectedOperation.finishedAt)}</p>
               <p>cutoffAt {formatDateTime(selectedOperation.cutoffAt)}</p>
-              <p>requestSummary {formatNullableText(JSON.stringify(selectedOperation.requestSummary))}</p>
-              <p>resultSummary {formatNullableText(JSON.stringify(selectedOperation.resultSummary))}</p>
-              <p className="text-red-700">{formatNullableText(selectedOperation.errorMessage)}</p>
+              {selectedOperation.status === "QUEUED" &&
+                (selectedOperation.attemptCount ?? 0) > 0 && (
+                  <p>
+                    다음 시도 {formatDateTime(selectedOperation.runAfter)} ·{" "}
+                    {selectedOperation.attemptCount}/
+                    {selectedOperation.maxAttempts}회 시도
+                  </p>
+                )}
+              <details>
+                <summary className="cursor-pointer">
+                  요청·결과 상세 정보
+                </summary>
+                <p>
+                  requestSummary{" "}
+                  {formatNullableText(
+                    JSON.stringify(selectedOperation.requestSummary),
+                  )}
+                </p>
+                <p>
+                  resultSummary{" "}
+                  {formatNullableText(
+                    JSON.stringify(selectedOperation.resultSummary),
+                  )}
+                </p>
+              </details>
+              <p className="text-red-700">
+                {formatNullableText(selectedOperation.errorMessage)}
+              </p>
 
               <button
                 className="button-shell button-primary"
                 type="button"
                 disabled={isBusy || selectedOperation.status !== "FAILED"}
                 onClick={async () => {
+                  if (retryInFlight.current) return;
+                  retryInFlight.current = true;
+                  const operationId = selectedOperation.operationId;
+                  const idempotencyKey =
+                    retryKeys.current.get(operationId) ?? crypto.randomUUID();
+                  retryKeys.current.set(operationId, idempotencyKey);
+                  persistRetryKeys();
                   setErrorMessage(null);
                   setSuccessMessage(null);
                   setIsRetrying(true);
                   try {
-                    await readApiResponse(
-                      await fetch(`/api/operations/${selectedOperation.operationId}/retry`, {
-                        method: "POST",
-                      }),
+                    const retry = await readApiResponse<{
+                      retryOperationId: string | null;
+                      batchId?: string;
+                    }>(
+                      await fetch(
+                        `/api/operations/${selectedOperation.operationId}/retry`,
+                        {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ idempotencyKey }),
+                        },
+                      ),
                       "작업 재시도 요청에 실패했습니다.",
                     );
+                    if (
+                      !retry?.retryOperationId &&
+                      typeof retry?.batchId === "string"
+                    ) {
+                      retryKeys.current.delete(operationId);
+                      persistRetryKeys();
+                      router.push(
+                        `/orders?batchId=${encodeURIComponent(retry.batchId)}`,
+                      );
+                      return;
+                    }
+                    if (!retry?.retryOperationId)
+                      throw new Error("재시도 작업 ID를 확인할 수 없습니다.");
+                    setSelectedOperationId(retry.retryOperationId);
+                    retryKeys.current.delete(operationId);
+                    persistRetryKeys();
                     setSuccessMessage("재시도 요청을 등록했습니다.");
                     startRefresh(() => {
                       router.refresh();
                     });
                   } catch (error) {
                     setErrorMessage(
-                      error instanceof Error ? error.message : "재시도 중 오류가 발생했습니다.",
+                      error instanceof Error
+                        ? error.message
+                        : "재시도 중 오류가 발생했습니다.",
                     );
                   } finally {
+                    retryInFlight.current = false;
                     setIsRetrying(false);
                   }
                 }}

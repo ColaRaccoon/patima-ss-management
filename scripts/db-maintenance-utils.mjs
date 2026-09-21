@@ -34,6 +34,9 @@ export const FULL_SYNC_TABLES = [
   'daily_sales_unit_profits',
   'daily_store_summaries',
   'operations',
+  'order_sync_batches',
+  'order_sync_batch_items',
+  'order_sync_states',
   'audit_logs',
 ];
 
@@ -57,6 +60,9 @@ export const DATABASE_SHAPE_KEYS = [
   ['dailySalesUnitProfits', 'daily_sales_unit_profits'],
   ['dailyStoreSummaries', 'daily_store_summaries'],
   ['operations', 'operations'],
+  ['orderSyncBatches', 'order_sync_batches'],
+  ['orderSyncBatchItems', 'order_sync_batch_items'],
+  ['orderSyncStates', 'order_sync_states'],
   ['auditLogs', 'audit_logs'],
 ];
 

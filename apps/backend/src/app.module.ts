@@ -15,6 +15,7 @@ import { NaverCommerceService } from "./naver-commerce.service";
 import { OperationService } from "./operation.service";
 import { OperationWorkerService } from "./operation-worker.service";
 import { OrderMappingService } from "./order-mapping.service";
+import { OrderSyncBatchService } from "./order-sync-batch.service";
 import { OrderSyncService } from "./order-sync.service";
 import { ProfitService } from "./profit.service";
 import { ProfitSummaryService } from "./profit-summary.service";
@@ -36,6 +37,7 @@ import { StoreService } from "./store.service";
     CredentialService,
     SalesUnitService,
     OrderSyncService,
+    OrderSyncBatchService,
     OrderMappingService,
     AdsService,
     CampaignMappingService,

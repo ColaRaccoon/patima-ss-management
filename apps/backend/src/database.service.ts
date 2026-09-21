@@ -231,6 +231,9 @@ const STORAGE_TABLES: StorageTable[] = [
   { key: "dailySalesUnitProfits", tableName: "daily_sales_unit_profits" },
   { key: "dailyStoreSummaries", tableName: "daily_store_summaries" },
   { key: "operations", tableName: "operations", queueOwned: true },
+  { key: "orderSyncBatches", tableName: "order_sync_batches", queueOwned: true },
+  { key: "orderSyncBatchItems", tableName: "order_sync_batch_items", queueOwned: true },
+  { key: "orderSyncStates", tableName: "order_sync_states", queueOwned: true },
   { key: "auditLogs", tableName: "audit_logs" },
 ];
 
@@ -480,6 +483,11 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     await this.pool?.end();
   }
 
+  async assertStatusReadable(): Promise<void> {
+    if (this.storageMode === "postgres") await this.getPool().query("SELECT 1");
+    else if (this.lastPersistenceError) throw new Error("STORAGE_UNAVAILABLE");
+  }
+
   getStorageMode() {
     return this.storageMode;
   }
@@ -555,6 +563,147 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return this.cloneSnapshot(normalized);
   }
 
+  /** Serialize queue-owned writes with normal snapshot commits; publish memory only after COMMIT. */
+  async commitOrderSync<T>(
+    mutator: (draft: DatabaseShape) => T,
+    fence?: { id: string; owner: string; attempt: number },
+    storeId?: string,
+    scope?: { orderIds: Set<string>; itemIds: Set<string> },
+  ): Promise<T> {
+    const checkFence = (draft: DatabaseShape) => {
+      if (!fence) return;
+      const operation = draft.operations.find((item) => item.id === fence.id);
+      if (
+        !operation ||
+        operation.status !== "RUNNING" ||
+        operation.leaseOwner !== fence.owner ||
+        operation.attemptCount !== fence.attempt ||
+        !operation.leaseExpiresAt ||
+        operation.leaseExpiresAt <= new Date().toISOString()
+      )
+        throw new Error("OPERATION_LEASE_LOST");
+    };
+    if (this.storageMode !== "postgres")
+      return this.writeCommitted((draft) => {
+        checkFence(draft);
+        return mutator(draft);
+      });
+    return this.runPostgresCommitted(async () => {
+      const client = await this.acquirePostgresClient();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL lock_timeout = '10s'");
+        await client.query("SET LOCAL statement_timeout = '30s'");
+        await client.query("SELECT pg_advisory_xact_lock(7192341)");
+        const keys: Array<keyof DatabaseShape> = [
+          "operations",
+          "orderSyncBatches",
+          "orderSyncBatchItems",
+          "orderSyncStates",
+          ...(storeId
+            ? ([
+                "orders",
+                "orderItems",
+                "products",
+                "orderSourceSignatures",
+                "stores",
+                "auditLogs",
+              ] as Array<keyof DatabaseShape>)
+            : []),
+        ];
+        const draft = { ...this.database };
+        const writableRows = new Set<unknown>();
+        for (const key of keys) {
+          (draft[key] as unknown[]) = (
+            this.database[key] as Array<{
+              id: string;
+              storeId?: string;
+              externalOrderId?: string;
+              externalProductOrderId?: string;
+            }>
+          ).map((row) => {
+            const selected =
+              key === "orders" && scope
+                ? scope.orderIds.has(row.externalOrderId ?? "") &&
+                  row.storeId === storeId
+                : key === "orderItems" && scope
+                  ? scope.itemIds.has(row.externalProductOrderId ?? "") &&
+                    row.storeId === storeId
+                  : storeId &&
+                      [
+                        "products",
+                        "orderSourceSignatures",
+                        "auditLogs",
+                      ].includes(key)
+                    ? row.storeId === storeId
+                    : key === "operations" && fence
+                      ? row.id === fence.id
+                      : true;
+            if (!selected) return row;
+            const copy = this.cloneSnapshot(row);
+            writableRows.add(copy);
+            return copy;
+          });
+        }
+        if (fence) {
+          const locked = await client.query<{ payload: OperationRecord }>(
+            "SELECT payload FROM operations WHERE id = $1 FOR UPDATE",
+            [fence.id],
+          );
+          const index = draft.operations.findIndex(
+            (item) => item.id === fence.id,
+          );
+          if (!locked.rows[0] || index < 0)
+            throw new Error("OPERATION_LEASE_LOST");
+          draft.operations[index] = locked.rows[0].payload;
+          writableRows.add(draft.operations[index]);
+        }
+        checkFence(draft);
+        // Idempotency lookup must use committed rows under the cross-request transaction lock.
+        if (!fence && !storeId) {
+          const batches = await client.query<{
+            payload: DatabaseShape["orderSyncBatches"][number];
+          }>("SELECT payload FROM order_sync_batches");
+          draft.orderSyncBatches = batches.rows.map((row) => row.payload);
+        }
+        const before = new Map(
+          keys.map((key) => [
+            key,
+            new Map(
+              (draft[key] as Array<{ id: string }>).map((row) => [
+                row.id,
+                writableRows.has(row) ? hashPayload(row) : null,
+              ]),
+            ),
+          ]),
+        );
+        const leaseExpiresAt = fence ? draft.operations.find((item) => item.id === fence.id)?.leaseExpiresAt : null;
+        const result = mutator(draft);
+        for (const key of keys) {
+          const table = STORAGE_TABLES.find(
+            (candidate) => candidate.key === key,
+          )!;
+          const changed = (draft[key] as Array<{ id: string }>).filter(
+            (row) =>
+              (writableRows.has(row) || !before.get(key)?.has(row.id)) &&
+              before.get(key)?.get(row.id) !== hashPayload(row),
+          );
+          if (changed.length)
+            await this.upsertTableRows(client, table, changed);
+        }
+        if (leaseExpiresAt && leaseExpiresAt <= new Date().toISOString()) throw new Error("OPERATION_LEASE_LOST");
+        await client.query("COMMIT");
+        this.database = draft;
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
   async insertOperation(operation: OperationRecord): Promise<OperationRecord> {
     const normalized = this.normalizeOperationRecord(operation);
 
@@ -590,6 +739,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     const nowAt = now.toISOString();
 
     if (this.storageMode !== "postgres") {
+      if (!this.database.operations.some((operation) => operation.status === "RUNNING" && (!operation.leaseExpiresAt || operation.leaseExpiresAt <= nowAt))) return 0;
       return this.writeCommitted((draft) => {
         let recoveredCount = 0;
         draft.operations = draft.operations.map((operation) => {
@@ -646,6 +796,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     const nowAt = now.toISOString();
 
     if (this.storageMode !== "postgres") {
+      if (!this.findNextOperationCandidate(this.database.operations, nowAt)) return null;
       return this.writeCommitted((draft) => {
         const candidate = this.findNextOperationCandidate(draft.operations, nowAt);
         if (!candidate) {
@@ -683,8 +834,10 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
              WHERE active.id <> operations.id
                AND active.payload->>'storeId' = operations.payload->>'storeId'
                AND active.payload->>'operationType' = operations.payload->>'operationType'
-               AND active.payload->>'status' = 'RUNNING'
-               AND COALESCE(NULLIF(active.payload->>'leaseExpiresAt', ''), '0001-01-01T00:00:00.000Z') > $1
+               AND ((active.payload->>'status' = 'RUNNING'
+                 AND COALESCE(NULLIF(active.payload->>'leaseExpiresAt', ''), '0001-01-01T00:00:00.000Z') > $1)
+                 OR (operations.payload->>'operationType' = 'ORDER_SYNC' AND active.payload->>'status' = 'QUEUED'
+                   AND (active.payload->>'createdAt', active.id) < (operations.payload->>'createdAt', operations.id)))
            )
            ORDER BY
              CASE WHEN payload->>'status' = 'RUNNING' THEN 0 ELSE 1 END,
@@ -1246,6 +1399,70 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return operation;
   }
 
+  async saveDailyFakePurchaseCommitted(params: {
+    storeId: string;
+    date: string;
+    buildReplacement: (existing: DatabaseShape["dailyFakePurchases"][number] | null) => {
+      purchase: DatabaseShape["dailyFakePurchases"][number];
+      auditLog: DatabaseShape["auditLogs"][number];
+    };
+  }): Promise<DatabaseShape["dailyFakePurchases"][number]> {
+    const apply = (
+      draft: DatabaseShape,
+      purchase: DatabaseShape["dailyFakePurchases"][number],
+      auditLog: DatabaseShape["auditLogs"][number],
+    ) => {
+      const index = draft.dailyFakePurchases.findIndex(
+        (row) => row.storeId === purchase.storeId && row.date === purchase.date,
+      );
+      if (index === -1) draft.dailyFakePurchases.push(purchase);
+      else draft.dailyFakePurchases[index] = purchase;
+      this.upsertAuditLogInSnapshot(draft, auditLog);
+    };
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        const existing =
+          draft.dailyFakePurchases.find(
+            (row) => row.storeId === params.storeId && row.date === params.date,
+          ) ?? null;
+        const replacement = params.buildReplacement(existing ? this.cloneSnapshot(existing) : null);
+        apply(draft, replacement.purchase, replacement.auditLog);
+        return this.cloneSnapshot(replacement.purchase);
+      });
+    }
+    return this.runPostgresCommitted(async () => {
+      const client = await this.acquirePostgresClient();
+      try {
+        await client.query("BEGIN");
+        const storeResult = await client.query("SELECT id FROM stores WHERE id = $1 FOR UPDATE", [
+          params.storeId,
+        ]);
+        if (!storeResult.rows.length) throw new Error("STORE_NOT_FOUND");
+        const result = await client.query<{ payload: DatabaseShape["dailyFakePurchases"][number] }>(
+          "SELECT payload FROM daily_fake_purchases WHERE payload->>'storeId' = $1 AND payload->>'date' = $2 ORDER BY id LIMIT 1 FOR UPDATE",
+          [params.storeId, params.date],
+        );
+        const replacement = params.buildReplacement(result.rows[0]?.payload ?? null);
+        await this.upsertTableRows(
+          client,
+          { key: "dailyFakePurchases", tableName: "daily_fake_purchases" },
+          [replacement.purchase],
+        );
+        await this.upsertTableRows(client, { key: "auditLogs", tableName: "audit_logs" }, [
+          replacement.auditLog,
+        ]);
+        await client.query("COMMIT");
+        apply(this.database, replacement.purchase, replacement.auditLog);
+        return this.cloneSnapshot(replacement.purchase);
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+  }
+
   async createCanonicalSalesUnitCommitted(params: {
     salesUnit: CanonicalSalesUnit;
     auditLog?: DatabaseShape["auditLogs"][number] | null;
@@ -1675,7 +1892,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         }
 
         const current = this.normalizeOperationRecord(draft.operations[index]);
-        if (current.leaseOwner !== leaseOwner) {
+        if (current.leaseOwner !== leaseOwner || current.status !== "RUNNING" || !current.leaseExpiresAt || current.leaseExpiresAt <= new Date().toISOString()) {
           return null;
         }
 
@@ -1704,7 +1921,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         }
 
         const current = this.normalizeOperationRecord(row.payload);
-        if (current.leaseOwner !== leaseOwner) {
+        if (current.leaseOwner !== leaseOwner || current.status !== "RUNNING" || !current.leaseExpiresAt || current.leaseExpiresAt <= new Date().toISOString()) {
           await client.query("COMMIT");
           return null;
         }
@@ -1790,8 +2007,8 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
               active.id !== operation.id &&
               active.storeId === operation.storeId &&
               active.operationType === operation.operationType &&
-              active.status === "RUNNING" &&
-              !this.isOperationLeaseExpired(active, nowAt),
+              ((active.status === "RUNNING" && !this.isOperationLeaseExpired(active, nowAt)) ||
+                (operation.operationType === "ORDER_SYNC" && active.status === "QUEUED" && (active.createdAt < operation.createdAt || (active.createdAt === operation.createdAt && active.id < operation.id)))),
           ),
       )
       .sort((left, right) => this.compareOperationCandidates(left.operation, right.operation));
@@ -2397,6 +2614,9 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     this.pool = new Pool({
       connectionString: process.env.DATABASE_URL,
       max: 4,
+      connectionTimeoutMillis: 10_000,
+      statement_timeout: 30_000,
+      lock_timeout: 10_000,
     });
     this.pool.on("error", (error) => {
       console.error(`[DatabaseService] PostgreSQL idle client error: ${this.getErrorMessage(error)}`);
@@ -2441,6 +2661,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       await pool.query(`ALTER TABLE ${table.tableName} ADD COLUMN IF NOT EXISTS payload_hash TEXT`);
     }
 
+    await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS order_sync_batches_idempotency_key ON order_sync_batches ((payload->>'idempotencyKey'))");
     await this.backfillPostgresPayloadHashes(pool);
     const duplicateWarnings = await this.warnAboutDuplicateBusinessKeys(pool);
     await this.ensurePostgresIndexes(pool, duplicateWarnings);

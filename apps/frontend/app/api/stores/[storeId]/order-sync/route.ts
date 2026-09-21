@@ -1,13 +1,20 @@
-import { proxyRequest } from "@/app/api/_utils/proxy";
+import {
+  proxyRequest,
+  ORDER_SYNC_PROXY_TIMEOUT_MS,
+} from "@/app/api/_utils/proxy";
 
 export async function POST(
   request: Request,
   context: { params: Promise<{ storeId: string }> },
 ) {
   const { storeId } = await context.params;
-  const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = (await request.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
 
   return proxyRequest({
+    timeoutMs: ORDER_SYNC_PROXY_TIMEOUT_MS,
     path: `/stores/${storeId}/order-sync`,
     method: "POST",
     fallbackMessage: "주문 동기화 시작에 실패했습니다.",

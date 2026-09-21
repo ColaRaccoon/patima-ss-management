@@ -7,7 +7,13 @@ export async function readApiResponse<T>(
     | T
     | null;
 
-  if (!response.ok) {
+  if (
+    !response.ok ||
+    payload === null ||
+    (typeof payload === "object" &&
+      "success" in payload &&
+      payload.success === false)
+  ) {
     if (
       payload &&
       typeof payload === "object" &&

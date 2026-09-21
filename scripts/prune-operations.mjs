@@ -41,6 +41,7 @@ const operationDateSql = `
 const targetPredicate = `
   (${operationDateSql}) < $1
   AND payload->>'status' NOT IN ('QUEUED', 'RUNNING')
+  AND NULLIF(payload->'requestJson'->>'batchId', '') IS NULL
   AND (
     payload->>'status' = 'SUCCEEDED'
     OR ($2::boolean IS TRUE AND payload->>'status' = 'FAILED')

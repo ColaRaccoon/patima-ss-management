@@ -1,0 +1,60 @@
+{
+  "recordedAt": "2026-09-18T02:06:15.159Z",
+  "nodeVersion": "v24.14.0",
+  "platform": "win32",
+  "hardware": {
+    "cpuModel": "12th Gen Intel(R) Core(TM) i5-12400",
+    "logicalCpus": 12,
+    "totalRamMiB": 16105.24
+  },
+  "scope": "Synthetic file-mode baseline at 1x=100 and 3x=300 items/store. Production DB size was not inspected. statusP95Ms is immediate service execution; scheduledStatusP95Ms includes lateness of a 25ms timer plus state lookup, not HTTP/proxy or Naver network. Real file persistence, worker execution, mapping and summary services are included. Repeated IDs test idempotence, not continuously growing order history. Early/late heap medians sample first/last 20 batches without forced GC, include retained operation/audit history, and do not prove absence of memory leaks.",
+  "results": [
+    {
+      "itemsPerStore": 100,
+      "stores": 6,
+      "repeatedBatches": 100,
+      "successfulOperations": 600,
+      "uniqueOrders": 600,
+      "uniqueOrderItems": 600,
+      "duplicateItems": 0,
+      "failedOperations": 0,
+      "pendingOperations": 0,
+      "elapsedSeconds": 94.84,
+      "enqueueP95Ms": 16.11,
+      "statusP95Ms": 0.16,
+      "scheduledStatusP95Ms": 190.08,
+      "scheduledStatusSamples": 700,
+      "operationP95Ms": 217.67,
+      "peakHeapMiB": 122.19,
+      "peakRssMiB": 322.57,
+      "earlyBatchHeapMedianMiB": 52.25,
+      "lateBatchHeapMedianMiB": 78.29,
+      "eventLoopMaxMs": 287.57,
+      "eventLoopP95Ms": 215.22
+    },
+    {
+      "itemsPerStore": 300,
+      "stores": 6,
+      "repeatedBatches": 100,
+      "successfulOperations": 600,
+      "uniqueOrders": 1800,
+      "uniqueOrderItems": 1800,
+      "duplicateItems": 0,
+      "failedOperations": 0,
+      "pendingOperations": 0,
+      "elapsedSeconds": 262.67,
+      "enqueueP95Ms": 26.43,
+      "statusP95Ms": 0.22,
+      "scheduledStatusP95Ms": 290.96,
+      "scheduledStatusSamples": 1897,
+      "operationP95Ms": 604.75,
+      "peakHeapMiB": 148.29,
+      "peakRssMiB": 362.27,
+      "earlyBatchHeapMedianMiB": 59.83,
+      "lateBatchHeapMedianMiB": 86.01,
+      "eventLoopMaxMs": 1145.04,
+      "eventLoopP95Ms": 314.57
+    }
+  ],
+  "measurementConditions": "Active developer workstation; the initial portion overlapped a full project build, and later typechecks ran concurrently. Background workloads were not isolated."
+}

@@ -5,14 +5,14 @@ import {
 
 export async function POST(
   request: Request,
-  context: { params: Promise<{ operationId: string }> },
+  context: { params: Promise<{ batchId: string }> },
 ) {
-  const { operationId } = await context.params;
+  const { batchId } = await context.params;
   return proxyRequest({
     timeoutMs: ORDER_SYNC_PROXY_TIMEOUT_MS,
-    path: `/operations/${operationId}/retry`,
+    path: `/order-sync-batches/${encodeURIComponent(batchId)}/retry-failed`,
     method: "POST",
-    fallbackMessage: "작업 재시도 요청에 실패했습니다.",
+    fallbackMessage: "실패 스토어 재시도를 접수할 수 없습니다.",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(await request.json().catch(() => ({}))),
   });

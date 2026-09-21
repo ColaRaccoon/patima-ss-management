@@ -9,22 +9,17 @@ import { PageHeader } from "@/components/shared/page-header";
 import { Panel } from "@/components/shared/panel";
 import { SourceBanner } from "@/components/shared/source-banner";
 import { StatusBadge } from "@/components/shared/status-badge";
-import { readApiResponse } from "@/lib/api/browser";
-import type {
-  OrdersPageData,
-  OrdersPageFilters,
-  OrderSyncAllResult,
-} from "@/lib/api/types";
+import { OrderSyncPanel } from "./order-sync-panel";
+import { isActiveBatch, useOrderSync } from "./order-sync-provider";
+import type { OrdersPageData, OrdersPageFilters } from "@/lib/api/types";
 import {
   buildNaverStoreProductUrl,
   formatCurrency,
   formatDate,
-  formatDateRange,
-  formatDateTime,
   formatNullableText,
   formatNumber,
 } from "@/lib/format";
-import { toneForOperationStatus, toneForSaleStatus } from "@/lib/status-tone";
+import { toneForSaleStatus } from "@/lib/status-tone";
 import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 
 const SALE_STATUS_OPTIONS = [
@@ -40,9 +35,7 @@ const SALE_STATUS_OPTIONS = [
 export function OrdersView({ data }: { data: OrdersPageData }) {
   const router = useRouter();
   const [filters, setFilters] = useState<OrdersPageFilters>(data.filters);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const sync = useOrderSync();
   const [isRefreshing, startRefresh] = useTransition();
 
   useEffect(() => {
@@ -60,7 +53,11 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
     );
   }
 
-  const isBusy = isSyncing || isRefreshing;
+  const isBusy =
+    sync.submitting ||
+    sync.pending ||
+    sync.batches.some(isActiveBatch) ||
+    isRefreshing;
   const operationsHref = buildHrefWithStore(
     "/operations",
     null,
@@ -78,79 +75,30 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
     });
 
     startRefresh(() => {
-      router.replace(searchParams.size > 0 ? `/orders?${searchParams.toString()}` : "/orders");
+      router.replace(
+        searchParams.size > 0
+          ? `/orders?${searchParams.toString()}`
+          : "/orders",
+      );
     });
   };
 
-  const startOrderSync = async (
-    payload: { dateFrom?: string; dateTo?: string },
-    fallbackMessage: string,
-    nextSuccessMessage: string,
-  ) => {
-    setErrorMessage(null);
-    setSuccessMessage(null);
-    setIsSyncing(true);
-    try {
-      await readApiResponse(
-        await fetch(`/api/stores/${data.primaryStore!.id}/order-sync`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload),
-        }),
-        fallbackMessage,
-      );
-
-      setSuccessMessage(nextSuccessMessage);
-      startRefresh(() => {
-        router.refresh();
-      });
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : "\uC8FC\uBB38 \uB3D9\uAE30\uD654 \uC694\uCCAD \uC911 \uC624\uB958\uAC00 \uBC1C\uC0DD\uD588\uC2B5\uB2C8\uB2E4.",
-      );
-    } finally {
-      setIsSyncing(false);
-    }
+  const startOrderSync = async (payload: {
+    dateFrom?: string;
+    dateTo?: string;
+  }) => {
+    await sync.submit(`/api/stores/${data.primaryStore!.id}/order-sync`, {
+      ...payload,
+      mode: payload.dateFrom ? "MANUAL" : "YESTERDAY",
+    });
   };
 
   const startAllStoreOrderSync = async () => {
-    setErrorMessage(null);
-    setSuccessMessage(null);
-    setIsSyncing(true);
-    try {
-      const result = await readApiResponse<OrderSyncAllResult>(
-        await fetch("/api/stores/order-sync-all", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            dateFrom: filters.dateFrom,
-            dateTo: filters.dateTo,
-          }),
-        }),
-        "전체 스토어 주문 동기화 시작에 실패했습니다.",
-      );
-
-      setSuccessMessage(
-        `${result.targetStoreCount}개 스토어 동기화 작업을 시작했습니다. ${result.skippedStoreCount}개 스토어는 건너뛰었습니다.`,
-      );
-      startRefresh(() => {
-        router.refresh();
-      });
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : "전체 스토어 주문 동기화 요청 중 오류가 발생했습니다.",
-      );
-    } finally {
-      setIsSyncing(false);
-    }
+    await sync.submit("/api/stores/order-sync-all", {
+      mode: "MANUAL",
+      dateFrom: filters.dateFrom,
+      dateTo: filters.dateFrom,
+    });
   };
 
   return (
@@ -165,29 +113,19 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               className="button-shell button-secondary"
               type="button"
               disabled={isBusy}
-              onClick={() =>
-                void startOrderSync(
-                  {},
-                  "최근 30일 주문 동기화 시작에 실패했습니다.",
-                  "최근 30일 주문 동기화를 큐에 등록했습니다.",
-                )
-              }
+              onClick={() => void startOrderSync({})}
             >
-              최근 30일 동기화
+              어제 주문 동기화
             </button>
             <button
               className="button-shell button-secondary"
               type="button"
               disabled={isBusy}
               onClick={() =>
-                void startOrderSync(
-                  {
-                    dateFrom: filters.dateFrom,
-                    dateTo: filters.dateFrom,
-                  },
-                  "\uC120\uD0DD \uAE30\uAC04 \uC8FC\uBB38 \uB3D9\uAE30\uD654 \uC2DC\uC791\uC5D0 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4.",
-                  `\uC120\uD0DD \uB0A0\uC9DC(${filters.dateFrom}) \uC8FC\uBB38 \uB3D9\uAE30\uD654\uB97C \uC791\uC5C5 \uD050\uC5D0 \uB4F1\uB85D\uD588\uC2B5\uB2C8\uB2E4.`,
-                )
+                void startOrderSync({
+                  dateFrom: filters.dateFrom,
+                  dateTo: filters.dateFrom,
+                })
               }
             >
               {"\uC120\uD0DD \uB0A0\uC9DC \uB3D9\uAE30\uD654"}
@@ -198,7 +136,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               disabled={isBusy}
               onClick={() => void startAllStoreOrderSync()}
             >
-              전체 스토어 주문 동기화
+              전체 스토어 선택 날짜 동기화
             </button>
             <Link className="button-shell button-primary" href={operationsHref}>
               작업 상세 보기
@@ -208,8 +146,9 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
       />
 
       <SourceBanner sources={data.sources} />
+      <OrderSyncPanel />
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.25fr)_minmax(320px,0.75fr)]">
+      <div className="grid gap-6">
         <Panel
           title="조회 필터"
           description={`현재 선택 날짜 ${formatDate(filters.dateFrom)}`}
@@ -218,67 +157,93 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
             className="space-y-4"
             onSubmit={(event: FormEvent<HTMLFormElement>) => {
               event.preventDefault();
-              setErrorMessage(null);
-              setSuccessMessage(null);
               applyFilters(filters);
             }}
           >
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">조회 날짜</span>
+                <span className="mb-2 block text-sm font-medium text-ink">
+                  조회 날짜
+                </span>
                 <input
                   className="input-shell"
                   type="date"
                   value={filters.dateFrom}
                   onChange={(event) => {
-                    setErrorMessage(null);
-                    setSuccessMessage(null);
-                    setFilters((current) => ({ ...current, dateFrom: event.target.value, dateTo: event.target.value }));
-                    const nextFilters = { ...filters, dateFrom: event.target.value, dateTo: event.target.value };
+                    setFilters((current) => ({
+                      ...current,
+                      dateFrom: event.target.value,
+                      dateTo: event.target.value,
+                    }));
+                    const nextFilters = {
+                      ...filters,
+                      dateFrom: event.target.value,
+                      dateTo: event.target.value,
+                    };
                     applyFilters(nextFilters);
                   }}
                 />
               </label>
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">상품명</span>
+                <span className="mb-2 block text-sm font-medium text-ink">
+                  상품명
+                </span>
                 <input
                   className="input-shell"
                   placeholder="원본 상품명 검색"
                   value={filters.productName}
                   onChange={(event) =>
-                    setFilters((current) => ({ ...current, productName: event.target.value }))
+                    setFilters((current) => ({
+                      ...current,
+                      productName: event.target.value,
+                    }))
                   }
                 />
               </label>
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">옵션 정보</span>
+                <span className="mb-2 block text-sm font-medium text-ink">
+                  옵션 정보
+                </span>
                 <input
                   className="input-shell"
                   placeholder="원본 옵션 검색"
                   value={filters.optionInfo}
                   onChange={(event) =>
-                    setFilters((current) => ({ ...current, optionInfo: event.target.value }))
+                    setFilters((current) => ({
+                      ...current,
+                      optionInfo: event.target.value,
+                    }))
                   }
                 />
               </label>
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">orderStatus</span>
+                <span className="mb-2 block text-sm font-medium text-ink">
+                  orderStatus
+                </span>
                 <input
                   className="input-shell"
                   placeholder="예: DELIVERED"
                   value={filters.orderStatus}
                   onChange={(event) =>
-                    setFilters((current) => ({ ...current, orderStatus: event.target.value }))
+                    setFilters((current) => ({
+                      ...current,
+                      orderStatus: event.target.value,
+                    }))
                   }
                 />
               </label>
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">saleStatus</span>
+                <span className="mb-2 block text-sm font-medium text-ink">
+                  saleStatus
+                </span>
                 <select
                   className="input-shell"
                   value={filters.saleStatus}
                   onChange={(event) =>
-                    setFilters((current) => ({ ...current, saleStatus: event.target.value }))
+                    setFilters((current) => ({
+                      ...current,
+                      saleStatus: event.target.value,
+                    }))
                   }
                 >
                   {SALE_STATUS_OPTIONS.map((option) => (
@@ -289,14 +254,17 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                 </select>
               </label>
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">mappingStatus</span>
+                <span className="mb-2 block text-sm font-medium text-ink">
+                  mappingStatus
+                </span>
                 <select
                   className="input-shell"
                   value={filters.mappingStatus}
                   onChange={(event) =>
                     setFilters((current) => ({
                       ...current,
-                      mappingStatus: event.target.value as OrdersPageFilters["mappingStatus"],
+                      mappingStatus: event.target
+                        .value as OrdersPageFilters["mappingStatus"],
                     }))
                   }
                 >
@@ -307,15 +275,17 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                 </select>
               </label>
               <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">paymentDateStatus</span>
+                <span className="mb-2 block text-sm font-medium text-ink">
+                  paymentDateStatus
+                </span>
                 <select
                   className="input-shell"
                   value={filters.paymentDateStatus}
                   onChange={(event) =>
                     setFilters((current) => ({
                       ...current,
-                      paymentDateStatus:
-                        event.target.value as OrdersPageFilters["paymentDateStatus"],
+                      paymentDateStatus: event.target
+                        .value as OrdersPageFilters["paymentDateStatus"],
                     }))
                   }
                 >
@@ -326,20 +296,12 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               </label>
             </div>
 
-            {errorMessage ? (
-              <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                {errorMessage}
-              </div>
-            ) : null}
-
-            {successMessage ? (
-              <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-                {successMessage}
-              </div>
-            ) : null}
-
             <div className="flex flex-wrap gap-3">
-              <button className="button-shell button-primary" type="submit" disabled={isBusy}>
+              <button
+                className="button-shell button-primary"
+                type="submit"
+                disabled={isBusy}
+              >
                 필터 적용
               </button>
               <button
@@ -365,37 +327,6 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               </button>
             </div>
           </form>
-        </Panel>
-
-        <Panel title="최근 주문 동기화 작업">
-          {data.latestOperation ? (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-semibold text-ink">
-                    {data.latestOperation.operationType}
-                  </p>
-                  <p className="mt-1 text-xs text-ink/55">
-                    {formatDateTime(data.latestOperation.createdAt)}
-                  </p>
-                </div>
-                <StatusBadge tone={toneForOperationStatus(data.latestOperation.status)}>
-                  {data.latestOperation.status}
-                </StatusBadge>
-              </div>
-              <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-                <p>cutoffAt {formatDateTime(data.latestOperation.cutoffAt)}</p>
-                <p className="mt-2">
-                  요청 요약: {formatNullableText(JSON.stringify(data.latestOperation.requestSummary))}
-                </p>
-                <p className="mt-2">
-                  결과 요약: {formatNullableText(JSON.stringify(data.latestOperation.resultSummary))}
-                </p>
-              </div>
-            </div>
-          ) : (
-            <p className="text-sm text-ink/60">아직 동기화 작업 이력이 없습니다.</p>
-          )}
         </Panel>
       </div>
 
@@ -456,7 +387,9 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               title: "매핑",
               render: (row) => (
                 <div>
-                  <p className="font-medium text-ink">{row.displayName ?? "미매핑"}</p>
+                  <p className="font-medium text-ink">
+                    {row.displayName ?? "미매핑"}
+                  </p>
                   <p className="mt-1 text-xs text-ink/55">
                     {row.mappingStatus} / 결제일 {formatDate(row.paymentDate)}
                   </p>
@@ -486,9 +419,12 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               title: "원본 시그니처",
               render: (row) => (
                 <div>
-                  <p className="font-semibold text-ink">{row.sourceSignature}</p>
+                  <p className="font-semibold text-ink">
+                    {row.sourceSignature}
+                  </p>
                   <p className="mt-1 text-xs text-ink/55">
-                    {row.rawProductNameSnapshot} / {formatNullableText(row.rawOptionInfoSnapshot)}
+                    {row.rawProductNameSnapshot} /{" "}
+                    {formatNullableText(row.rawOptionInfoSnapshot)}
                   </p>
                   {row.fallbackProductName && (
                     <p className="mt-2 text-xs text-ink/45">
@@ -500,34 +436,45 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                           {row.fallbackProductNameSource === "orderItem"
                             ? "원본 주문 표기"
                             : row.fallbackProductNameSource === "optionInfo"
-                            ? "옵션에서 추출"
-                            : row.fallbackProductNameSource === "product"
-                            ? "상품 DB 매칭"
-                            : row.fallbackProductNameSource === "commerceApi"
-                            ? "네이버 커머스 API"
-                            : "상품 정보 없음"}
+                              ? "옵션에서 추출"
+                              : row.fallbackProductNameSource === "product"
+                                ? "상품 DB 매칭"
+                                : row.fallbackProductNameSource ===
+                                    "commerceApi"
+                                  ? "네이버 커머스 API"
+                                  : "상품 정보 없음"}
                           )
                         </span>
                       </span>
                     </p>
                   )}
-                  {row.externalProductId && !row.fallbackProductName && row.fallbackProductNameSource === null && (
-                    <p className="mt-2 text-xs text-ink/45">
-                      ↳{" "}
-                      {buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ? (
-                        <a
-                          href={buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ?? ""}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-ink/50 underline hover:text-ink/70"
-                        >
-                          네이버 스토어 열기 ↗
-                        </a>
-                      ) : (
-                        <span className="text-ink/35">(상품 정보 없음)</span>
-                      )}
-                    </p>
-                  )}
+                  {row.externalProductId &&
+                    !row.fallbackProductName &&
+                    row.fallbackProductNameSource === null && (
+                      <p className="mt-2 text-xs text-ink/45">
+                        ↳{" "}
+                        {buildNaverStoreProductUrl(
+                          row.storeSlug,
+                          row.externalProductId,
+                        ) ? (
+                          <a
+                            href={
+                              buildNaverStoreProductUrl(
+                                row.storeSlug,
+                                row.externalProductId,
+                              ) ?? ""
+                            }
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-ink/50 underline hover:text-ink/70"
+                          >
+                            네이버 스토어 열기 ↗
+                          </a>
+                        ) : (
+                          <span className="text-ink/35">(상품 정보 없음)</span>
+                        )}
+                      </p>
+                    )}
                 </div>
               ),
             },
@@ -540,7 +487,9 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               key: "mappingStatus",
               title: "매핑 상태",
               render: (row) => (
-                <StatusBadge tone={row.mappingStatus === "MAPPED" ? "success" : "warning"}>
+                <StatusBadge
+                  tone={row.mappingStatus === "MAPPED" ? "success" : "warning"}
+                >
                   {row.mappingStatus}
                 </StatusBadge>
               ),

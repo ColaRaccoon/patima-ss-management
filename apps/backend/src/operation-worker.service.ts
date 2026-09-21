@@ -1,10 +1,17 @@
-import { Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import {
+  Injectable,
+  OnApplicationShutdown,
+  OnModuleInit,
+} from "@nestjs/common";
 import { OperationService } from "./operation.service";
 
 const OPERATION_WORKER_POLL_INTERVAL_MS = 3 * 1000;
 
 @Injectable()
-export class OperationWorkerService implements OnModuleInit, OnApplicationShutdown {
+export class OperationWorkerService
+  implements OnModuleInit, OnApplicationShutdown
+{
   private timer: NodeJS.Timeout | null = null;
   private tickPromise: Promise<void> | null = null;
   private stopped = false;
@@ -53,7 +60,9 @@ export class OperationWorkerService implements OnModuleInit, OnApplicationShutdo
     this.tickPromise = this.drainInternal()
       .catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`[OperationWorkerService] worker tick failed: ${message}`);
+        console.error(
+          `[OperationWorkerService] worker tick failed: ${message}`,
+        );
       })
       .finally(() => {
         this.tickPromise = null;
@@ -68,6 +77,7 @@ export class OperationWorkerService implements OnModuleInit, OnApplicationShutdo
       if (!didWork) {
         return;
       }
+      await yieldToEventLoop();
     }
   }
 }

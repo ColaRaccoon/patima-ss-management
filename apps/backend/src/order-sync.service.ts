@@ -1,10 +1,16 @@
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { BadRequestException, Injectable, OnModuleInit } from "@nestjs/common";
-import { OrderItem, OrderRecord, OrderSourceSignature, Product, normalizeText } from "@patima/shared";
+import {
+  OrderItem,
+  OrderRecord,
+  OrderSourceSignature,
+  Product,
+  normalizeText,
+} from "@patima/shared";
 import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import {
   createId,
-  ensureKstDateRange,
   ensureStoreExists,
   formatApiSuccess,
   getSignatureMappingStatus,
@@ -14,8 +20,18 @@ import {
   rawToSourceSignature,
   stripOrderItemRepeatedTextFields,
 } from "./helpers";
-import { NaverCommerceService, SyncedOrderItemInput } from "./naver-commerce.service";
-import { OperationService } from "./operation.service";
+import {
+  NaverCommerceService,
+  SyncedOrderItemInput,
+} from "./naver-commerce.service";
+import {
+  OrderSyncBatchService,
+  OrderSyncRequest,
+} from "./order-sync-batch.service";
+import {
+  OperationService,
+  OperationExecutionContext,
+} from "./operation.service";
 import { ProfitSummaryService } from "./profit-summary.service";
 import {
   getKstRetentionCutoffDate,
@@ -25,55 +41,10 @@ import {
   shouldRetainOrderRawPayload,
 } from "./raw-payload-retention";
 import { recalculateOrderMappingsForTouchedItems } from "./sales-unit-auto-mapper";
-import { enrichSignatureDisplayName, type EnrichmentContext } from "./signature-enrichment";
-
-interface OrderTemplate {
-  productName: string;
-  optionInfo: string;
-  standardKey: string;
-  price: number;
-  quantity: number;
-}
-
-const ORDER_TEMPLATES: OrderTemplate[] = [
-  {
-    productName: "Black Running Hat",
-    optionInfo: "[Fast Delivery] Color: Black",
-    standardKey: "running-black",
-    price: 19900,
-    quantity: 1,
-  },
-  {
-    productName: "Knee Support Guard",
-    optionInfo: "Color: Modern Gray",
-    standardKey: "knee-gray",
-    price: 22900,
-    quantity: 1,
-  },
-  {
-    productName: "Daily Sports Socks",
-    optionInfo: "Color: Black / Size: Free",
-    standardKey: "sock-black",
-    price: 12900,
-    quantity: 2,
-  },
-  {
-    productName: "Slim Shin Guard",
-    optionInfo: "Option: Navy",
-    standardKey: "guard-navy",
-    price: 18900,
-    quantity: 1,
-  },
-];
-
-const RAW_STATUSES = [
-  "PAYED",
-  "DELIVERED",
-  "PURCHASE_DECIDED",
-  "CANCEL_REQUEST",
-  "RETURNED",
-  "EXCHANGED",
-] as const;
+import {
+  enrichSignatureDisplayName,
+  type EnrichmentContext,
+} from "./signature-enrichment";
 
 @Injectable()
 export class OrderSyncService implements OnModuleInit {
@@ -83,140 +54,83 @@ export class OrderSyncService implements OnModuleInit {
     private readonly auditLogService: AuditLogService,
     private readonly naverCommerceService: NaverCommerceService,
     private readonly profitSummaryService?: ProfitSummaryService,
+    private readonly batchService: OrderSyncBatchService = new OrderSyncBatchService(
+      databaseService,
+    ),
   ) {}
 
   onModuleInit(): void {
-    this.operationService.registerRetryExecutor("ORDER_SYNC", async (operation) => {
-      const request = operation.requestJson as {
-        dateFrom: string;
-        dateTo: string;
-        rangeMode: string;
-        requireLiveCredential?: boolean;
-      };
-      return this.performSync(
-        operation.storeId,
-        request.dateFrom,
-        request.dateTo,
-        request.rangeMode as "MANUAL" | "AUTO_LAST_30_DAYS",
-        { requireLiveCredential: request.requireLiveCredential === true },
-      );
-    });
-  }
-
-  async enqueueSync(storeId: string, dateFrom?: string, dateTo?: string) {
-    const { dateFrom: normalizedDateFrom, dateTo: normalizedDateTo, rangeMode } =
-      ensureKstDateRange(dateFrom, dateTo);
-    ensureStoreExists(this.databaseService.getSnapshot(), storeId);
-    const operation = await this.operationService.enqueue(
-      storeId,
+    this.operationService.registerRetryExecutor(
       "ORDER_SYNC",
-      {
-        dateFrom: normalizedDateFrom,
-        dateTo: normalizedDateTo,
-        rangeMode,
+      async (operation, context) => {
+        if (
+          operation.requestJson?.schemaVersion &&
+          operation.requestJson.schemaVersion !== 1
+        )
+          throw Object.assign(new Error("UNSUPPORTED_REQUEST_SCHEMA"), {
+            code: "UNSUPPORTED_REQUEST_SCHEMA",
+            retryable: false,
+          });
+        const request = operation.requestJson as {
+          dateFrom: string;
+          dateTo: string;
+          rangeMode: string;
+          requireLiveCredential?: boolean;
+          mode?: string;
+          requestedCutoffAt?: string;
+        };
+        return this.performSync(
+          operation.storeId,
+          request.dateFrom,
+          request.dateTo,
+          request.rangeMode as "MANUAL" | "AUTO_YESTERDAY" | "AUTO_LAST_30_DAYS",
+          {
+            mode: request.mode,
+            requestedCutoffAt: request.requestedCutoffAt ?? operation.cutoffAt,
+            context,
+          },
+        );
       },
-      () => this.performSync(storeId, normalizedDateFrom, normalizedDateTo, rangeMode),
     );
+  }
 
+  async enqueueSync(
+    storeId: string,
+    dateFrom?: string,
+    dateTo?: string,
+    input: OrderSyncRequest = {},
+  ) {
+    const batch = await this.batchService.enqueue(
+      { ...input, dateFrom, dateTo },
+      storeId,
+    );
     return formatApiSuccess({
-      operationId: operation.id,
-      operationType: operation.operationType,
-      status: operation.status,
-      requestSummary: operation.requestJson,
+      ...batch,
+      operationId: batch.items[0]?.operationId ?? null,
     });
   }
 
-  async enqueueSyncAll(dateFrom?: string, dateTo?: string) {
-    const { dateFrom: normalizedDateFrom, dateTo: normalizedDateTo, rangeMode } =
-      ensureKstDateRange(dateFrom, dateTo);
-    const snapshot = this.databaseService.getSnapshot();
-    const activeStores = snapshot.stores.filter((store) => store.isActive);
-    const operations: Array<{
-      storeId: string;
-      storeName: string;
-      operationId: string;
-      operationType: "ORDER_SYNC";
-      status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
-    }> = [];
-    const skippedStores: Array<{
-      storeId: string;
-      storeName: string;
-      reason: "NAVER_CREDENTIALS_NOT_CONFIGURED" | "ORDER_SYNC_ALREADY_IN_FLIGHT";
-    }> = [];
-
-    for (const store of activeStores) {
-      if (this.operationService.hasInFlightOperation(store.id, "ORDER_SYNC")) {
-        skippedStores.push({
-          storeId: store.id,
-          storeName: store.name,
-          reason: "ORDER_SYNC_ALREADY_IN_FLIGHT",
-        });
-        continue;
-      }
-
-      if (!this.naverCommerceService.getResolvedConfiguration(store.id)) {
-        skippedStores.push({
-          storeId: store.id,
-          storeName: store.name,
-          reason: "NAVER_CREDENTIALS_NOT_CONFIGURED",
-        });
-        continue;
-      }
-
-      const operation = await this.operationService.enqueue(
-        store.id,
-        "ORDER_SYNC",
-        {
-          dateFrom: normalizedDateFrom,
-          dateTo: normalizedDateTo,
-          rangeMode,
-          requireLiveCredential: true,
-          requestedByBatch: true,
-        },
-        () =>
-          this.performSync(
-            store.id,
-            normalizedDateFrom,
-            normalizedDateTo,
-            rangeMode,
-            { requireLiveCredential: true },
-          ),
-      );
-
-      operations.push({
-        storeId: store.id,
-        storeName: store.name,
-        operationId: operation.id,
-        operationType: "ORDER_SYNC",
-        status: operation.status,
-      });
-    }
-
-    if (operations.length === 0 && skippedStores.length === 0) {
-      throw new BadRequestException({
-        success: false,
-        message: "활성 스토어가 없습니다.",
-        errors: [{ field: "storeId", reason: "NO_ACTIVE_STORES" }],
-      });
-    }
-
-    return formatApiSuccess({
-      dateFrom: normalizedDateFrom,
-      dateTo: normalizedDateTo,
-      rangeMode,
-      targetStoreCount: operations.length,
-      skippedStoreCount: skippedStores.length,
-      operations,
-      skippedStores,
-    });
+  async enqueueSyncAll(
+    dateFrom?: string,
+    dateTo?: string,
+    input: OrderSyncRequest = {},
+  ) {
+    return formatApiSuccess(
+      await this.batchService.enqueue({ ...input, dateFrom, dateTo }),
+    );
   }
 
   async performSync(
     storeId: string,
     dateFrom: string,
     dateTo: string,
-    rangeMode: "MANUAL" | "AUTO_LAST_30_DAYS",
-    options?: { requireLiveCredential?: boolean },
+    rangeMode: "MANUAL" | "AUTO_YESTERDAY" | "AUTO_LAST_30_DAYS",
+    options?: {
+      requireLiveCredential?: boolean;
+      mode?: string;
+      requestedCutoffAt?: string;
+      context?: OperationExecutionContext;
+    },
   ) {
     const snapshot = this.databaseService.getSnapshot();
     const store = ensureStoreExists(snapshot, storeId);
@@ -224,232 +138,394 @@ export class OrderSyncService implements OnModuleInit {
       throw new BadRequestException("STORE_INACTIVE");
     }
 
+    await options?.context?.progress({
+      stage: "VALIDATING",
+      stageStartedAt: nowIso(),
+    });
+    let resolvedConfiguration;
     try {
-      const resolvedConfiguration = this.naverCommerceService.getResolvedConfiguration(storeId);
-      const liveEnabled = !!resolvedConfiguration;
+      resolvedConfiguration =
+        this.naverCommerceService.getResolvedConfiguration(storeId);
+    } catch {
+      throw Object.assign(new Error("NAVER_CREDENTIAL_DECRYPT_FAILED"), {
+        code: "NAVER_CREDENTIAL_DECRYPT_FAILED",
+        retryable: false,
+        safeMessage: "스토어 인증 정보를 읽을 수 없습니다.",
+        actionHint: "스토어 설정에서 인증 정보를 다시 저장하세요.",
+      });
+    }
+    const liveEnabled = !!resolvedConfiguration;
 
-      if (options?.requireLiveCredential && !liveEnabled) {
-        throw new BadRequestException("NAVER_CREDENTIALS_NOT_CONFIGURED");
-      }
+    if (!liveEnabled) {
+      throw Object.assign(new Error("NAVER_CREDENTIALS_NOT_CONFIGURED"), {
+        code: "NAVER_CREDENTIALS_NOT_CONFIGURED",
+        retryable: false,
+        safeMessage: "네이버 인증 설정이 필요합니다.",
+        actionHint: "스토어 설정에서 인증 정보를 입력하세요.",
+      });
+    }
 
-      const rawPayloadRetentionDays = getOrderRawPayloadRetentionDays();
-      const rawPayloadRetentionCutoffDate = getKstRetentionCutoffDate(rawPayloadRetentionDays);
-      const includeRawPayload = rawPayloadRetentionDays > 0;
-      const liveEntries = liveEnabled
-        ? await this.naverCommerceService.fetchOrderItems(storeId, dateFrom, dateTo, {
-            includeRawPayload,
-          })
-        : null;
-      const entries = liveEntries ?? this.generateMockItems(dateFrom, dateTo, { includeRawPayload });
-      const syncSource = liveEnabled ? "NAVER_LIVE" : "MOCK_FALLBACK";
-
-      let ordersUpserted = 0;
-      let orderItemsUpserted = 0;
-      let orderSourceSignaturesCreated = 0;
-      let unknownOrderStatusCount = 0;
-      let paymentDateMissingCount = 0;
-      let rawPayloadPrunedOrderCount = 0;
-      let rawPayloadPrunedOrderItemCount = 0;
-
-      await this.databaseService.writeCommitted((draft) => {
-        const touchedSignatureIds = new Set<string>();
-        const touchedOrderItemIds = new Set<string>();
-
-        entries.forEach((entry) => {
-          const rawPayloadReferenceDate = getSyncedOrderItemRetentionDate(entry);
-          const retainedRawPayload =
-            entry.rawPayload &&
-            shouldRetainOrderRawPayload(
-              rawPayloadReferenceDate,
-              rawPayloadRetentionCutoffDate,
-              rawPayloadRetentionDays,
-            )
-              ? entry.rawPayload
-              : null;
-          const product = this.upsertProduct(draft, storeId, entry);
-          const existingSignature = draft.orderSourceSignatures.find(
-            (item) =>
-              item.storeId === storeId &&
-              item.normalizedProductName === normalizeText(entry.rawProductName) &&
-              item.normalizedOptionInfo === normalizeText(entry.rawOptionInfo ?? ""),
-          );
-          const signature = this.upsertSignature(draft, storeId, entry.rawProductName, entry.rawOptionInfo);
-          if (!existingSignature) {
-            draft.orderSourceSignatures.push(signature);
-            orderSourceSignaturesCreated += 1;
+    const rawPayloadRetentionDays = getOrderRawPayloadRetentionDays();
+    const rawPayloadRetentionCutoffDate = getKstRetentionCutoffDate(
+      rawPayloadRetentionDays,
+    );
+    const includeRawPayload = rawPayloadRetentionDays > 0;
+    const syncSource = "NAVER_LIVE";
+    const context = options?.context;
+    const cutoff = options?.requestedCutoffAt ?? nowIso();
+    const state = snapshot.orderSyncStates.find(
+      (item) => item.storeId === storeId,
+    );
+    const current = options?.mode === "CURRENT";
+    // This is an application verification policy, not a claim about Naver retention.
+    const recoveryFrom = new Date(
+      new Date(cutoff).getTime() - 30 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const changedWatermark = [
+      state?.lastSuccessfulChangedTo,
+      state?.changedCoverageBaselineAt,
+    ]
+      .filter((value): value is string => !!value)
+      .sort()
+      .at(-1);
+    const coverageGap =
+      current && changedWatermark && changedWatermark < recoveryFrom
+        ? {
+            code: "COVERAGE_GAP" as const,
+            from: changedWatermark,
+            to: recoveryFrom,
+            reason:
+              "앱 검증 정책(30일)을 넘긴 변경 이력 공백입니다. 네이버 보존기간은 보장되지 않아 과거 미발견 주문까지 복구했다고 확인할 수 없습니다.",
           }
-          const existingOrder = draft.orders.find(
-            (item) => item.storeId === storeId && item.externalOrderId === entry.externalOrderId,
-          );
-          let orderRecord: OrderRecord;
+        : null;
+    const changedFrom = current
+      ? coverageGap
+        ? recoveryFrom
+        : (changedWatermark ?? recoveryFrom)
+      : undefined;
+    const affectedDates = new Set<string>(
+      (snapshot.operations.find((item) => item.id === context?.fence.id)
+        ?.progressJson?.affectedDates as string[] | undefined) ?? [],
+    );
+    let syncedItemCount = 0;
+    await context?.progress({
+      stage: "AUTHENTICATING",
+      stageStartedAt: nowIso(),
+    });
+    let ordersUpserted = 0;
+    let orderItemsUpserted = 0;
+    let orderSourceSignaturesCreated = 0;
+    let unknownOrderStatusCount = 0;
+    let paymentDateMissingCount = 0;
+    let rawPayloadPrunedOrderCount = 0;
+    let rawPayloadPrunedOrderItemCount = 0;
 
-          if (existingOrder) {
-            existingOrder.orderDatetime = entry.orderDateTime;
-            existingOrder.paymentDatetime = entry.paymentDateTime;
-            existingOrder.orderStatus = entry.rawStatus;
-            existingOrder.rawPayload = retainedRawPayload;
-            existingOrder.syncedAt = nowIso();
-            existingOrder.updatedAt = nowIso();
-            orderRecord = existingOrder;
-          } else {
-            orderRecord = {
-              id: createId(),
+    for await (const chunk of this.naverCommerceService.streamOrderItems(
+      storeId,
+      dateFrom,
+      dateTo,
+      {
+        includeRawPayload,
+        requestedCutoffAt: cutoff,
+        changedFrom,
+        existingProductOrderIds:
+          current && (!state || coverageGap)
+            ? snapshot.orderItems
+                .filter((item) => item.storeId === storeId)
+                .map((item) => item.externalProductOrderId)
+            : undefined,
+        signal: context?.signal,
+        onProgress: async (progress) => {
+          await context?.progress(progress);
+        },
+      },
+    )) {
+      context?.signal.throwIfAborted();
+      const entries = chunk.items;
+      syncedItemCount += entries.length;
+      await context?.progress({
+        stage: "SAVING",
+        fetchedCount: chunk.fetchedCount,
+        validatedCount: chunk.validatedCount,
+      });
+      await this.databaseService.commitOrderSync(
+        (draft) => {
+          const ordersById = new Map(
+            draft.orders
+              .filter((item) => item.storeId === storeId)
+              .map((item) => [item.externalOrderId, item]),
+          );
+          const itemsById = new Map(
+            draft.orderItems
+              .filter((item) => item.storeId === storeId)
+              .map((item) => [item.externalProductOrderId, item]),
+          );
+          const productsById = new Map(
+            draft.products
+              .filter((item) => item.storeId === storeId)
+              .map((item) => [item.externalProductId, item]),
+          );
+          const signatureKey = (name: string, option: string | null) =>
+            JSON.stringify([normalizeText(name), normalizeText(option ?? "")]);
+          const signaturesByKey = new Map(
+            draft.orderSourceSignatures
+              .filter((item) => item.storeId === storeId)
+              .map((item) => [
+                signatureKey(
+                  item.rawProductNameSnapshot,
+                  item.rawOptionInfoSnapshot,
+                ),
+                item,
+              ]),
+          );
+          const touchedSignatureIds = new Set<string>();
+          const touchedOrderItemIds = new Set<string>();
+
+          entries.forEach((entry) => {
+            const rawPayloadReferenceDate =
+              getSyncedOrderItemRetentionDate(entry);
+            const retainedRawPayload =
+              entry.rawPayload &&
+              shouldRetainOrderRawPayload(
+                rawPayloadReferenceDate,
+                rawPayloadRetentionCutoffDate,
+                rawPayloadRetentionDays,
+              )
+                ? entry.rawPayload
+                : null;
+            const product = this.upsertProduct(
+              draft,
               storeId,
-              externalOrderId: entry.externalOrderId,
-              orderDatetime: entry.orderDateTime,
-              paymentDatetime: entry.paymentDateTime,
+              entry,
+              productsById,
+            );
+            const key = signatureKey(entry.rawProductName, entry.rawOptionInfo);
+            const existingSignature = signaturesByKey.get(key);
+            const signature = this.upsertSignature(
+              draft,
+              storeId,
+              entry.rawProductName,
+              entry.rawOptionInfo,
+              existingSignature,
+            );
+            if (!existingSignature) {
+              draft.orderSourceSignatures.push(signature);
+              signaturesByKey.set(key, signature);
+              orderSourceSignaturesCreated += 1;
+            }
+            const existingOrder = ordersById.get(entry.externalOrderId);
+            let orderRecord: OrderRecord;
+
+            if (existingOrder) {
+              existingOrder.orderDatetime = entry.orderDateTime;
+              existingOrder.paymentDatetime = entry.paymentDateTime;
+              existingOrder.orderStatus = entry.rawStatus;
+              existingOrder.rawPayload = retainedRawPayload;
+              existingOrder.syncedAt = nowIso();
+              existingOrder.updatedAt = nowIso();
+              orderRecord = existingOrder;
+            } else {
+              orderRecord = {
+                id: createId(),
+                storeId,
+                externalOrderId: entry.externalOrderId,
+                orderDatetime: entry.orderDateTime,
+                paymentDatetime: entry.paymentDateTime,
+                orderStatus: entry.rawStatus,
+                rawPayload: retainedRawPayload,
+                syncedAt: nowIso(),
+                createdAt: nowIso(),
+                updatedAt: nowIso(),
+              };
+              draft.orders.push(orderRecord);
+              ordersById.set(entry.externalOrderId, orderRecord);
+              ordersUpserted += 1;
+            }
+
+            const existingItem = itemsById.get(entry.externalProductOrderId);
+            if (existingItem?.paymentDate)
+              affectedDates.add(existingItem.paymentDate);
+            if (entry.paymentDate) affectedDates.add(entry.paymentDate);
+            const previousSignatureId =
+              existingItem?.orderSourceSignatureId ?? null;
+            if (entry.saleStatus === "UNKNOWN") {
+              unknownOrderStatusCount += 1;
+            }
+            if (!entry.paymentDate) {
+              paymentDateMissingCount += 1;
+            }
+
+            this.updateSignatureUsageSummary(
+              draft,
+              signature,
+              entry,
+              previousSignatureId,
+              !existingItem,
+            );
+            touchedSignatureIds.add(signature.id);
+            if (previousSignatureId && previousSignatureId !== signature.id) {
+              touchedSignatureIds.add(previousSignatureId);
+            }
+
+            const payload: OrderItem = {
+              id: existingItem?.id ?? createId(),
+              orderId: orderRecord.id,
+              storeId,
+              productId: product.id,
+              orderSourceSignatureId: signature.id,
+              canonicalSalesUnitId: null,
+              externalProductOrderId: entry.externalProductOrderId,
+              externalProductId: product.externalProductId,
+              optionCode: entry.optionCode,
+              packageNumber: entry.packageNumber,
+              quantity: entry.quantity,
+              productPaymentAmount: entry.productPaymentAmount,
+              totalProductAmount: entry.totalProductAmount,
+              deliveryFeeAmount: entry.deliveryFeeAmount,
+              paymentCommission: entry.paymentCommission,
+              knowledgeShoppingSellingInterlockCommission:
+                entry.knowledgeShoppingSellingInterlockCommission,
+              saleCommission: entry.saleCommission,
+              channelCommission: entry.channelCommission,
+              orderDate: entry.orderDate,
+              paymentDate: entry.paymentDate,
+              saleStatus: entry.saleStatus,
               orderStatus: entry.rawStatus,
+              isCanceled:
+                entry.saleStatus === "CANCELED" ||
+                entry.saleStatus === "CANCEL_REQUESTED",
+              isReturned: entry.saleStatus === "RETURNED",
               rawPayload: retainedRawPayload,
-              syncedAt: nowIso(),
-              createdAt: nowIso(),
+              createdAt: existingItem?.createdAt ?? nowIso(),
               updatedAt: nowIso(),
             };
-            draft.orders.push(orderRecord);
-            ordersUpserted += 1;
-          }
 
-          const existingItem = draft.orderItems.find(
-            (item) => item.storeId === storeId && item.externalProductOrderId === entry.externalProductOrderId,
-          );
-          const previousSignatureId = existingItem?.orderSourceSignatureId ?? null;
-          if (entry.saleStatus === "UNKNOWN") {
-            unknownOrderStatusCount += 1;
-          }
-          if (!entry.paymentDate) {
-            paymentDateMissingCount += 1;
-          }
+            // optionManageCode가 있으면 추가
+            if (entry.optionManageCode) {
+              payload.optionManageCode = entry.optionManageCode;
+            }
 
-          this.updateSignatureUsageSummary(draft, signature, entry, previousSignatureId, !existingItem);
-          touchedSignatureIds.add(signature.id);
-          if (previousSignatureId && previousSignatureId !== signature.id) {
-            touchedSignatureIds.add(previousSignatureId);
-          }
+            if (existingItem) {
+              Object.assign(existingItem, payload);
+              stripOrderItemRepeatedTextFields(existingItem);
+            } else {
+              draft.orderItems.push(stripOrderItemRepeatedTextFields(payload));
+              itemsById.set(entry.externalProductOrderId, payload);
+            }
+            touchedOrderItemIds.add(payload.id);
+            orderItemsUpserted += 1;
+          });
 
-          const payload: OrderItem = {
-            id: existingItem?.id ?? createId(),
-            orderId: orderRecord.id,
+          recalculateOrderMappingsForTouchedItems(draft, {
             storeId,
-            productId: product.id,
-            orderSourceSignatureId: signature.id,
-            canonicalSalesUnitId: null,
-            externalProductOrderId: entry.externalProductOrderId,
-            externalProductId: product.externalProductId,
-            optionCode: entry.optionCode,
-            packageNumber: entry.packageNumber,
-            quantity: entry.quantity,
-            productPaymentAmount: entry.productPaymentAmount,
-            totalProductAmount: entry.totalProductAmount,
-            deliveryFeeAmount: entry.deliveryFeeAmount,
-            paymentCommission: entry.paymentCommission,
-            knowledgeShoppingSellingInterlockCommission:
-              entry.knowledgeShoppingSellingInterlockCommission,
-            saleCommission: entry.saleCommission,
-            channelCommission: entry.channelCommission,
-            orderDate: entry.orderDate,
-            paymentDate: entry.paymentDate,
-            saleStatus: entry.saleStatus,
-            orderStatus: entry.rawStatus,
-            isCanceled:
-              entry.saleStatus === "CANCELED" || entry.saleStatus === "CANCEL_REQUESTED",
-            isReturned: entry.saleStatus === "RETURNED",
-            rawPayload: retainedRawPayload,
-            createdAt: existingItem?.createdAt ?? nowIso(),
-            updatedAt: nowIso(),
-          };
+            signatureIds: touchedSignatureIds,
+            orderItemIds: touchedOrderItemIds,
+          });
 
-          // optionManageCode가 있으면 추가
-          if (entry.optionManageCode) {
-            payload.optionManageCode = entry.optionManageCode;
+          if (context) {
+            const operation = draft.operations.find(
+              (item) => item.id === context.fence.id,
+            )!;
+            operation.progressJson = {
+              ...operation.progressJson,
+              affectedDates: [...affectedDates],
+              checkpoint: chunk.checkpoint,
+              committedCount: syncedItemCount,
+              stage: "SAVING",
+              lastProgressAt: nowIso(),
+            };
           }
-
-          if (existingItem) {
-            Object.assign(existingItem, payload);
-            stripOrderItemRepeatedTextFields(existingItem);
-          } else {
-            draft.orderItems.push(stripOrderItemRepeatedTextFields(payload));
-          }
-          touchedOrderItemIds.add(payload.id);
-          orderItemsUpserted += 1;
-        });
-
-        const pruneResult = pruneExpiredOrderRawPayloads(
-          draft,
-          storeId,
-          rawPayloadRetentionCutoffDate,
-          rawPayloadRetentionDays,
-        );
-        rawPayloadPrunedOrderCount = pruneResult.prunedOrderCount;
-        rawPayloadPrunedOrderItemCount = pruneResult.prunedOrderItemCount;
-
-        recalculateOrderMappingsForTouchedItems(draft, {
-          storeId,
-          signatureIds: touchedSignatureIds,
-          orderItemIds: touchedOrderItemIds,
-        });
-
-        const targetStore = ensureStoreExists(draft, storeId);
-        targetStore.lastOrderSyncAt = nowIso();
-        targetStore.lastOrderSyncStatus = "SUCCEEDED";
-        targetStore.updatedAt = nowIso();
-        this.auditLogService.appendToDraft(draft, {
-          storeId,
-          domain: "ORDER_SYNC",
-          action: "RUN",
-          targetId: null,
-          actorIdentifier: "LOCALHOST_ADMIN",
-          beforeJson: null,
-          afterJson: { dateFrom, dateTo, rangeMode, syncSource },
-        });
+        },
+        context?.fence,
+        storeId,
+        {
+          orderIds: new Set(entries.map((entry) => entry.externalOrderId)),
+          itemIds: new Set(
+            entries.map((entry) => entry.externalProductOrderId),
+          ),
+        },
+      );
+      await context?.progress({
+        committedCount: syncedItemCount,
+        affectedDates: [...affectedDates],
+        checkpoint: chunk.checkpoint,
       });
-
-      const summaryRecalculation = this.profitSummaryService
-        ? await this.profitSummaryService.refreshStoreDatesBestEffort({
-            storeId,
-            dateFrom,
-            dateTo,
-            reason: "ORDER_SYNC",
-          })
-        : null;
-
-      const result = {
-        syncSource,
-        ordersUpserted,
-        orderItemsUpserted,
-        orderSourceSignaturesCreated,
-        unknownOrderStatusCount,
-        paymentDateMissingCount,
-        syncedItemCount: entries.length,
-        rawPayloadRetentionDays,
-        rawPayloadRetentionCutoffDate,
-        rawPayloadPrunedOrderCount,
-        rawPayloadPrunedOrderItemCount,
-        ...(summaryRecalculation ? { summaryRecalculation } : {}),
-      };
-
-      return result;
-    } catch (error) {
-      await this.databaseService.writeCommitted((draft) => {
-        const targetStore = ensureStoreExists(draft, storeId);
-        targetStore.lastOrderSyncStatus = "FAILED";
-        targetStore.updatedAt = nowIso();
-        this.auditLogService.appendToDraft(draft, {
-          storeId,
-          domain: "ORDER_SYNC",
-          action: "RUN_FAILED",
-          targetId: null,
-          actorIdentifier: "LOCALHOST_ADMIN",
-          beforeJson: null,
-          afterJson: {
-            dateFrom,
-            dateTo,
-            rangeMode,
-            message: error instanceof Error ? error.message : String(error),
-          },
-        });
-      });
-
-      throw error;
+      await yieldToEventLoop();
     }
+    // Retention applies to historical rows too, once per run rather than once per fetched chunk.
+    const retainedSnapshot = this.databaseService.getSnapshot();
+    if (
+      retainedSnapshot.orders.some(
+        (item) => item.storeId === storeId && item.rawPayload,
+      ) ||
+      retainedSnapshot.orderItems.some(
+        (item) => item.storeId === storeId && item.rawPayload,
+      )
+    ) {
+      await this.databaseService.commitOrderSync(
+        (draft) => {
+          const pruned = pruneExpiredOrderRawPayloads(
+            draft,
+            storeId,
+            rawPayloadRetentionCutoffDate,
+            rawPayloadRetentionDays,
+          );
+          rawPayloadPrunedOrderCount = pruned.prunedOrderCount;
+          rawPayloadPrunedOrderItemCount = pruned.prunedOrderItemCount;
+        },
+        context?.fence,
+        storeId,
+        {
+          orderIds: new Set(
+            retainedSnapshot.orders
+              .filter((item) => item.storeId === storeId && item.rawPayload)
+              .map((item) => item.externalOrderId),
+          ),
+          itemIds: new Set(
+            retainedSnapshot.orderItems
+              .filter((item) => item.storeId === storeId && item.rawPayload)
+              .map((item) => item.externalProductOrderId),
+          ),
+        },
+      );
+    }
+    await context?.progress({ stage: "RECALCULATING" });
+    const dates = [...affectedDates].sort();
+    const summaryRecalculation = this.profitSummaryService
+      ? await this.profitSummaryService.refreshStoreDateListBestEffort({
+          storeId,
+          dates,
+          reason: "ORDER_SYNC",
+        })
+      : null;
+
+    const result = {
+      syncSource,
+      ordersUpserted,
+      orderItemsUpserted,
+      orderSourceSignaturesCreated,
+      unknownOrderStatusCount,
+      paymentDateMissingCount,
+      syncedItemCount,
+      coverageGap,
+      historicalCoverageGap: state?.historicalCoverageGap ?? null,
+      affectedDates: dates,
+      summaryStatus: summaryRecalculation ? "SUCCEEDED" : "WARNING",
+      summaryWarning: summaryRecalculation
+        ? null
+        : "주문 저장 완료 · 손익 집계 갱신 필요",
+      rawPayloadRetentionDays,
+      rawPayloadRetentionCutoffDate,
+      rawPayloadPrunedOrderCount,
+      rawPayloadPrunedOrderItemCount,
+      ...(summaryRecalculation ? { summaryRecalculation } : {}),
+    };
+
+    await context?.progress({
+      stage: "FINALIZING",
+      summaryStatus: result.summaryStatus,
+    });
+    return result;
   }
 
   async listOrderItems(query: {
@@ -467,12 +543,10 @@ export class OrderSyncService implements OnModuleInit {
   }) {
     const snapshot = this.databaseService.getSnapshot();
     const result = await this.databaseService.queryOrderItems(query);
-    return formatApiSuccess(
-      {
-        ...result,
-        items: result.items.map((item) => mapOrderItemResponse(snapshot, item)),
-      },
-    );
+    return formatApiSuccess({
+      ...result,
+      items: result.items.map((item) => mapOrderItemResponse(snapshot, item)),
+    });
   }
 
   async listOrderSourceSignatures(query: {
@@ -484,7 +558,9 @@ export class OrderSyncService implements OnModuleInit {
   }) {
     const keyword = query.q ? normalizeText(query.q) : null;
     const snapshot = this.databaseService.getSnapshot();
-    const salesUnitsById = new Map(snapshot.canonicalSalesUnits.map((item) => [item.id, item]));
+    const salesUnitsById = new Map(
+      snapshot.canonicalSalesUnits.map((item) => [item.id, item]),
+    );
     const filteredSignatures = snapshot.orderSourceSignatures
       .filter((item) => item.storeId === query.storeId)
       .filter((item) =>
@@ -521,21 +597,43 @@ export class OrderSyncService implements OnModuleInit {
     const pageOptionCodeMap = new Map<string, string>();
     const pageOptionManageCodeMap = new Map<string, string>();
     snapshot.orderItems.forEach((item) => {
-      if (!item.orderSourceSignatureId || !pageSignatureIds.has(item.orderSourceSignatureId)) {
+      if (
+        !item.orderSourceSignatureId ||
+        !pageSignatureIds.has(item.orderSourceSignatureId)
+      ) {
         return;
       }
-      const relatedItems = signatureItemsMap.get(item.orderSourceSignatureId) ?? [];
+      const relatedItems =
+        signatureItemsMap.get(item.orderSourceSignatureId) ?? [];
       relatedItems.push(item);
       signatureItemsMap.set(item.orderSourceSignatureId, relatedItems);
-      pageUsageMap.set(item.orderSourceSignatureId, (pageUsageMap.get(item.orderSourceSignatureId) ?? 0) + 1);
-      if (item.externalProductId && !pageExternalProductIdMap.has(item.orderSourceSignatureId)) {
-        pageExternalProductIdMap.set(item.orderSourceSignatureId, item.externalProductId);
+      pageUsageMap.set(
+        item.orderSourceSignatureId,
+        (pageUsageMap.get(item.orderSourceSignatureId) ?? 0) + 1,
+      );
+      if (
+        item.externalProductId &&
+        !pageExternalProductIdMap.has(item.orderSourceSignatureId)
+      ) {
+        pageExternalProductIdMap.set(
+          item.orderSourceSignatureId,
+          item.externalProductId,
+        );
       }
-      if (item.optionCode && !pageOptionCodeMap.has(item.orderSourceSignatureId)) {
+      if (
+        item.optionCode &&
+        !pageOptionCodeMap.has(item.orderSourceSignatureId)
+      ) {
         pageOptionCodeMap.set(item.orderSourceSignatureId, item.optionCode);
       }
-      if (item.optionManageCode && !pageOptionManageCodeMap.has(item.orderSourceSignatureId)) {
-        pageOptionManageCodeMap.set(item.orderSourceSignatureId, item.optionManageCode);
+      if (
+        item.optionManageCode &&
+        !pageOptionManageCodeMap.has(item.orderSourceSignatureId)
+      ) {
+        pageOptionManageCodeMap.set(
+          item.orderSourceSignatureId,
+          item.optionManageCode,
+        );
       }
     });
 
@@ -550,8 +648,14 @@ export class OrderSyncService implements OnModuleInit {
 
     const items = await Promise.all(
       pageResult.items.map(async (item) => {
-        const salesUnit = snapshot.canonicalSalesUnits.find((entry) => entry.id === item.canonicalSalesUnitId);
-        const enriched = await enrichSignatureDisplayName(snapshot, item, enrichmentContext);
+        const salesUnit = snapshot.canonicalSalesUnits.find(
+          (entry) => entry.id === item.canonicalSalesUnitId,
+        );
+        const enriched = await enrichSignatureDisplayName(
+          snapshot,
+          item,
+          enrichmentContext,
+        );
         return {
           id: item.id,
           rawProductNameSnapshot: item.rawProductNameSnapshot,
@@ -560,15 +664,25 @@ export class OrderSyncService implements OnModuleInit {
           mappingStatus: getSignatureMappingStatus(item),
           canonicalSalesUnitId: item.canonicalSalesUnitId,
           canonicalDisplayName: salesUnit?.displayName ?? null,
-          usageCount: Math.max(item.usageCount ?? 0, pageUsageMap.get(item.id) ?? 0),
-          externalProductId: item.sampleExternalProductId ?? pageExternalProductIdMap.get(item.id) ?? null,
-          optionCode: item.sampleOptionCode ?? pageOptionCodeMap.get(item.id) ?? null,
-          optionManageCode: item.sampleOptionManageCode ?? pageOptionManageCodeMap.get(item.id) ?? null,
+          usageCount: Math.max(
+            item.usageCount ?? 0,
+            pageUsageMap.get(item.id) ?? 0,
+          ),
+          externalProductId:
+            item.sampleExternalProductId ??
+            pageExternalProductIdMap.get(item.id) ??
+            null,
+          optionCode:
+            item.sampleOptionCode ?? pageOptionCodeMap.get(item.id) ?? null,
+          optionManageCode:
+            item.sampleOptionManageCode ??
+            pageOptionManageCodeMap.get(item.id) ??
+            null,
           fallbackProductName: enriched.fallbackProductName,
           fallbackProductNameSource: enriched.fallbackProductNameSource,
           storeSlug: null,
         };
-      })
+      }),
     );
 
     return formatApiSuccess({
@@ -588,9 +702,14 @@ export class OrderSyncService implements OnModuleInit {
     const shouldIncrement = isNewItem || previousSignatureId !== signature.id;
 
     if (previousSignatureId && previousSignatureId !== signature.id) {
-      const previousSignature = draft.orderSourceSignatures.find((item) => item.id === previousSignatureId);
+      const previousSignature = draft.orderSourceSignatures.find(
+        (item) => item.id === previousSignatureId,
+      );
       if (previousSignature) {
-        previousSignature.usageCount = Math.max(0, (previousSignature.usageCount ?? 0) - 1);
+        previousSignature.usageCount = Math.max(
+          0,
+          (previousSignature.usageCount ?? 0) - 1,
+        );
         previousSignature.updatedAt = nowIso();
       }
     }
@@ -624,17 +743,18 @@ export class OrderSyncService implements OnModuleInit {
     draft: ReturnType<DatabaseService["getSnapshot"]>,
     storeId: string,
     entry: SyncedOrderItemInput,
+    productsById: Map<string, Product>,
   ): Product {
     const externalProductId =
-      entry.externalProductId ?? `synthetic:${rawToSourceSignature(entry.rawProductName, entry.rawOptionInfo)}`;
-    const existing = draft.products.find(
-      (item) => item.storeId === storeId && item.externalProductId === externalProductId,
-    );
+      entry.externalProductId ??
+      `synthetic:${rawToSourceSignature(entry.rawProductName, entry.rawOptionInfo)}`;
+    const existing = productsById.get(externalProductId);
 
     if (existing) {
       existing.productName = entry.rawProductName;
       existing.normalizedProductName = normalizeText(entry.rawProductName);
-      existing.status = entry.saleStatus === "UNKNOWN" ? existing.status : entry.rawStatus;
+      existing.status =
+        entry.saleStatus === "UNKNOWN" ? existing.status : entry.rawStatus;
       existing.lastSeenAt = nowIso();
       existing.updatedAt = nowIso();
       return existing;
@@ -654,6 +774,7 @@ export class OrderSyncService implements OnModuleInit {
     };
 
     draft.products.push(created);
+    productsById.set(externalProductId, created);
     return created;
   }
 
@@ -662,24 +783,23 @@ export class OrderSyncService implements OnModuleInit {
     storeId: string,
     rawProductName: string,
     rawOptionInfo: string | null,
+    existing?: OrderSourceSignature,
   ): OrderSourceSignature {
     const normalizedProductName = normalizeText(rawProductName);
     const normalizedOptionInfo = normalizeText(rawOptionInfo ?? "");
-    const existing = draft.orderSourceSignatures.find(
-      (item) =>
-        item.storeId === storeId &&
-        item.normalizedProductName === normalizedProductName &&
-        item.normalizedOptionInfo === normalizedOptionInfo,
-    );
 
     if (existing) {
       existing.rawProductNameSnapshot = rawProductName;
       existing.rawOptionInfoSnapshot = rawOptionInfo;
-      existing.sourceSignature = rawToSourceSignature(rawProductName, rawOptionInfo);
+      existing.sourceSignature = rawToSourceSignature(
+        rawProductName,
+        rawOptionInfo,
+      );
       existing.usageCount = existing.usageCount ?? 0;
       existing.firstSeenAt = existing.firstSeenAt ?? existing.createdAt ?? null;
       existing.lastSeenAt = existing.lastSeenAt ?? existing.updatedAt ?? null;
-      existing.sampleExternalProductId = existing.sampleExternalProductId ?? null;
+      existing.sampleExternalProductId =
+        existing.sampleExternalProductId ?? null;
       existing.sampleOptionCode = existing.sampleOptionCode ?? null;
       existing.sampleOptionManageCode = existing.sampleOptionManageCode ?? null;
       existing.lastAutoMappedAt = existing.lastAutoMappedAt ?? null;
@@ -710,74 +830,5 @@ export class OrderSyncService implements OnModuleInit {
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
-  }
-
-  private generateMockItems(
-    dateFrom: string,
-    dateTo: string,
-    options?: { includeRawPayload?: boolean },
-  ): SyncedOrderItemInput[] {
-    const start = new Date(`${dateFrom}T00:00:00+09:00`);
-    const end = new Date(`${dateTo}T00:00:00+09:00`);
-    const items: SyncedOrderItemInput[] = [];
-
-    for (let cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
-      const isoDate = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Seoul",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-      }).format(cursor);
-      ORDER_TEMPLATES.forEach((template, index) => {
-        const externalOrderId = `${isoDate.replace(/-/g, "")}${String(index + 1).padStart(4, "0")}`;
-        const externalProductOrderId = `${externalOrderId}-ITEM`;
-        const rawStatus = RAW_STATUSES[(cursor.getUTCDate() + index) % RAW_STATUSES.length];
-        const paymentDate = rawStatus === "CANCEL_REQUEST" ? null : isoDate;
-        const saleStatus =
-          rawStatus === "CANCEL_REQUEST"
-            ? "CANCEL_REQUESTED"
-            : rawStatus === "RETURNED"
-              ? "RETURNED"
-              : rawStatus === "EXCHANGED"
-                ? "EXCHANGED"
-                : "SALE";
-
-        items.push({
-          externalOrderId,
-          externalProductOrderId,
-          externalProductId: `demo-product-${normalizeText(template.standardKey)}`,
-          rawProductName: template.productName,
-          rawOptionInfo: template.optionInfo,
-          optionCode: null,
-          quantity: template.quantity,
-          productPaymentAmount: template.price * template.quantity,
-          totalProductAmount: template.price * template.quantity,
-          deliveryFeeAmount: 3000,
-          paymentCommission: saleStatus === "SALE" ? Math.round(template.price * 0.015) : null,
-          knowledgeShoppingSellingInterlockCommission:
-            saleStatus === "SALE" ? Math.round(template.price * 0.008) : null,
-          saleCommission: 0,
-          channelCommission: 0,
-          orderDate: isoDate,
-          paymentDate,
-          orderDateTime: `${isoDate}T09:00:00+09:00`,
-          paymentDateTime: paymentDate ? `${paymentDate}T09:30:00+09:00` : null,
-          productOrderStatus: rawStatus,
-          claimStatus: rawStatus === "CANCEL_REQUEST" ? "CANCEL_REQUEST" : null,
-          rawStatus,
-          saleStatus,
-          packageNumber: `PKG-${externalOrderId}`,
-          rawPayload: options?.includeRawPayload === true
-            ? {
-                originalOrderStatus: rawStatus,
-                claimStatus: rawStatus === "CANCEL_REQUEST" ? "CANCEL_REQUEST" : null,
-                productOrderStatus: rawStatus,
-              }
-            : null,
-        });
-      });
-    }
-
-    return items;
   }
 }

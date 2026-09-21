@@ -45,57 +45,42 @@ export class FakePurchaseService {
     };
   }
 
-  async upsert(payload: { storeId: string; date: string; amount: number }): Promise<DailyFakePurchase> {
+  async upsert(payload: {
+    storeId: string;
+    date: string;
+    amount: number;
+  }): Promise<DailyFakePurchase> {
     this.validateStoreId(payload.storeId);
     this.validateDate(payload.date);
     this.validateAmount(payload.amount);
     this.storeService.ensureWritable(payload.storeId);
 
-    let previousAmount: number | null = null;
-    const persisted = await this.databaseService.writeCommitted((draft) => {
-      const existing = draft.dailyFakePurchases.find(
-        (row) => row.storeId === payload.storeId && row.date === payload.date,
-      );
-      const timestamp = nowIso();
-
-      if (existing) {
-        previousAmount = existing.amount;
-        existing.amount = payload.amount;
-        existing.updatedAt = timestamp;
-        this.auditLogService.appendToDraft(draft, {
+    return this.databaseService.saveDailyFakePurchaseCommitted({
+      storeId: payload.storeId,
+      date: payload.date,
+      buildReplacement: (existing) => {
+        this.storeService.ensureWritable(payload.storeId);
+        const timestamp = nowIso();
+        const created: DailyFakePurchase = {
+          id: existing?.id ?? createId(),
+          storeId: payload.storeId,
+          date: payload.date,
+          amount: payload.amount,
+          createdAt: existing?.createdAt ?? timestamp,
+          updatedAt: timestamp,
+        };
+        const auditLog = this.auditLogService.createAuditLog({
           storeId: payload.storeId,
           domain: "FAKE_PURCHASE",
           action: "UPSERT",
           targetId: `${payload.storeId}-${payload.date}`,
           actorIdentifier: "LOCALHOST_ADMIN",
-          beforeJson: previousAmount,
+          beforeJson: existing?.amount ?? null,
           afterJson: payload.amount,
         });
-        return { ...existing };
-      }
-
-      const created: DailyFakePurchase = {
-        id: createId(),
-        storeId: payload.storeId,
-        date: payload.date,
-        amount: payload.amount,
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      };
-      draft.dailyFakePurchases.push(created);
-      this.auditLogService.appendToDraft(draft, {
-        storeId: payload.storeId,
-        domain: "FAKE_PURCHASE",
-        action: "UPSERT",
-        targetId: `${payload.storeId}-${payload.date}`,
-        actorIdentifier: "LOCALHOST_ADMIN",
-        beforeJson: previousAmount,
-        afterJson: payload.amount,
-      });
-      return created;
+        return { purchase: created, auditLog };
+      },
     });
-
-    return persisted;
   }
 
   private validateStoreId(storeId: string) {

@@ -8,8 +8,6 @@ import {
   mockCostSettings,
   mockCredential,
   mockDashboardSummary,
-  mockOperationDetail,
-  mockOperations,
   mockOrderItems,
   mockPreviewRows,
   mockProfitDetailPreview,
@@ -500,9 +498,6 @@ async function getOperations(storeId: string, operationType?: string) {
       page: 1,
       pageSize: 20,
     }),
-    fallback: {
-      items: mockOperations as unknown as Array<Record<string, unknown>>,
-    },
   });
 
   const items = response.data.items.map((item) => ({
@@ -523,7 +518,6 @@ async function getOperationDetail(operationId: string) {
   return fetchApi<OperationDetail>({
     label: "Operation detail",
     path: `/operations/${operationId}`,
-    fallback: mockOperationDetail,
   });
 }
 
@@ -945,32 +939,25 @@ export async function getOrdersPageData(
     };
   }
 
-  const [orderResponse, signatureResponse, operationListResponse] = await Promise.all([
+  const [orderResponse, signatureResponse] = await Promise.all([
     getOrderItems(primaryStore.id, filters),
     getOrderSourceSignatures(primaryStore.id, {
       mappingStatus: filters.mappingStatus,
       productName: filters.productName,
       optionInfo: filters.optionInfo,
     }),
-    getOperations(primaryStore.id, "ORDER_SYNC"),
   ]);
-  const firstOperation = operationListResponse.data[0];
-  const operationDetailResponse = firstOperation
-    ? await getOperationDetail(firstOperation.operationId)
-    : null;
 
   return {
     primaryStore,
     filters,
     orderItems: orderResponse.data,
     signatures: signatureResponse.data,
-    latestOperation: operationDetailResponse?.data ?? null,
+    latestOperation: null,
     sources: collectSources(
       storeResponse,
       orderResponse,
       signatureResponse,
-      operationListResponse,
-      ...(operationDetailResponse ? [operationDetailResponse] : []),
     ),
   };
 }

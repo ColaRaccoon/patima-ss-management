@@ -1,0 +1,47 @@
+{
+  "recordedAt": "2026-09-18T01:55:21.248Z",
+  "nodeVersion": "v24.14.0",
+  "platform": "win32",
+  "scope": "Synthetic file-mode baseline at 1x=100 and 3x=300 items/store. Production DB size was not inspected. Service-level timings exclude HTTP/proxy and Naver network. Real file persistence, worker execution, mapping and summary services are included. Repeated IDs test idempotence, not continuously growing order history.",
+  "results": [
+    {
+      "itemsPerStore": 100,
+      "stores": 6,
+      "repeatedBatches": 100,
+      "successfulOperations": 600,
+      "uniqueOrders": 600,
+      "uniqueOrderItems": 600,
+      "duplicateItems": 0,
+      "failedOperations": 0,
+      "pendingOperations": 0,
+      "elapsedSeconds": 106.45,
+      "enqueueP95Ms": 23.43,
+      "statusP95Ms": 0.19,
+      "operationP95Ms": 268,
+      "peakHeapMiB": 118.83,
+      "peakRssMiB": 313.83,
+      "eventLoopMaxMs": 1823.47,
+      "eventLoopP95Ms": 1628.44
+    },
+    {
+      "itemsPerStore": 300,
+      "stores": 6,
+      "repeatedBatches": 100,
+      "successfulOperations": 600,
+      "uniqueOrders": 1800,
+      "uniqueOrderItems": 1800,
+      "duplicateItems": 0,
+      "failedOperations": 0,
+      "pendingOperations": 0,
+      "elapsedSeconds": 297.56,
+      "enqueueP95Ms": 38.64,
+      "statusP95Ms": 0.23,
+      "operationP95Ms": 680.54,
+      "peakHeapMiB": 129.49,
+      "peakRssMiB": 338.7,
+      "eventLoopMaxMs": 5758.78,
+      "eventLoopP95Ms": 4047.5
+    }
+  ],
+  "measurementConditions": "Active developer workstation with concurrent development and typechecking; not an isolated benchmark."
+}

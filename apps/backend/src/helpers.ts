@@ -51,6 +51,9 @@ export const createEmptyDatabase = (): DatabaseShape => ({
   dailySalesUnitProfits: [],
   dailyStoreSummaries: [],
   operations: [],
+  orderSyncBatches: [],
+  orderSyncBatchItems: [],
+  orderSyncStates: [],
   auditLogs: [],
 });
 

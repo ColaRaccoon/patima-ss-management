@@ -425,8 +425,8 @@ export interface DailySalesUnitDetailDeliveryContext {
 export interface SalesUnitCostSnapshot {
   id: string;
   storeId: string;
-  effectiveFrom: string;          // YYYY-MM-DD (KST 기준)
-  sourceFileName: string | null;  // 업로드 원본 파일명 (감사용)
+  effectiveFrom: string; // YYYY-MM-DD (KST 기준)
+  sourceFileName: string | null; // 업로드 원본 파일명 (감사용)
   createdAt: string;
   updatedAt: string;
 }
@@ -438,10 +438,10 @@ export interface SalesUnitCostSnapshot {
 export interface SalesUnitCostSnapshotEntry {
   id: string;
   snapshotId: string;
-  storeId: string;                       // 동일 스토어 보장용 (cross-store 차단)
+  storeId: string; // 동일 스토어 보장용 (cross-store 차단)
   canonicalSalesUnitId: string;
   unitCost: number;
-  feeRate: number | null;                // null = API 실측 수수료 폴백
+  feeRate: number | null; // null = API 실측 수수료 폴백
   otherCost: number;
   createdAt: string;
   updatedAt: string;
@@ -476,5 +476,105 @@ export interface DatabaseShape {
   dailySalesUnitProfits: StoredDailySalesUnitProfit[];
   dailyStoreSummaries: StoredDailyStoreSummary[];
   operations: OperationRecord[];
+  orderSyncBatches: OrderSyncBatch[];
+  orderSyncBatchItems: OrderSyncBatchItem[];
+  orderSyncStates: OrderSyncState[];
   auditLogs: AuditLog[];
+}
+
+export type OrderSyncMode = "YESTERDAY" | "CURRENT" | "MANUAL" | "RECENT_30_DAYS";
+export interface OrderSyncError {
+  code: string;
+  category: string;
+  retryable: boolean;
+  safeMessage: string;
+  actionHint: string;
+  stage?: string;
+  upstreamStatus?: number;
+  upstreamCode?: string;
+  traceId?: string;
+}
+export interface OrderSyncBatch {
+  id: string;
+  idempotencyKey: string;
+  fingerprint: string;
+  mode: OrderSyncMode;
+  requestedCutoffAt: string;
+  requestedRange: { dateFrom: string; dateTo: string };
+  createdAt: string;
+  finishedAt: string | null;
+  retryOfBatchId: string | null;
+  schemaVersion: number;
+}
+export interface OrderSyncBatchItem {
+  id: string;
+  batchId: string;
+  storeId: string;
+  storeNameAtRequest: string;
+  operationId: string | null;
+  eligibility: "ELIGIBLE" | "SKIPPED";
+  skipReason: string | null;
+}
+export interface OrderSyncCoverageGap {
+  code: "COVERAGE_GAP";
+  from: string;
+  to: string;
+  reason: string;
+  acknowledgedAt?: string;
+}
+export interface OrderSyncState {
+  changedCoverageBaselineAt?: string;
+  historicalCoverageGap?: OrderSyncCoverageGap;
+  acknowledgedCoverageGaps?: Array<{
+    batchId: string;
+    gap: OrderSyncCoverageGap;
+    acknowledgedAt: string;
+  }>;
+  id: string;
+  storeId: string;
+  initialCoverageFrom: string;
+  lastSuccessfulChangedTo: string | null;
+  lastSuccessfulSyncAt: string | null;
+  updatedAt: string;
+}
+export interface OrderSyncBatchView {
+  statusUrl?: string;
+  batchId: string;
+  mode: OrderSyncMode;
+  requestedCutoffAt: string;
+  requestedRange: { dateFrom: string; dateTo: string };
+  status:
+    | "QUEUED"
+    | "RUNNING"
+    | "SUCCEEDED"
+    | "PARTIAL_FAILED"
+    | "FAILED"
+    | "NO_TARGETS";
+  createdAt: string;
+  finishedAt: string | null;
+  updatedAt: string;
+  retryOfBatchId: string | null;
+  counts: {
+    total: number;
+    target: number;
+    queued: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    skipped: number;
+  };
+  items: Array<{
+    storeId: string;
+    storeName: string;
+    operationId: string | null;
+    status: OperationStatus | "SKIPPED";
+    skipReason: string | null;
+    error: OrderSyncError | null;
+    progress: Record<string, unknown> | null;
+    attemptCount: number;
+    maxAttempts: number;
+    retryAt: string | null;
+    result: Record<string, unknown> | null;
+    initialCoverageFrom: string | null;
+  }>;
 }

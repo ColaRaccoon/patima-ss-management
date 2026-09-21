@@ -1,6 +1,16 @@
-import { BadGatewayException, BadRequestException, Injectable } from "@nestjs/common";
+import {
+  BadGatewayException,
+  BadRequestException,
+  Injectable,
+} from "@nestjs/common";
 import { SaleStatus, Store, normalizeText } from "@patima/shared";
 import bcrypt from "bcryptjs";
+import {
+  NaverRequestError,
+  requestNaverJson,
+  waitForNaverRetry,
+  waitForNaverToken,
+} from "./naver-request";
 import { CryptoService } from "./crypto.service";
 import { DatabaseService } from "./database.service";
 import { ensureStoreExists } from "./helpers";
@@ -54,15 +64,34 @@ interface CachedSellerToken {
   expiresAt: number;
 }
 
-interface SellerTokenResponse {
-  access_token: string;
-  expires_in: number;
+export interface OrderStreamOptions {
+  includeRawPayload?: boolean;
+  requestedCutoffAt?: string;
+  changedFrom?: string;
+  existingProductOrderIds?: Iterable<string>;
+  signal?: AbortSignal;
+  onProgress?: (progress: {
+    stage: "AUTHENTICATING" | "FETCHING_ORDERS" | "FETCHING_DETAILS";
+    queryKind?: "PAYMENT" | "EXISTING" | "CHANGED";
+    page?: number;
+    dateWindow?: { from: string; to: string };
+  }) => Promise<void>;
 }
-
-interface ChangedOrderCursor {
-  moreFrom: string;
-  moreSequence: string | number;
+export interface OrderStreamChunk {
+  items: SyncedOrderItemInput[];
+  checkpoint: {
+    schemaVersion: number;
+    queryKind: "PAYMENT" | "CHANGED" | "EXISTING";
+    windowFrom: string;
+    windowTo: string;
+    page: number;
+  };
+  fetchedCount: number;
+  validatedCount: number;
+  warnings: string[];
 }
+const toKstTimestamp = (value: number) =>
+  new Date(value + 9 * 60 * 60 * 1000).toISOString().replace("Z", "+09:00");
 
 type JsonRecord = Record<string, unknown>;
 
@@ -86,7 +115,11 @@ const pickNumber = (...values: unknown[]): number | null => {
     if (typeof value === "number" && Number.isFinite(value)) {
       return value;
     }
-    if (typeof value === "string" && value.trim().length > 0 && !Number.isNaN(Number(value))) {
+    if (
+      typeof value === "string" &&
+      value.trim().length > 0 &&
+      Number.isFinite(Number(value))
+    ) {
       return Number(value);
     }
   }
@@ -94,14 +127,14 @@ const pickNumber = (...values: unknown[]): number | null => {
 };
 
 const toDateString = (value: string | null): string | null => {
-  if (!value) {
+  if (!value || !Number.isFinite(Date.parse(value))) {
     return null;
   }
-  const matched = value.match(/\d{4}-\d{2}-\d{2}/);
-  return matched ? matched[0] : null;
+  return kstDateFormatter.format(new Date(value));
 };
 
-const buildOrderRangeStart = (dateFrom: string) => `${dateFrom}T00:00:00.000+09:00`;
+const buildOrderRangeStart = (dateFrom: string) =>
+  `${dateFrom}T00:00:00.000+09:00`;
 const buildOrderRangeEnd = (dateTo: string) => `${dateTo}T23:59:59.999+09:00`;
 
 const kstDateFormatter = new Intl.DateTimeFormat("en-CA", {
@@ -184,7 +217,11 @@ const saleStatusFromNaverState = (
   ) {
     return "CANCELED";
   }
-  if (raw.includes("RETURN") || raw === "COLLECTING" || raw === "COLLECT_DONE") {
+  if (
+    raw.includes("RETURN") ||
+    raw === "COLLECTING" ||
+    raw === "COLLECT_DONE"
+  ) {
     return "RETURNED";
   }
   if (raw.includes("EXCHANGE")) {
@@ -205,6 +242,7 @@ const saleStatusFromNaverState = (
 @Injectable()
 export class NaverCommerceService {
   private readonly tokenCache = new Map<string, CachedSellerToken>();
+  private readonly tokenRequests = new Map<string, Promise<string>>();
 
   constructor(
     private readonly databaseService: DatabaseService,
@@ -243,7 +281,9 @@ export class NaverCommerceService {
     return {
       credentialId: resolved.credential.credentialId,
       storeId,
-      maskedClientId: this.naverCommerceConfigService.maskClientId(resolved.credential.clientId),
+      maskedClientId: this.naverCommerceConfigService.maskClientId(
+        resolved.credential.clientId,
+      ),
       accessType: resolved.credential.accessType,
       secretStored: true,
       credentialConnectionStatus: store.credentialConnectionStatus,
@@ -258,8 +298,24 @@ export class NaverCommerceService {
       throw new BadRequestException("NAVER_CREDENTIALS_NOT_CONFIGURED");
     }
 
-    const channelInfo = await this.lookupSellerChannels(resolved.store, resolved.credential);
-    const matched = channelInfo.find((entry) => entry.channelNo === resolved.store.channelNo) ?? null;
+    let channelInfo: Awaited<
+      ReturnType<NaverCommerceService["lookupSellerChannels"]>
+    >;
+    try {
+      channelInfo = await this.lookupSellerChannels(
+        resolved.store,
+        resolved.credential,
+      );
+    } catch (error) {
+      // Preserve the existing credential-test HTTP 502 contract.
+      if (error instanceof NaverRequestError)
+        throw new BadGatewayException(error.safeMessage);
+      throw error;
+    }
+    const matched =
+      channelInfo.find(
+        (entry) => entry.channelNo === resolved.store.channelNo,
+      ) ?? null;
     if (channelInfo.length > 0 && !matched) {
       throw new BadGatewayException(
         `NAVER_CHANNEL_MISMATCH: configured channelNo ${resolved.store.channelNo} was not returned by seller channel lookup.`,
@@ -277,42 +333,251 @@ export class NaverCommerceService {
     storeId: string,
     dateFrom: string,
     dateTo: string,
-    options?: { includeRawPayload?: boolean },
+    options?: OrderStreamOptions,
   ): Promise<SyncedOrderItemInput[]> {
+    const items = new Map<string, SyncedOrderItemInput>();
+    for await (const batch of this.streamOrderItems(
+      storeId,
+      dateFrom,
+      dateTo,
+      options,
+    )) {
+      for (const item of batch.items)
+        items.set(item.externalProductOrderId, item);
+    }
+    return [...items.values()];
+  }
+
+  async *streamOrderItems(
+    storeId: string,
+    dateFrom: string,
+    dateTo: string,
+    options: OrderStreamOptions = {},
+  ): AsyncGenerator<OrderStreamChunk> {
+    options.signal?.throwIfAborted();
+    await options.onProgress?.({ stage: "AUTHENTICATING" });
     const resolved = this.getResolvedConfiguration(storeId);
-    if (!resolved) {
-      throw new BadRequestException("NAVER_CREDENTIALS_NOT_CONFIGURED");
-    }
-
-    const targetDates = enumerateDateRange(dateFrom, dateTo);
-
-    // 결제일 기준 조회 (GET /v1/pay-order/seller/product-orders, rangeType=PAYED_DATETIME)
-    const productOrderIds: string[] = [];
-    for (const targetDate of targetDates) {
-      const ids = await this.fetchProductOrderIdsByPaymentDate(
-        resolved.store,
-        resolved.credential,
-        targetDate,
+    if (!resolved)
+      throw new NaverRequestError("NAVER_CREDENTIALS_NOT_CONFIGURED");
+    const { store, credential } = resolved;
+    let fetchedCount = 0;
+    let validatedCount = 0;
+    const cutoff = Date.parse(
+      options.requestedCutoffAt ?? buildOrderRangeEnd(dateTo),
+    );
+    const rangeStart = Date.parse(buildOrderRangeStart(dateFrom));
+    const rangeEnd = Date.parse(buildOrderRangeEnd(dateTo));
+    if (
+      !Number.isFinite(cutoff) ||
+      !Number.isFinite(rangeStart) ||
+      !Number.isFinite(rangeEnd) ||
+      rangeStart > rangeEnd ||
+      rangeStart > cutoff
+    )
+      throw new NaverRequestError("INVALID_ORDER_RANGE");
+    const makeChunk = async (
+      ids: string[],
+      checkpoint: OrderStreamChunk["checkpoint"],
+      changed = new Map<string, JsonRecord>(),
+    ): Promise<OrderStreamChunk> => {
+      options.signal?.throwIfAborted();
+      fetchedCount += ids.length;
+      await options.onProgress?.({
+        stage: "FETCHING_DETAILS",
+        queryKind: checkpoint.queryKind,
+        page: checkpoint.page,
+        dateWindow: { from: checkpoint.windowFrom, to: checkpoint.windowTo },
+      });
+      const details = await this.fetchOrderDetails(
+        store,
+        credential,
+        ids,
+        options.signal,
       );
-      productOrderIds.push(...ids);
+      const items = details.map((detail) =>
+        this.normalizeOrderDetail(
+          detail,
+          changed.get(this.extractProductOrderId(detail)!),
+          options,
+        ),
+      );
+      validatedCount += items.length;
+      return {
+        items,
+        checkpoint,
+        fetchedCount,
+        validatedCount,
+        warnings: items.some((item) => item.saleStatus === "UNKNOWN")
+          ? ["UNKNOWN_ORDER_STATUS"]
+          : [],
+      };
+    };
+    for (const date of enumerateDateRange(dateFrom, dateTo)) {
+      const from = buildOrderRangeStart(date);
+      const to = toKstTimestamp(
+        Math.min(Date.parse(buildOrderRangeEnd(date)), cutoff),
+      );
+      if (Date.parse(from) > Date.parse(to)) continue;
+      const seenPages = new Set<string>();
+      for (let page = 1; page <= MAX_CONDITIONAL_ORDER_PAGES; page += 1) {
+        await options.onProgress?.({
+          stage: "FETCHING_ORDERS",
+          queryKind: "PAYMENT",
+          page,
+          dateWindow: { from, to },
+        });
+        const response = await this.requestSellerJson(
+          "/v1/pay-order/seller/product-orders",
+          store,
+          credential,
+          {
+            query: {
+              from,
+              to,
+              rangeType: "PAYED_DATETIME",
+              pageSize: String(CONDITIONAL_ORDER_PAGE_SIZE),
+              page: String(page),
+            },
+            signal: options.signal,
+          },
+        );
+        if (
+          !isRecord(response) ||
+          !isRecord(response.data) ||
+          !Array.isArray(response.data.contents) ||
+          !isRecord(response.data.pagination)
+        )
+          throw new NaverRequestError("NAVER_INVALID_RESPONSE");
+        const pagination = response.data.pagination;
+        if (typeof pagination.hasNext !== "boolean" || pagination.page !== page)
+          throw new NaverRequestError("NAVER_INVALID_PAGINATION");
+        const ids = response.data.contents.map((entry: unknown) => {
+          if (!isRecord(entry))
+            throw new NaverRequestError("NAVER_INVALID_ORDER");
+          if (!isRecord(entry.content))
+            throw new NaverRequestError("NAVER_INVALID_ORDER");
+          const id = this.extractProductOrderId(entry.content);
+          if (!id) throw new NaverRequestError("NAVER_INVALID_ORDER_ID");
+          return id;
+        });
+        const fingerprint = [...ids].sort().join(",");
+        if (
+          (ids.length === 0 && pagination.hasNext) ||
+          (ids.length > 0 && seenPages.has(fingerprint))
+        )
+          throw new NaverRequestError("INCOMPLETE_PAGINATION");
+        seenPages.add(fingerprint);
+        yield await makeChunk(uniqueStrings(ids), {
+          schemaVersion: 1,
+          queryKind: "PAYMENT",
+          windowFrom: from,
+          windowTo: to,
+          page,
+        });
+        if (!pagination.hasNext) break;
+        if (page === MAX_CONDITIONAL_ORDER_PAGES)
+          throw new NaverRequestError("INCOMPLETE_PAGINATION");
+      }
     }
-
-    const uniqueIds = uniqueStrings(productOrderIds);
-    if (uniqueIds.length === 0) {
-      return [];
+    let existing: string[] = [];
+    let page = 0;
+    for (const id of options.existingProductOrderIds ?? []) {
+      existing.push(id);
+      if (existing.length === DETAIL_BATCH_SIZE) {
+        yield await makeChunk(uniqueStrings(existing), {
+          schemaVersion: 1,
+          queryKind: "EXISTING",
+          windowFrom: dateFrom,
+          windowTo: dateTo,
+          page: ++page,
+        });
+        existing = [];
+      }
     }
-
-    const details = await this.fetchOrderDetails(resolved.store, resolved.credential, uniqueIds);
-
-    const includeRawPayload = options?.includeRawPayload === true;
-
-    return details
-      .map((detail) => this.normalizeOrderDetail(detail, undefined, { includeRawPayload }))
-      .filter((item): item is SyncedOrderItemInput => !!item);
+    if (existing.length)
+      yield await makeChunk(uniqueStrings(existing), {
+        schemaVersion: 1,
+        queryKind: "EXISTING",
+        windowFrom: dateFrom,
+        windowTo: dateTo,
+        page: ++page,
+      });
+    if (options.changedFrom) {
+      // NAVER FAQ #10 recommends allowing five seconds for upstream publication.
+      if (cutoff > Date.now() + 1000)
+        throw new NaverRequestError("INVALID_ORDER_RANGE");
+      await waitForNaverRetry(
+        Math.max(0, cutoff + 5000 - Date.now()),
+        options.signal,
+      );
+      let start = Date.parse(options.changedFrom);
+      if (!Number.isFinite(start) || start > cutoff)
+        throw new NaverRequestError("INVALID_ORDER_RANGE");
+      // Re-read five minutes before the committed watermark for delayed changes.
+      start -= 5 * 60 * 1000;
+      while (start <= cutoff) {
+        const end = Math.min(start + 24 * 60 * 60 * 1000 - 1, cutoff);
+        const to = toKstTimestamp(end);
+        let from = toKstTimestamp(start);
+        let sequence: string | undefined;
+        const seen = new Set<string>();
+        for (let page = 1; page <= MAX_CHANGED_ORDER_PAGES; page += 1) {
+          await options.onProgress?.({
+            stage: "FETCHING_ORDERS",
+            queryKind: "CHANGED",
+            page,
+            dateWindow: { from, to },
+          });
+          const response = await this.requestSellerJson(
+            "/v1/pay-order/seller/product-orders/last-changed-statuses",
+            store,
+            credential,
+            {
+              query: {
+                lastChangedFrom: from,
+                lastChangedTo: to,
+                limitCount: "300",
+                ...(sequence ? { moreSequence: sequence } : {}),
+              },
+              signal: options.signal,
+            },
+          );
+          const { entries, more } = this.parseChangedOrders(response);
+          const changed = new Map(
+            entries.map((entry) => [String(entry.productOrderId), entry]),
+          );
+          yield await makeChunk(
+            [...changed.keys()],
+            {
+              schemaVersion: 1,
+              queryKind: "CHANGED",
+              windowFrom: toKstTimestamp(start),
+              windowTo: to,
+              page,
+            },
+            changed,
+          );
+          if (!more) break;
+          const cursor = `${more.moreFrom}:${more.moreSequence}`;
+          if (
+            seen.has(cursor) ||
+            Date.parse(more.moreFrom) < Date.parse(from) ||
+            Date.parse(more.moreFrom) > end ||
+            page === MAX_CHANGED_ORDER_PAGES
+          )
+            throw new NaverRequestError("INCOMPLETE_PAGINATION");
+          seen.add(cursor);
+          from = toKstTimestamp(Date.parse(more.moreFrom));
+          sequence = String(more.moreSequence);
+        }
+        start = end + 1;
+      }
+    }
   }
 
   private resolveCredential(store: Store): ResolvedCommerceCredential | null {
-    const envCredential = this.naverCommerceConfigService.getEnvCredentialForStore(store);
+    const envCredential =
+      this.naverCommerceConfigService.getEnvCredentialForStore(store);
     if (envCredential) {
       return {
         credentialId: null,
@@ -340,150 +605,116 @@ export class NaverCommerceService {
     };
   }
 
-  private async lookupSellerChannels(store: Store, credential: ResolvedCommerceCredential) {
-    const response = await this.requestSellerJson("/v1/seller/channels", store, credential);
+  private async lookupSellerChannels(
+    store: Store,
+    credential: ResolvedCommerceCredential,
+  ) {
+    const response = await this.requestSellerJson(
+      "/v1/seller/channels",
+      store,
+      credential,
+    );
     return this.extractChannelEntries(response);
   }
 
-  private async fetchChangedOrders(
-    store: Store,
-    credential: ResolvedCommerceCredential,
-    dateFrom: string,
-    dateTo: string,
-  ) {
-    const entries: JsonRecord[] = [];
-    const start = buildOrderRangeStart(dateFrom);
-    const end = buildOrderRangeEnd(dateTo);
-    let lastChangedFrom = start;
-    let moreSequence: string | number | null = null;
-
-    for (let page = 0; page < MAX_CHANGED_ORDER_PAGES; page += 1) {
-      const response = await this.requestSellerJson(
-        "/v1/pay-order/seller/product-orders/last-changed-statuses",
-        store,
-        credential,
-        {
-          query: {
-            lastChangedFrom,
-            lastChangedTo: end,
-            limitCount: "300",
-            ...(moreSequence != null ? { moreSequence: String(moreSequence) } : {}),
-          },
-        },
-      );
-
-      entries.push(...this.extractChangedOrderEntries(response));
-      const more = this.extractChangedOrderCursor(response);
-      if (!more) {
-        break;
-      }
-
-      lastChangedFrom = more.moreFrom;
-      moreSequence = more.moreSequence;
-    }
-
-    return { entries };
-  }
-
-  private async fetchProductOrderIdsByPaymentDate(
-    store: Store,
-    credential: ResolvedCommerceCredential,
-    targetDate: string,
-  ): Promise<string[]> {
-    const from = buildOrderRangeStart(targetDate);
-    const to = buildOrderRangeEnd(targetDate);
-    const ids: string[] = [];
-
-    for (let page = 1; page <= MAX_CONDITIONAL_ORDER_PAGES; page += 1) {
-      const response = await this.requestSellerJson(
-        "/v1/pay-order/seller/product-orders",
-        store,
-        credential,
-        {
-          query: {
-            from,
-            to,
-            rangeType: "PAYED_DATETIME",
-            pageSize: String(CONDITIONAL_ORDER_PAGE_SIZE),
-            page: String(page),
-          },
-        },
-      );
-
-      const entries = this.extractConditionalOrderEntries(response);
-      entries.forEach((entry) => {
-        const id = pickString(entry.productOrderId);
-        if (id) {
-          ids.push(id);
-        }
-      });
-
-      // 반환된 항목 수가 pageSize보다 적으면 마지막 페이지
-      if (entries.length < CONDITIONAL_ORDER_PAGE_SIZE) {
-        break;
-      }
-    }
-
-    return ids;
-  }
-
-  private extractConditionalOrderEntries(payload: unknown): JsonRecord[] {
-    return this.extractMatchingArrayEntries(payload, (entry) =>
-      pickString(entry.productOrderId) !== null,
-    );
+  private parseChangedOrders(payload: unknown): {
+    entries: JsonRecord[];
+    more: { moreFrom: string; moreSequence: string | number } | null;
+  } {
+    if (!isRecord(payload))
+      throw new NaverRequestError("NAVER_INVALID_RESPONSE");
+    // Official NAVER notice #321 (2025-04-16): empty responses omit data.
+    if (
+      Object.keys(payload).every(
+        (key) => key === "traceId" || key === "timestamp",
+      ) &&
+      typeof payload.traceId === "string" &&
+      typeof payload.timestamp === "string" &&
+      Number.isFinite(Date.parse(payload.timestamp))
+    )
+      return { entries: [], more: null };
+    const data = payload.data;
+    if (!isRecord(data) || !Array.isArray(data.lastChangeStatuses))
+      throw new NaverRequestError("NAVER_INVALID_RESPONSE");
+    const entries = data.lastChangeStatuses.map((entry: unknown) => {
+      if (
+        !isRecord(entry) ||
+        !pickString(entry.productOrderId) ||
+        !pickString(entry.orderId) ||
+        typeof entry.lastChangedDate !== "string" ||
+        !Number.isFinite(Date.parse(entry.lastChangedDate))
+      )
+        throw new NaverRequestError("NAVER_INVALID_CHANGED_ORDER");
+      return entry;
+    });
+    if (data.count !== entries.length)
+      throw new NaverRequestError("NAVER_INVALID_CHANGED_COUNT");
+    if (data.more == null) return { entries, more: null };
+    const more = data.more;
+    if (
+      !entries.length ||
+      !isRecord(more) ||
+      typeof more.moreFrom !== "string" ||
+      !Number.isFinite(Date.parse(more.moreFrom)) ||
+      (typeof more.moreSequence !== "string" &&
+        typeof more.moreSequence !== "number")
+    )
+      throw new NaverRequestError("NAVER_INVALID_PAGINATION");
+    return {
+      entries,
+      more: { moreFrom: more.moreFrom, moreSequence: more.moreSequence },
+    };
   }
 
   private async fetchOrderDetails(
     store: Store,
     credential: ResolvedCommerceCredential,
     productOrderIds: string[],
-  ) {
-    const envelopes: JsonRecord[] = [];
-
+    signal?: AbortSignal,
+  ): Promise<JsonRecord[]> {
+    const results: JsonRecord[] = [];
     for (const batch of chunk(productOrderIds, DETAIL_BATCH_SIZE)) {
-      const response = await this.requestOrderDetailBatch(store, credential, batch);
-      envelopes.push(...this.extractOrderDetailEnvelopes(response));
-    }
-
-    const deduped = new Map<string, JsonRecord>();
-    envelopes.forEach((entry) => {
-      const productOrderId = this.extractProductOrderId(entry);
-      if (productOrderId) {
-        deduped.set(productOrderId, entry);
+      const found = new Map<string, JsonRecord>();
+      let missing = batch;
+      for (let attempt = 0; attempt < 2 && missing.length; attempt += 1) {
+        const response = await this.requestSellerJson(
+          "/v1/pay-order/seller/product-orders/query",
+          store,
+          credential,
+          { method: "POST", body: { productOrderIds: missing }, signal },
+        );
+        if (!isRecord(response) || !Array.isArray(response.data))
+          throw new NaverRequestError("NAVER_INVALID_RESPONSE");
+        const requested = new Set(missing);
+        for (const entry of response.data) {
+          if (
+            !isRecord(entry) ||
+            !isRecord(entry.productOrder) ||
+            !isRecord(entry.order)
+          )
+            throw new NaverRequestError("NAVER_INVALID_ORDER");
+          const id = this.extractProductOrderId(entry);
+          if (!id || !requested.has(id) || found.has(id))
+            throw new NaverRequestError("NAVER_UNEXPECTED_DETAIL_ID");
+          found.set(id, entry);
+        }
+        missing = batch.filter((id) => !found.has(id));
       }
-    });
-
-    return Array.from(deduped.values());
-  }
-
-  private async requestOrderDetailBatch(
-    store: Store,
-    credential: ResolvedCommerceCredential,
-    productOrderIds: string[],
-  ) {
-    const candidateBodies = [{ productOrderIds }, { productOrderIdList: productOrderIds }];
-    let lastError: Error | null = null;
-
-    for (const body of candidateBodies) {
-      try {
-        return await this.requestSellerJson("/v1/pay-order/seller/product-orders/query", store, credential, {
-          method: "POST",
-          body,
-        });
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-      }
+      if (missing.length)
+        throw new NaverRequestError("NAVER_MISSING_ORDER_DETAILS", true);
+      results.push(...batch.map((id) => found.get(id)!));
     }
-
-    throw lastError ?? new BadGatewayException("NAVER_ORDER_DETAIL_QUERY_FAILED");
+    return results;
   }
 
   private normalizeOrderDetail(
     detailEnvelope: JsonRecord,
     changedOrder: JsonRecord | undefined,
     options?: { includeRawPayload?: boolean },
-  ): SyncedOrderItemInput | null {
-    const productOrder = isRecord(detailEnvelope.productOrder) ? detailEnvelope.productOrder : detailEnvelope;
+  ): SyncedOrderItemInput {
+    const productOrder = isRecord(detailEnvelope.productOrder)
+      ? detailEnvelope.productOrder
+      : detailEnvelope;
     const order = isRecord(detailEnvelope.order)
       ? detailEnvelope.order
       : isRecord(productOrder.order)
@@ -512,28 +743,80 @@ export class NaverCommerceService {
       changedOrder?.orderId,
     );
 
-    if (!externalProductOrderId || !externalOrderId) {
-      return null;
+    if (
+      !externalProductOrderId ||
+      !externalOrderId ||
+      typeof productOrder.productOrderId !== "string" ||
+      typeof order?.orderId !== "string"
+    ) {
+      throw new NaverRequestError("NAVER_INVALID_ORDER_ID");
+    }
+
+    const quantity = pickNumber(productOrder.quantity);
+    const amount = pickNumber(productOrder.totalPaymentAmount);
+    if (
+      quantity == null ||
+      !Number.isInteger(quantity) ||
+      quantity < 1 ||
+      amount == null ||
+      !Number.isFinite(amount) ||
+      amount < 0
+    )
+      throw new NaverRequestError("NAVER_INVALID_ORDER_AMOUNT");
+    for (const field of [
+      "totalProductAmount",
+      "deliveryFeeAmount",
+      "paymentCommission",
+      "knowledgeShoppingSellingInterlockCommission",
+      "saleCommission",
+      "channelCommission",
+    ]) {
+      if (
+        productOrder[field] != null &&
+        pickNumber(productOrder[field]) == null
+      )
+        throw new NaverRequestError("NAVER_INVALID_ORDER_AMOUNT");
     }
 
     const rawProductName =
-      pickString(productOrder.productName, product?.productName, detailEnvelope.productName) ??
-      `NAVER_PRODUCT_${externalProductOrderId}`;
-    const rawOptionInfo = this.buildOptionInfo(productOrder, product, detailEnvelope);
+      pickString(
+        productOrder.productName,
+        product?.productName,
+        detailEnvelope.productName,
+      ) ?? `NAVER_PRODUCT_${externalProductOrderId}`;
+    const rawOptionInfo = this.buildOptionInfo(
+      productOrder,
+      product,
+      detailEnvelope,
+    );
     const productOrderStatus = pickString(
       productOrder.productOrderStatus,
       detailEnvelope.productOrderStatus,
       changedOrder?.productOrderStatus,
     );
-    const claimStatus = this.extractClaimStatus(productOrder, detailEnvelope, changedOrder);
+    const claimStatus = this.extractClaimStatus(
+      productOrder,
+      detailEnvelope,
+      changedOrder,
+    );
     const rawStatus = claimStatus ?? productOrderStatus ?? "UNKNOWN";
-    const orderDateTime = pickString(order?.orderDate, productOrder.orderDate, detailEnvelope.orderDate);
+    const orderDateTime = pickString(
+      order?.orderDate,
+      productOrder.orderDate,
+      detailEnvelope.orderDate,
+    );
     const paymentDateTime = pickString(
       order?.paymentDate,
       productOrder.paymentDate,
       detailEnvelope.paymentDate,
       productOrder.decisionDate,
     );
+    if (
+      !orderDateTime ||
+      !Number.isFinite(Date.parse(orderDateTime)) ||
+      (paymentDateTime != null && !Number.isFinite(Date.parse(paymentDateTime)))
+    )
+      throw new NaverRequestError("NAVER_INVALID_ORDER_DATE");
 
     const optionManageCode = pickString(productOrder.optionManageCode);
 
@@ -549,15 +832,8 @@ export class NaverCommerceService {
       rawProductName,
       rawOptionInfo,
       optionCode: pickString(productOrder.optionCode),
-      quantity: pickNumber(productOrder.quantity, productOrder.productCount, detailEnvelope.quantity) ?? 1,
-      productPaymentAmount:
-        pickNumber(
-          productOrder.totalPaymentAmount,
-          productOrder.paymentAmount,
-          productOrder.productAmount,
-          productOrder.salePrice,
-          detailEnvelope.totalPaymentAmount,
-        ) ?? 0,
+      quantity,
+      productPaymentAmount: amount,
       totalProductAmount: pickNumber(
         productOrder.totalProductAmount,
         productOrder.productPrice,
@@ -568,13 +844,22 @@ export class NaverCommerceService {
         productOrder.shippingFeeAmount,
         delivery?.deliveryFeeAmount,
       ),
-      paymentCommission: pickNumber(productOrder.paymentCommission, detailEnvelope.paymentCommission),
+      paymentCommission: pickNumber(
+        productOrder.paymentCommission,
+        detailEnvelope.paymentCommission,
+      ),
       knowledgeShoppingSellingInterlockCommission: pickNumber(
         productOrder.knowledgeShoppingSellingInterlockCommission,
         detailEnvelope.knowledgeShoppingSellingInterlockCommission,
       ),
-      saleCommission: pickNumber(productOrder.saleCommission, detailEnvelope.saleCommission),
-      channelCommission: pickNumber(productOrder.channelCommission, detailEnvelope.channelCommission),
+      saleCommission: pickNumber(
+        productOrder.saleCommission,
+        detailEnvelope.saleCommission,
+      ),
+      channelCommission: pickNumber(
+        productOrder.channelCommission,
+        detailEnvelope.channelCommission,
+      ),
       orderDate: toDateString(orderDateTime),
       paymentDate: toDateString(paymentDateTime),
       orderDateTime,
@@ -583,13 +868,18 @@ export class NaverCommerceService {
       claimStatus,
       rawStatus,
       saleStatus: saleStatusFromNaverState(productOrderStatus, claimStatus),
-      packageNumber: pickString(productOrder.packageNumber, delivery?.packageNumber, detailEnvelope.packageNumber),
-      rawPayload: options?.includeRawPayload === true
-        ? {
-            changedOrder: changedOrder ?? null,
-            detail: detailEnvelope,
-          }
-        : null,
+      packageNumber: pickString(
+        productOrder.packageNumber,
+        delivery?.packageNumber,
+        detailEnvelope.packageNumber,
+      ),
+      rawPayload:
+        options?.includeRawPayload === true
+          ? {
+              changedOrder: changedOrder ?? null,
+              detail: detailEnvelope,
+            }
+          : null,
     };
 
     // optionManageCode가 있으면 추가 (빈 문자열은 제외)
@@ -600,7 +890,11 @@ export class NaverCommerceService {
     return result;
   }
 
-  private buildOptionInfo(productOrder: JsonRecord, product: JsonRecord | null, detailEnvelope: JsonRecord) {
+  private buildOptionInfo(
+    productOrder: JsonRecord,
+    product: JsonRecord | null,
+    detailEnvelope: JsonRecord,
+  ) {
     const selectedOptions = [
       this.stringifyOptionCollection(productOrder.standardPurchaseOptions),
       this.stringifyOptionCollection(productOrder.selectedOptions),
@@ -616,7 +910,11 @@ export class NaverCommerceService {
         ...selectedOptions,
       ]) ?? null;
 
-    return pickString(productOrder.productOption, readableOptionInfo, productOrder.optionCode);
+    return pickString(
+      productOrder.productOption,
+      readableOptionInfo,
+      productOrder.optionCode,
+    );
   }
 
   private stringifyOptionCollection(value: unknown): string | null {
@@ -629,7 +927,11 @@ export class NaverCommerceService {
         if (!isRecord(entry)) {
           return pickString(entry);
         }
-        return optionPartsToText([entry.optionName, entry.valueName, entry.optionValue]);
+        return optionPartsToText([
+          entry.optionName,
+          entry.valueName,
+          entry.optionValue,
+        ]);
       })
       .filter((entry): entry is string => !!entry);
 
@@ -647,16 +949,24 @@ export class NaverCommerceService {
         return direct;
       }
 
-      const currentClaim = isRecord(node.currentClaim) ? node.currentClaim : null;
+      const currentClaim = isRecord(node.currentClaim)
+        ? node.currentClaim
+        : null;
       if (!currentClaim) {
         continue;
       }
 
       const nestedStatuses = [
         pickString(currentClaim.claimStatus),
-        isRecord(currentClaim.cancel) ? pickString(currentClaim.cancel.claimStatus) : null,
-        isRecord(currentClaim.return) ? pickString(currentClaim.return.claimStatus) : null,
-        isRecord(currentClaim.exchange) ? pickString(currentClaim.exchange.claimStatus) : null,
+        isRecord(currentClaim.cancel)
+          ? pickString(currentClaim.cancel.claimStatus)
+          : null,
+        isRecord(currentClaim.return)
+          ? pickString(currentClaim.return.claimStatus)
+          : null,
+        isRecord(currentClaim.exchange)
+          ? pickString(currentClaim.exchange.claimStatus)
+          : null,
       ];
       const matched = nestedStatuses.find((value): value is string => !!value);
       if (matched) {
@@ -672,71 +982,11 @@ export class NaverCommerceService {
     return pickString(productOrder.productOrderId, node.productOrderId);
   }
 
-  private extractChangedOrderEntries(payload: unknown) {
-    return this.extractMatchingArrayEntries(payload, (entry) =>
-      pickString(entry.productOrderId, entry.orderId, entry.lastChangedDate) !== null,
-    );
-  }
-
-  private extractOrderDetailEnvelopes(payload: unknown) {
-    return this.extractMatchingArrayEntries(payload, (entry) => this.extractProductOrderId(entry) !== null);
-  }
-
-  private extractMatchingArrayEntries(payload: unknown, predicate: (entry: JsonRecord) => boolean): JsonRecord[] {
-    const results: JsonRecord[] = [];
-
-    const visit = (node: unknown) => {
-      if (Array.isArray(node)) {
-        const matching = node.filter((entry): entry is JsonRecord => isRecord(entry) && predicate(entry));
-        if (matching.length > 0) {
-          results.push(...matching);
-          return;
-        }
-
-        node.forEach((entry) => visit(entry));
-        return;
-      }
-
-      if (isRecord(node)) {
-        Object.values(node).forEach((entry) => visit(entry));
-      }
-    };
-
-    visit(payload);
-    return results;
-  }
-
-  private extractChangedOrderCursor(payload: unknown): ChangedOrderCursor | null {
-    let found: ChangedOrderCursor | null = null;
-
-    const visit = (node: unknown) => {
-      if (found) {
-        return;
-      }
-      if (Array.isArray(node)) {
-        node.forEach((entry) => visit(entry));
-        return;
-      }
-      if (!isRecord(node)) {
-        return;
-      }
-
-      const moreFrom = pickString(node.moreFrom);
-      const moreSequence = pickString(node.moreSequence) ?? pickNumber(node.moreSequence);
-      if (moreFrom && moreSequence != null) {
-        found = { moreFrom, moreSequence };
-        return;
-      }
-
-      Object.values(node).forEach((entry) => visit(entry));
-    };
-
-    visit(payload);
-    return found;
-  }
-
-  private extractChannelEntries(payload: unknown): Array<{ channelNo: string; channelName: string | null }> {
-    const entries: Array<{ channelNo: string; channelName: string | null }> = [];
+  private extractChannelEntries(
+    payload: unknown,
+  ): Array<{ channelNo: string; channelName: string | null }> {
+    const entries: Array<{ channelNo: string; channelName: string | null }> =
+      [];
 
     const visit = (node: unknown) => {
       if (Array.isArray(node)) {
@@ -747,7 +997,11 @@ export class NaverCommerceService {
         return;
       }
 
-      const channelNo = pickString(node.channelNo, node.defaultChannelNo, node.representChannelNo);
+      const channelNo = pickString(
+        node.channelNo,
+        node.defaultChannelNo,
+        node.representChannelNo,
+      );
       if (channelNo) {
         entries.push({
           channelNo,
@@ -770,91 +1024,116 @@ export class NaverCommerceService {
       method?: "GET" | "POST";
       query?: Record<string, string>;
       body?: unknown;
-      retryOnAuthFailure?: boolean;
+      signal?: AbortSignal;
     },
   ): Promise<unknown> {
-    const retryOnAuthFailure = options?.retryOnAuthFailure ?? true;
-    const token = await this.getSellerToken(store, credential);
     const url = new URL(`${NAVER_API_BASE_URL}${path}`);
-    Object.entries(options?.query ?? {}).forEach(([key, value]) => {
-      url.searchParams.set(key, value);
-    });
-
-    const response = await fetch(url, {
-      method: options?.method ?? "GET",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(options?.body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: options?.body ? JSON.stringify(options.body) : undefined,
-    });
-
-    const parsed = await this.parseJsonResponse(response);
-    if (response.status === 401 && parsed.code === "GW.AUTHN" && retryOnAuthFailure) {
-      this.tokenCache.delete(this.buildCacheKey(store, credential));
-      return this.requestSellerJson(path, store, credential, {
-        ...options,
-        retryOnAuthFailure: false,
-      });
-    }
-
-    if (!response.ok) {
-      throw new BadGatewayException(
-        `NAVER_API_ERROR [${parsed.code ?? response.status}] ${parsed.message ?? "Request failed."}`,
+    Object.entries(options?.query ?? {}).forEach(([key, value]) =>
+      url.searchParams.set(key, value),
+    );
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      options?.signal?.throwIfAborted();
+      const token = await waitForNaverToken(
+        this.getSellerToken(store, credential),
+        options?.signal,
       );
+      options?.signal?.throwIfAborted();
+      try {
+        return await requestNaverJson(
+          url,
+          {
+            method: options?.method ?? "GET",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              ...(options?.body ? { "Content-Type": "application/json" } : {}),
+            },
+            body: options?.body ? JSON.stringify(options.body) : undefined,
+          },
+          options?.signal,
+        );
+      } catch (error) {
+        if (
+          !(error instanceof NaverRequestError) ||
+          error.upstreamStatus !== 401 ||
+          error.upstreamCode !== "GW.AUTHN" ||
+          attempt > 0
+        )
+          throw error;
+        const key = this.buildCacheKey(store, credential);
+        if (this.tokenCache.get(key)?.accessToken === token)
+          this.tokenCache.delete(key);
+      }
     }
-
-    return parsed.body;
+    throw new NaverRequestError("NAVER_AUTHENTICATION_FAILED");
   }
 
-  private async getSellerToken(store: Store, credential: ResolvedCommerceCredential) {
+  private async getSellerToken(
+    store: Store,
+    credential: ResolvedCommerceCredential,
+  ): Promise<string> {
     const cacheKey = this.buildCacheKey(store, credential);
     const cached = this.tokenCache.get(cacheKey);
-    if (cached && cached.expiresAt - TOKEN_RENEWAL_BUFFER_MS > Date.now()) {
+    if (cached && cached.expiresAt - TOKEN_RENEWAL_BUFFER_MS > Date.now())
       return cached.accessToken;
+    const pending = this.tokenRequests.get(cacheKey);
+    if (pending) return pending;
+    const request = this.issueSellerToken(store, credential, cacheKey);
+    this.tokenRequests.set(cacheKey, request);
+    try {
+      return await request;
+    } finally {
+      this.tokenRequests.delete(cacheKey);
     }
+  }
 
+  private async issueSellerToken(
+    store: Store,
+    credential: ResolvedCommerceCredential,
+    cacheKey: string,
+  ): Promise<string> {
     const timestamp = Date.now().toString();
-    const signature = createNaverClientSecretSign(
-      credential.clientId,
-      credential.clientSecret,
-      timestamp,
-    );
-
     const body = new URLSearchParams({
       client_id: credential.clientId,
       timestamp,
-      client_secret_sign: signature,
+      client_secret_sign: createNaverClientSecretSign(
+        credential.clientId,
+        credential.clientSecret,
+        timestamp,
+      ),
       grant_type: "client_credentials",
       type: "SELLER",
       account_id: store.sellerAccountId,
     });
-
-    const response = await fetch(`${NAVER_API_BASE_URL}/v1/oauth2/token`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
+    const parsed = await requestNaverJson(
+      `${NAVER_API_BASE_URL}/v1/oauth2/token`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
       },
-      body,
-    });
-
-    const parsed = await this.parseJsonResponse<SellerTokenResponse>(response);
-    if (!response.ok || !parsed.body?.access_token) {
-      throw new BadGatewayException(
-        `NAVER_TOKEN_ISSUE_FAILED [${parsed.code ?? response.status}] ${parsed.message ?? "Token was not issued."}`,
-      );
-    }
-
-    const expiresAt = Date.now() + parsed.body.expires_in * 1000;
+    );
+    if (
+      !isRecord(parsed) ||
+      typeof parsed.access_token !== "string" ||
+      !parsed.access_token ||
+      typeof parsed.expires_in !== "number" ||
+      !Number.isFinite(parsed.expires_in) ||
+      parsed.expires_in <= 0
+    )
+      throw new NaverRequestError("NAVER_INVALID_TOKEN_RESPONSE");
+    const expiresAt = Date.now() + parsed.expires_in * 1000;
+    await this.recordTokenIssuedAt(credential.credentialId, expiresAt);
     this.tokenCache.set(cacheKey, {
-      accessToken: parsed.body.access_token,
+      accessToken: parsed.access_token,
       expiresAt,
     });
-    await this.recordTokenIssuedAt(credential.credentialId, expiresAt);
-    return parsed.body.access_token;
+    return parsed.access_token;
   }
 
-  private async recordTokenIssuedAt(credentialId: string | null, expiresAt: number) {
+  private async recordTokenIssuedAt(
+    credentialId: string | null,
+    expiresAt: number,
+  ) {
     if (!credentialId) {
       return;
     }
@@ -862,7 +1141,9 @@ export class NaverCommerceService {
     const issuedAtIso = new Date().toISOString();
     const expiresAtIso = new Date(expiresAt).toISOString();
     await this.databaseService.writeCommitted((draft) => {
-      const credential = draft.commerceCredentials.find((item) => item.id === credentialId);
+      const credential = draft.commerceCredentials.find(
+        (item) => item.id === credentialId,
+      );
       if (!credential) {
         return;
       }
@@ -870,32 +1151,6 @@ export class NaverCommerceService {
       credential.lastTokenExpiresAt = expiresAtIso;
       credential.updatedAt = issuedAtIso;
     });
-  }
-
-  private async parseJsonResponse<T = JsonRecord>(response: Response) {
-    const text = await response.text();
-    if (!text.trim()) {
-      return {
-        body: null as T | null,
-        code: null as string | null,
-        message: null as string | null,
-      };
-    }
-
-    try {
-      const parsed = JSON.parse(text) as T & { code?: string; message?: string };
-      return {
-        body: parsed,
-        code: typeof parsed.code === "string" ? parsed.code : null,
-        message: typeof parsed.message === "string" ? parsed.message : null,
-      };
-    } catch {
-      return {
-        body: null as T | null,
-        code: null as string | null,
-        message: text,
-      };
-    }
   }
 
   private buildCacheKey(store: Store, credential: ResolvedCommerceCredential) {

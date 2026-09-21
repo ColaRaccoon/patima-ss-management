@@ -5,13 +5,13 @@ import {
 
 export async function GET(
   _request: Request,
-  context: { params: Promise<{ operationId: string }> },
+  context: { params: Promise<{ batchId: string }> },
 ) {
-  const { operationId } = await context.params;
+  const { batchId } = await context.params;
   return proxyRequest({
     timeoutMs: ORDER_SYNC_PROXY_TIMEOUT_MS,
-    path: `/operations/${operationId}`,
+    path: `/order-sync-batches/${encodeURIComponent(batchId)}`,
     method: "GET",
-    fallbackMessage: "작업 상세 조회에 실패했습니다.",
+    fallbackMessage: "동기화 상태를 조회할 수 없습니다.",
   });
 }

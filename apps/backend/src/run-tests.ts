@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mock } from "node:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,6 +52,8 @@ import type { SyncedOrderItemInput } from "./naver-commerce.service";
 import { MappingSeedService } from "./mapping-seed.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncService } from "./order-sync.service";
+import { OrderSyncBatchService } from "./order-sync-batch.service";
+import { runNaverReliabilityTests } from "./naver-reliability-tests";
 import { OperationService } from "./operation.service";
 import { OperationWorkerService } from "./operation-worker.service";
 import { ProfitService } from "./profit.service";
@@ -157,6 +160,20 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   async writeCommitted(mutator: (draft: typeof database) => unknown) {
     this.writeCommittedCalls += 1;
     return this.write(mutator);
+  },
+  async commitOrderSync(mutator: (draft: typeof database) => unknown) {
+    return this.writeCommitted(mutator);
+  },
+  async saveDailyFakePurchaseCommitted(params: Parameters<DatabaseService["saveDailyFakePurchaseCommitted"]>[0]) {
+    return this.writeCommitted((draft) => {
+      const existing = draft.dailyFakePurchases.find((row) => row.storeId === params.storeId && row.date === params.date) ?? null;
+      const replacement = params.buildReplacement(existing);
+      const index = draft.dailyFakePurchases.findIndex((row) => row.storeId === params.storeId && row.date === params.date);
+      if (index === -1) draft.dailyFakePurchases.push(replacement.purchase);
+      else draft.dailyFakePurchases[index] = replacement.purchase;
+      draft.auditLogs.push(replacement.auditLog);
+      return replacement.purchase;
+    });
   },
   async createCanonicalSalesUnitCommitted(params: {
     salesUnit: (typeof database.canonicalSalesUnits)[number];
@@ -924,15 +941,16 @@ const createOrderSyncServiceHarness = (params?: {
     {
       getResolvedConfiguration: (storeId: string) =>
         configuredStoreIds.has(storeId) ? { store: { id: storeId }, credential: {} } : null,
-      fetchOrderItems: (
+      streamOrderItems: async function* (
         storeId: string,
         dateFrom: string,
         dateTo: string,
         options?: { includeRawPayload?: boolean },
-      ) => {
+      ) {
         fetchOrderItemsCalls.push({ storeId, dateFrom, dateTo, options });
         if (params?.liveOrderItems) {
-          return params.liveOrderItems;
+          yield { items: params.liveOrderItems, fetchedCount: params.liveOrderItems.length, validatedCount: params.liveOrderItems.length, checkpoint: { schemaVersion: 1, queryKind: "PAYMENT", windowStart: dateFrom, windowEnd: dateTo } };
+          return;
         }
         throw new Error("fetchOrderItems not configured for this test");
       },
@@ -1790,71 +1808,294 @@ run("NaverCommerceService prefers productOption over optionCode for readable opt
   );
 });
 
-runAsync("OrderSyncService enqueueSyncAll targets active configured stores and skips missing credentials", async () => {
-  const { orderSyncService, enqueueCalls } = createOrderSyncServiceHarness();
+runAsync("OrderSyncService batch includes unconfigured active stores and inactive result rows", async () => {
+  const { orderSyncService, databaseService } = createOrderSyncServiceHarness();
   const result = await orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
-
-  assert.equal(result.data.dateFrom, "2026-05-10");
-  assert.equal(result.data.dateTo, "2026-05-10");
-  assert.equal(result.data.rangeMode, "MANUAL");
-  assert.equal(result.data.targetStoreCount, 1);
-  assert.equal(result.data.skippedStoreCount, 1);
-  assert.equal(result.data.operations[0].storeId, "store-live");
-  assert.equal(result.data.operations.some((item) => item.storeId === "store-inactive"), false);
-  assert.equal(result.data.skippedStores[0].storeId, "store-missing");
-  assert.equal(result.data.skippedStores[0].reason, "NAVER_CREDENTIALS_NOT_CONFIGURED");
-  assert.equal(enqueueCalls.length, 1);
-  assert.equal(enqueueCalls[0].requestJson.requireLiveCredential, true);
-  assert.equal(enqueueCalls[0].requestJson.requestedByBatch, true);
+  assert.deepEqual(result.data.requestedRange, { dateFrom: "2026-05-10", dateTo: "2026-05-10" });
+  assert.equal(result.data.mode, "MANUAL");
+  assert.equal(result.data.counts.target, 2);
+  assert.equal(result.data.counts.skipped, 1);
+  assert.equal(result.data.items.find(item => item.storeId === "store-inactive")?.skipReason, "STORE_INACTIVE");
+  const operations = databaseService.getSnapshot().operations;
+  assert.equal(operations.length, 2);
+  assert.ok(operations.every((item: OperationRecord) => item.requestJson?.requireLiveCredential === true));
+  assert.ok(operations.every((item: OperationRecord) => item.cutoffAt === result.data.requestedCutoffAt));
 });
 
-runAsync("OrderSyncService enqueueSyncAll skips stores with in-flight ORDER_SYNC", async () => {
-  const { orderSyncService, enqueueCalls } = createOrderSyncServiceHarness({
-    stores: [
-      createStoreRecord("store-live", "Live Store"),
-      createStoreRecord("store-live-2", "Live Store 2"),
-    ],
-    configuredStoreIds: ["store-live", "store-live-2"],
-    inFlightStoreIds: ["store-live"],
-  });
-  const result = await orderSyncService.enqueueSyncAll("2026-05-10", "2026-05-10");
-
-  assert.equal(result.data.targetStoreCount, 1);
-  assert.equal(result.data.skippedStoreCount, 1);
-  assert.equal(result.data.operations[0].storeId, "store-live-2");
-  assert.equal(result.data.skippedStores[0].storeId, "store-live");
-  assert.equal(result.data.skippedStores[0].reason, "ORDER_SYNC_ALREADY_IN_FLIGHT");
-  assert.equal(enqueueCalls.length, 1);
+runAsync("OrderSyncService different requests queue independently of in-flight store work", async () => {
+  const { orderSyncService, databaseService } = createOrderSyncServiceHarness({ inFlightStoreIds: ["store-live"] });
+  const first = await orderSyncService.enqueueSyncAll(undefined, undefined, { mode: "CURRENT", idempotencyKey: "request-key-1" });
+  const second = await orderSyncService.enqueueSyncAll(undefined, undefined, { mode: "CURRENT", idempotencyKey: "request-key-2" });
+  assert.notEqual(first.data.batchId, second.data.batchId);
+  assert.equal(databaseService.getSnapshot().operations.length, 4);
 });
 
-runAsync("OrderSyncService retry executor preserves requireLiveCredential", async () => {
+runAsync("Default order sync uses the previous KST calendar day at admission", async () => {
+  for (const [now, expected] of [
+    ["2026-09-17T14:59:59.999Z", "2026-09-16"],
+    ["2026-09-17T15:00:00.000Z", "2026-09-17"],
+    ["2025-12-31T15:00:00.000Z", "2025-12-31"],
+  ]) {
+    mock.timers.enable({ apis: ["Date"], now: Date.parse(now) });
+    try {
+      const { orderSyncService, databaseService } = createOrderSyncServiceHarness();
+      const result = await orderSyncService.enqueueSyncAll();
+      assert.equal(result.data.mode, "YESTERDAY");
+      assert.equal(result.data.requestedCutoffAt, now);
+      assert.deepEqual(result.data.requestedRange, { dateFrom: expected, dateTo: expected });
+      assert.ok(databaseService.getSnapshot().operations.every((operation: OperationRecord) =>
+        operation.requestJson?.rangeMode === "AUTO_YESTERDAY" &&
+        operation.requestJson.dateFrom === expected && operation.requestJson.dateTo === expected));
+    } finally {
+      mock.timers.reset();
+    }
+  }
+});
+
+runAsync("Yesterday sync retries retain the admitted day across KST midnight", async () => {
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-17T14:59:59.999Z") });
+  try {
+    const { databaseService } = createOrderSyncServiceHarness({ stores: [createStoreRecord("store-live", "Live")] });
+    const batches = new OrderSyncBatchService(databaseService as never);
+    const original = await batches.enqueue({});
+    databaseService.write(draft => { draft.operations[0].status = "FAILED"; });
+    mock.timers.setTime(Date.parse("2026-09-17T15:00:00.000Z"));
+    const retry = await batches.enqueue({}, undefined, original.batchId);
+    assert.equal(retry.mode, "YESTERDAY");
+    assert.deepEqual(retry.requestedRange, { dateFrom: "2026-09-16", dateTo: "2026-09-16" });
+    assert.equal(retry.requestedCutoffAt, original.requestedCutoffAt);
+    assert.equal(databaseService.getSnapshot().operations[1].requestJson.rangeMode, "AUTO_YESTERDAY");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+runAsync("Yesterday sync reads only its payment day without changed-history or known-ID recovery", async () => {
+  for (const existingState of [false, true]) {
+    const { orderSyncService, databaseService, fetchOrderItemsCalls } = createOrderSyncServiceHarness({
+      stores: [createStoreRecord("store-live", "Live")], liveOrderItems: [],
+    });
+    if (existingState) databaseService.write(draft => {
+      draft.orderSyncStates.push({ id: "store-live", storeId: "store-live", initialCoverageFrom: "2026-01-01", lastSuccessfulChangedTo: "2026-01-01T00:00:00.000Z", lastSuccessfulSyncAt: null, updatedAt: "2026-01-01T00:00:00.000Z" });
+    });
+    const result = await orderSyncService.performSync("store-live", "2026-09-17", "2026-09-17", "AUTO_YESTERDAY", {
+      mode: "YESTERDAY", requestedCutoffAt: "2026-09-18T02:00:00.000Z",
+    });
+    assert.equal(result.coverageGap, null);
+    assert.equal(fetchOrderItemsCalls.length, 1);
+    const call = fetchOrderItemsCalls[0];
+    assert.equal(call.dateFrom, "2026-09-17");
+    assert.equal(call.dateTo, "2026-09-17");
+    const options = call.options as { changedFrom?: string; existingProductOrderIds?: string[] };
+    assert.equal(options.changedFrom, undefined);
+    assert.equal(options.existingProductOrderIds, undefined);
+  }
+});
+
+runAsync("Successful yesterday jobs preserve changed-history coverage watermarks", async () => {
+  for (const existingState of [false, true]) {
+    const { databaseService } = createOrderSyncServiceHarness({ stores: [createStoreRecord("store-live", "Live")] });
+    if (existingState) databaseService.write(draft => {
+      draft.orderSyncStates.push({ id: "store-live", storeId: "store-live", initialCoverageFrom: "2026-01-01", lastSuccessfulChangedTo: "2026-01-01T00:00:00.000Z", lastSuccessfulSyncAt: null, updatedAt: "2026-01-01T00:00:00.000Z" });
+    });
+    const before = databaseService.getSnapshot().orderSyncStates;
+    const batch = await new OrderSyncBatchService(databaseService as never).enqueue({});
+    const operations = new OperationService(databaseService as never, createAuditLogServiceDouble() as never);
+    operations.registerRetryExecutor("ORDER_SYNC", async () => ({ coverageGap: null }));
+    await operations.pollOnce();
+    assert.equal(new OrderSyncBatchService(databaseService as never).get(batch.batchId).status, "SUCCEEDED");
+    assert.deepEqual(databaseService.getSnapshot().orderSyncStates, before);
+  }
+});
+
+runAsync("OrderSyncService retry executor preserves original mode and cutoff", async () => {
   const { orderSyncService, retryExecutors } = createOrderSyncServiceHarness();
-  let capturedOptions: { requireLiveCredential?: boolean } | undefined;
-  orderSyncService.performSync = ((
-    _storeId: string,
-    _dateFrom: string,
-    _dateTo: string,
-    _rangeMode: "MANUAL" | "AUTO_LAST_30_DAYS",
-    options?: { requireLiveCredential?: boolean },
-  ) => {
-    capturedOptions = options;
-    return Promise.resolve({});
-  }) as never;
-
+  let captured: { mode?: string; requestedCutoffAt?: string } | undefined;
+  orderSyncService.performSync = (async (_store, _from, _to, _range, options) => { captured = options; return {}; }) as typeof orderSyncService.performSync;
   orderSyncService.onModuleInit();
-  const retryExecutor = retryExecutors.get("ORDER_SYNC");
-  assert.ok(retryExecutor);
-  await retryExecutor({
-    storeId: "store-live",
-    requestJson: {
-      dateFrom: "2026-05-10",
-      dateTo: "2026-05-10",
-      rangeMode: "MANUAL",
-      requireLiveCredential: true,
-    },
-  });
+  await retryExecutors.get("ORDER_SYNC")!({ storeId: "store-live", requestJson: { dateFrom: "2026-05-10", dateTo: "2026-05-10", rangeMode: "MANUAL", mode: "CURRENT", requestedCutoffAt: "2026-05-10T12:00:00.000Z" } });
+  assert.equal(captured?.mode, "CURRENT");
+  assert.equal(captured?.requestedCutoffAt, "2026-05-10T12:00:00.000Z");
+});
 
-  assert.equal(capturedOptions?.requireLiveCredential, true);
+runAsync("OrderSyncBatchService replays identical keys and rejects conflicting requests", async () => {
+  const { databaseService } = createOrderSyncServiceHarness();
+  const batches = new OrderSyncBatchService(databaseService as never);
+  const request = { mode: "CURRENT" as const, idempotencyKey: "shared-request-key" };
+  const first = await batches.enqueue(request);
+  const repeated = await batches.enqueue(request);
+  assert.equal(repeated.batchId, first.batchId);
+  assert.equal(databaseService.getSnapshot().operations.length, 2);
+  await assert.rejects(() => batches.enqueue({ ...request, mode: "RECENT_30_DAYS" }), /IDEMPOTENCY_KEY_CONFLICT/);
+  assert.equal(databaseService.getSnapshot().orderSyncBatches.length, 1);
+});
+
+runAsync("Default-mode idempotency replays batches admitted before the default changed", async () => {
+  const { databaseService } = createOrderSyncServiceHarness({ stores: [createStoreRecord("store-live", "Live")] });
+  const batches = new OrderSyncBatchService(databaseService as never);
+  const original = await batches.enqueue({ mode: "CURRENT", idempotencyKey: "previous-default-key" });
+  const replayed = await batches.enqueue({ idempotencyKey: "previous-default-key" });
+  assert.equal(replayed.batchId, original.batchId);
+  assert.equal(replayed.mode, "CURRENT");
+  await assert.rejects(() => batches.enqueue({ mode: "YESTERDAY", idempotencyKey: "previous-default-key" }), /IDEMPOTENCY_KEY_CONFLICT/);
+  databaseService.write(draft => { draft.operations[0].status = "FAILED"; });
+  const retry = await batches.enqueue({ mode: "CURRENT", idempotencyKey: "previous-retry-key" }, undefined, original.batchId);
+  const replayedRetry = await batches.enqueue({ idempotencyKey: "previous-retry-key" }, undefined, original.batchId);
+  assert.equal(replayedRetry.batchId, retry.batchId);
+  assert.equal(databaseService.getSnapshot().operations.length, 2);
+});
+
+runAsync("OrderSyncBatchService inactive-only registration is NO_TARGETS", async () => {
+  const { databaseService } = createOrderSyncServiceHarness({ stores: [createStoreRecord("inactive", "Inactive", false)] });
+  const batch = await new OrderSyncBatchService(databaseService as never).enqueue({mode: "CURRENT"});
+  assert.equal(batch.status, "NO_TARGETS");
+  assert.equal(batch.counts.skipped, 1);
+  assert.equal(databaseService.getSnapshot().operations.length, 0);
+});
+
+runAsync("OrderSyncBatchService retries failed stores with original cutoff and range", async () => {
+  const { databaseService } = createOrderSyncServiceHarness();
+  const service = new OrderSyncBatchService(databaseService as never);
+  const original = await service.enqueue({mode: "MANUAL", dateFrom: "2026-05-10", dateTo: "2026-05-10"});
+  databaseService.write(draft => { draft.operations[0].status = "SUCCEEDED"; draft.operations[1].status = "FAILED"; });
+  assert.equal(service.get(original.batchId).status, "PARTIAL_FAILED");
+  const retry = await service.enqueue({ idempotencyKey: "retry-request-key" }, undefined, original.batchId);
+  assert.equal(retry.retryOfBatchId, original.batchId);
+  assert.equal(retry.requestedCutoffAt, original.requestedCutoffAt);
+  assert.deepEqual(retry.requestedRange, original.requestedRange);
+  assert.equal(retry.items.length, 1);
+  assert.equal(retry.items[0].storeId, "store-missing");
+  assert.equal(retry.mode, "MANUAL");
+});
+
+runAsync("OrderSyncBatchService failed admission does not expose partial batch or operations", async () => {
+  const { databaseService } = createOrderSyncServiceHarness();
+  databaseService.commitOrderSync = async mutator => {
+    const draft = databaseService.getSnapshot();
+    mutator(draft);
+    throw new Error("SIMULATED_PERSISTENCE_FAILURE");
+  };
+  await assert.rejects(() => new OrderSyncBatchService(databaseService as never).enqueue({mode: "CURRENT"}), /SIMULATED_PERSISTENCE_FAILURE/);
+  assert.equal(databaseService.getSnapshot().operations.length, 0);
+  assert.equal(databaseService.getSnapshot().orderSyncBatches.length, 0);
+  assert.equal(databaseService.getSnapshot().orderSyncBatchItems.length, 0);
+});
+
+runAsync("OrderSync final failure updates store status and preserves last successful time", async () => {
+  const database = createMemoryDatabaseService();
+  database.write(draft => {
+    draft.stores.push({...(createStoreRecord("store-1", "Main") as unknown as Record<string, unknown>), lastOrderSyncStatus: "SUCCEEDED", lastOrderSyncAt: "2026-05-01T00:00:00.000Z"} as never);
+    draft.operations.push(createOperationRecord({id: "permanent-failure", storeId: "store-1", operationType: "ORDER_SYNC", status: "QUEUED"}));
+  });
+  const operations = new OperationService(database as never, createAuditLogServiceDouble() as never);
+  operations.registerRetryExecutor("ORDER_SYNC", async () => { throw Object.assign(new Error("NAVER_CREDENTIALS_NOT_CONFIGURED"), {code: "NAVER_CREDENTIALS_NOT_CONFIGURED", retryable: false}); });
+  await operations.pollOnce();
+  const result = database.getSnapshot();
+  assert.equal(result.operations[0].status, "FAILED");
+  assert.equal(result.stores[0].lastOrderSyncStatus, "FAILED");
+  assert.equal(result.stores[0].lastOrderSyncAt, "2026-05-01T00:00:00.000Z");
+});
+
+runAsync("CURRENT long gaps recover known IDs without advancing success watermark", async () => {
+  const { orderSyncService, databaseService, fetchOrderItemsCalls } = createOrderSyncServiceHarness({stores: [createStoreRecord("store-live", "Live")], liveOrderItems: []});
+  databaseService.write(draft => {
+    draft.orderSyncStates.push({id: "store-live", storeId: "store-live", initialCoverageFrom: "2026-01-01", lastSuccessfulChangedTo: "2026-01-01T00:00:00.000Z", lastSuccessfulSyncAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z"});
+  });
+  const result = await orderSyncService.performSync("store-live", "2026-05-01", "2026-05-30", "AUTO_LAST_30_DAYS", {mode: "CURRENT", requestedCutoffAt: "2026-05-30T00:00:00.000Z"});
+  assert.equal(result.coverageGap?.code, "COVERAGE_GAP");
+  assert.equal(result.coverageGap?.from, "2026-01-01T00:00:00.000Z");
+  const options = fetchOrderItemsCalls[0].options as unknown as {changedFrom: string; existingProductOrderIds: string[]};
+  assert.equal(options.changedFrom, "2026-04-30T00:00:00.000Z");
+  assert.deepEqual(options.existingProductOrderIds, []);
+  assert.equal(databaseService.getSnapshot().orderSyncStates[0].lastSuccessfulChangedTo, "2026-01-01T00:00:00.000Z");
+});
+
+runAsync("Coverage acknowledgement preserves failed history and success watermark", async () => {
+  const { databaseService } = createOrderSyncServiceHarness({stores: [createStoreRecord("store-live", "Live")]});
+  const service = new OrderSyncBatchService(databaseService as never);
+  const batch = await service.enqueue({mode: "CURRENT"});
+  databaseService.write(draft => {
+    draft.operations[0].status = "FAILED";
+    draft.operations[0].resultJson = {coverageGap: {code: "COVERAGE_GAP", from: "2026-01-01T00:00:00.000Z", to: "2026-05-01T00:00:00.000Z", reason: "Fixture"}};
+    draft.operations[0].finishedAt = "2026-05-02T00:00:00.000Z";
+    draft.orderSyncBatches[0].finishedAt = "2026-05-02T00:00:00.000Z";
+    draft.orderSyncStates.push({id: "store-live", storeId: "store-live", initialCoverageFrom: "2026-01-01", lastSuccessfulChangedTo: "2026-01-01T00:00:00.000Z", lastSuccessfulSyncAt: null, updatedAt: "2026-01-01T00:00:00.000Z"});
+  });
+  await service.acknowledgeCoverageGap(batch.batchId);
+  const first = databaseService.getSnapshot();
+  assert.equal(first.operations[0].status, "FAILED");
+  assert.equal(first.orderSyncStates[0].lastSuccessfulChangedTo, "2026-01-01T00:00:00.000Z");
+  assert.equal(first.orderSyncStates[0].changedCoverageBaselineAt, batch.requestedCutoffAt);
+  assert.ok(first.orderSyncStates[0].historicalCoverageGap.acknowledgedAt);
+  await service.acknowledgeCoverageGap(batch.batchId);
+  assert.deepEqual(databaseService.getSnapshot().orderSyncStates[0].historicalCoverageGap, first.orderSyncStates[0].historicalCoverageGap);
+  assert.equal(service.get(batch.batchId).status, "FAILED");
+  assert.equal(service.get(batch.batchId).finishedAt, "2026-05-02T00:00:00.000Z");
+  const newer = await service.enqueue({mode: "CURRENT"});
+  const newerCutoff = new Date(Date.parse(batch.requestedCutoffAt) + 86400000).toISOString();
+  databaseService.write(draft => {
+    draft.orderSyncBatches.find(item => item.id === newer.batchId)!.requestedCutoffAt = newerCutoff;
+    const operation = draft.operations.find(item => item.id === newer.items[0].operationId)!;
+    operation.status = "FAILED";
+    operation.resultJson = {coverageGap: {code: "COVERAGE_GAP", from: "2026-06-01T00:00:00.000Z", to: "2026-07-01T00:00:00.000Z", reason: "Second fixture"}};
+  });
+  await service.acknowledgeCoverageGap(newer.batchId);
+  const newerState = databaseService.getSnapshot().orderSyncStates[0];
+  assert.equal(newerState.acknowledgedCoverageGaps.length, 2);
+  assert.equal(newerState.historicalCoverageGap.from, "2026-01-01T00:00:00.000Z");
+  assert.equal(newerState.historicalCoverageGap.to, "2026-07-01T00:00:00.000Z");
+  await service.acknowledgeCoverageGap(batch.batchId);
+  assert.deepEqual(databaseService.getSnapshot().orderSyncStates[0], newerState);
+  assert.equal(newerState.changedCoverageBaselineAt, newerCutoff);
+});
+
+runAsync("Operation retry replays the same key without duplicate batch children", async () => {
+  const { databaseService } = createOrderSyncServiceHarness({stores: [createStoreRecord("store-live", "Live")]});
+  const batches = new OrderSyncBatchService(databaseService as never);
+  const original = await batches.enqueue({mode: "CURRENT"});
+  databaseService.write(draft => { draft.operations[0].status = "FAILED"; });
+  const operations = new OperationService(databaseService as never, createAuditLogServiceDouble() as never);
+  operations.registerRetryExecutor("ORDER_SYNC", async () => ({}));
+  const first = await operations.retry(original.items[0].operationId!, "operation-retry-key");
+  const repeated = await operations.retry(original.items[0].operationId!, "operation-retry-key");
+  assert.equal(first.data.retryOperationId, repeated.data.retryOperationId);
+  assert.equal(databaseService.getSnapshot().operations.length, 2);
+  assert.equal(databaseService.getSnapshot().orderSyncBatches.length, 2);
+  const retry = databaseService.getSnapshot().operations[1];
+  assert.equal(retry.cutoffAt, original.requestedCutoffAt);
+  assert.equal(retry.retryOfOperationId, original.items[0].operationId);
+});
+
+runAsync("Legacy order retry preserves cutoff and dates in an idempotent tracked batch", async () => {
+  const { databaseService } = createOrderSyncServiceHarness({stores: [createStoreRecord("store-live", "Live")]});
+  databaseService.write(draft => {
+    draft.operations.push(createOperationRecord({id: "legacy-retry", storeId: "store-live", operationType: "ORDER_SYNC", status: "FAILED", cutoffAt: "2026-05-10T12:00:00.000Z", requestJson: {dateFrom: "2026-05-01", dateTo: "2026-05-10", rangeMode: "MANUAL"}}));
+  });
+  const operations = new OperationService(databaseService as never, createAuditLogServiceDouble() as never);
+  operations.registerRetryExecutor("ORDER_SYNC", async () => ({}));
+  const first = await operations.retry("legacy-retry", "legacy-replay-key");
+  const repeated = await operations.retry("legacy-retry", "legacy-replay-key");
+  assert.equal(first.data.retryOperationId, repeated.data.retryOperationId);
+  const snapshot = databaseService.getSnapshot();
+  assert.equal(snapshot.operations.length, 2);
+  const retry = snapshot.operations[1];
+  assert.equal(retry.cutoffAt, "2026-05-10T12:00:00.000Z");
+  assert.equal(retry.requestJson.requestedCutoffAt, retry.cutoffAt);
+  assert.equal(retry.requestJson.dateFrom, "2026-05-01");
+  assert.equal(retry.requestJson.dateTo, "2026-05-10");
+  assert.equal(retry.retryOfOperationId, "legacy-retry");
+  assert.ok(retry.requestJson.batchId);
+});
+
+runAsync("DatabaseService order commits reject a previous generation owned by the same worker", async () => {
+  const database = createEmptyDatabase();
+  database.operations.push(createOperationRecord({id: "fenced", storeId: "store-1", operationType: "ORDER_SYNC", status: "RUNNING", leaseOwner: "same-worker", attemptCount: 2, leaseExpiresAt: new Date(Date.now()+60000).toISOString()}));
+  const service = Object.create(DatabaseService.prototype) as any;
+  const memory = createMemoryDatabaseService(database);
+  service.storageMode = "file";
+  service.writeCommitted = memory.writeCommitted.bind(memory);
+  await assert.rejects(() => service.commitOrderSync((draft: typeof database) => { draft.stores.push(createStoreRecord("unexpected", "Unexpected")); }, {id: "fenced", owner: "same-worker", attempt: 1}), /OPERATION_LEASE_LOST/);
+  assert.equal(memory.getSnapshot().stores.length, 0);
 });
 
 runAsync("OrderSyncService enqueueSyncAll rejects manual ranges over 30 days", async () => {
@@ -2200,7 +2441,7 @@ runAsync("OrderSyncService does not save new rawPayloads when retention days def
   }
 });
 
-runAsync("OrderSyncService mock fallback omits rawPayloads when retention days is zero", async () => {
+runAsync("OrderSyncService missing credentials fail without creating mock orders", async () => {
   const original = process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
   process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS = "0";
   const today = getKstRetentionCutoffDate(0);
@@ -2210,15 +2451,10 @@ runAsync("OrderSyncService mock fallback omits rawPayloads when retention days i
   });
 
   try {
-    const result = await orderSyncService.performSync("store-1", today, today, "MANUAL");
+    await assert.rejects(() => orderSyncService.performSync("store-1", today, today, "MANUAL"), /NAVER_CREDENTIALS_NOT_CONFIGURED/);
     const snapshot = databaseService.getSnapshot();
-
-    assert.equal(result.syncSource, "MOCK_FALLBACK");
-    assert.equal(result.rawPayloadRetentionDays, 0);
-    assert.equal(snapshot.orders.length > 0, true);
-    assert.equal(snapshot.orderItems.length > 0, true);
-    assert.equal(snapshot.orders.every((item: { rawPayload: unknown }) => item.rawPayload === null), true);
-    assert.equal(snapshot.orderItems.every((item: { rawPayload: unknown }) => item.rawPayload === null), true);
+    assert.equal(snapshot.orders.length, 0);
+    assert.equal(snapshot.orderItems.length, 0);
   } finally {
     if (original === undefined) {
       delete process.env.ORDER_RAW_PAYLOAD_RETENTION_DAYS;
@@ -2328,7 +2564,8 @@ runAsync("OperationWorkerService retries failed operations with backoff before m
   const stored = databaseService.getSnapshot().operations.find((item: OperationRecord) => item.id === operation.id)!;
   assert.equal(stored.status, "QUEUED");
   assert.equal(stored.attemptCount, 1);
-  assert.equal(stored.errorMessage, "SYNC_FAILED");
+  assert.equal(stored.progressJson?.error?.code, "SYNC_FAILED");
+  assert.equal(stored.errorMessage, "주문 동기화에 실패했습니다. 스토어 설정과 작업 이력을 확인하세요.");
   assert.ok(stored.runAfter && stored.runAfter > stored.createdAt);
   assert.equal(stored.finishedAt, null);
 });
@@ -2354,7 +2591,8 @@ runAsync("OperationWorkerService marks operation failed at max attempts", async 
   const stored = databaseService.getSnapshot().operations.find((item: OperationRecord) => item.id === operation.id)!;
   assert.equal(stored.status, "FAILED");
   assert.equal(stored.attemptCount, 1);
-  assert.equal(stored.errorMessage, "FINAL_FAILURE");
+  assert.equal(stored.progressJson?.error?.code, "FINAL_FAILURE");
+  assert.equal(stored.errorMessage, "주문 동기화에 실패했습니다. 스토어 설정과 작업 이력을 확인하세요.");
   assert.equal(stored.runAfter, null);
   assert.ok(stored.finishedAt);
 });
@@ -2671,6 +2909,65 @@ runAsync("FakePurchaseService stores daily amounts by store and date with audit 
     afterJson: 0,
   });
 });
+
+for (const failCommit of [false, true]) {
+  runAsync(`DatabaseService fake purchase targeted transaction ${failCommit ? "rolls back without publishing memory" : "serializes writes and uses committed rows"}`, async () => {
+    const service = Object.create(DatabaseService.prototype) as any;
+    service.storageMode = "postgres";
+    service.database = createEmptyDatabase();
+    service.persistenceQueue = Promise.resolve();
+    service.pendingWriteCount = 0;
+    service.lastPersistenceError = null;
+    const initial = {id: "cached-id", storeId: "store-1", date: "2026-04-02", amount: 1, createdAt: "original", updatedAt: "before"};
+    service.database.dailyFakePurchases.push(initial);
+    const authoritative = {...initial, id: "database-id", amount: 200};
+    let committed = authoritative;
+    let staged = authoritative;
+    const queries: string[] = [];
+    service.writeCommitted = () => { throw new Error("Full snapshot path must not be called"); };
+    service.acquirePostgresClient = async () => ({
+      query: async (sql: string, values?: unknown[]) => {
+        queries.push(sql);
+        if (sql.includes("FROM stores")) return {rows: [{id: "store-1"}]};
+        if (sql.includes("FROM daily_fake_purchases")) return {rows: [{payload: {...committed}}]};
+        if (sql.startsWith("INSERT INTO daily_fake_purchases")) staged = JSON.parse(String(values?.[1]));
+        if (sql === "COMMIT") {
+          if (failCommit) throw new Error("INJECTED_COMMIT_FAILURE");
+          committed = staged;
+        }
+        return {rows: []};
+      },
+      release: () => undefined,
+    });
+    const beforeAmounts: number[] = [];
+    const save = (amount: number) => service.saveDailyFakePurchaseCommitted({
+      storeId: "store-1", date: "2026-04-02",
+      buildReplacement: (existing: typeof initial) => {
+        beforeAmounts.push(existing.amount);
+        return {
+          purchase: {...existing, amount, updatedAt: "after"},
+          auditLog: {id: `audit-${amount}`, storeId: "store-1", domain: "FAKE_PURCHASE", action: "UPSERT", targetId: "store-1-2026-04-02", actorType: "LOCALHOST_ADMIN", actorIdentifier: "LOCALHOST_ADMIN", beforeJson: existing.amount, afterJson: amount, createdAt: "after"},
+        };
+      },
+    });
+    if (failCommit) {
+      await assert.rejects(save(500), /INJECTED_COMMIT_FAILURE/);
+      assert.deepEqual(service.database.dailyFakePurchases, [initial]);
+      assert.equal(service.database.auditLogs.length, 0);
+      assert.ok(queries.includes("ROLLBACK"));
+    } else {
+      await Promise.all([save(500), save(0)]);
+      assert.deepEqual(beforeAmounts, [200, 500]);
+      assert.equal(service.database.dailyFakePurchases.length, 1);
+      assert.equal(service.database.dailyFakePurchases[0].id, "database-id");
+      assert.equal(service.database.dailyFakePurchases[0].amount, 0);
+      assert.equal(service.database.dailyFakePurchases[0].createdAt, "original");
+      assert.equal(service.database.auditLogs.length, 2);
+      assert.equal(queries.filter((sql) => sql === "COMMIT").length, 2);
+    }
+    assert.ok(queries.filter((sql) => sql.startsWith("INSERT INTO")).every((sql) => /INSERT INTO (daily_fake_purchases|audit_logs) /.test(sql)));
+  });
+}
 
 run("getAdMappingOverride returns manual mapped rows as overrides", () => {
   assert.deepEqual(
@@ -3683,6 +3980,26 @@ runAsync("DatabaseService file mode writes committed snapshots atomically under 
     assert.equal(readdirSync(tempDir).some((fileName) => fileName.includes(".tmp-")), false);
     assert.equal(saved.stores[0].id, "store-atomic");
     assert.equal(saved.orderItems[0].id, "item-atomic");
+    await service.writeCommitted((draft) => { draft.stores[0] = createStoreRecord("store-atomic", "Atomic Store"); });
+    const batchService = new OrderSyncBatchService(service);
+    const [firstBatch, duplicateBatch] = await Promise.all([
+      batchService.enqueue({mode: "CURRENT", idempotencyKey: "file-concurrent-key"}),
+      batchService.enqueue({mode: "CURRENT", idempotencyKey: "file-concurrent-key"}),
+    ]);
+    assert.equal(firstBatch.batchId, duplicateBatch.batchId);
+    assert.equal(service.getSnapshot().operations.length, 1);
+    const reopened = new DatabaseService();
+    await reopened.onModuleInit();
+    assert.equal(new OrderSyncBatchService(reopened).get(firstBatch.batchId).status, "QUEUED");
+    assert.equal(reopened.getSnapshot().orderSyncBatchItems.length, 1);
+    const beforeFailure = readFileSync(filePath, "utf-8");
+    await assert.rejects(() => reopened.commitOrderSync((draft) => {
+      draft.orderSyncBatches.length = 0;
+      draft.operations.length = 0;
+      throw new Error("INJECTED_ADMISSION_FAILURE");
+    }), /INJECTED_ADMISSION_FAILURE/);
+    assert.equal(readFileSync(filePath, "utf-8"), beforeFailure);
+    assert.equal(reopened.getSnapshot().operations.length, 1);
   } finally {
     if (originalDatabaseUrl === undefined) {
       delete process.env.DATABASE_URL;
@@ -6620,6 +6937,8 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
   assert.strictEqual(index1, index1Again);
   assert.equal(index1Again.size, 1);
 });
+
+runAsync("Naver API schema, pagination, timeout and retry reliability", runNaverReliabilityTests);
 
 void Promise.all(pendingAsyncTests).then(() => {
   console.log("All backend checks passed.");
