@@ -16,6 +16,10 @@ npm run dev:backend
 npm run dev:frontend
 ```
 
+`npm run dev` starts both servers together. Wait for the backend's `[Startup] Ready` message before using the app; loading a large PostgreSQL dataset can take time. The page shows a loading indicator and a retry button if the backend is not ready yet. Unchanged environment credentials are not saved again during startup.
+
+Development output is stored in `apps/frontend/.next-dev`, separately from the production build in `.next`, so running `npm run build` does not overwrite the running development server. `NEXT_DIST_DIR` overrides this default when needed.
+
 ## Environment
 
 The backend now supports three layers for Naver Commerce integration:
@@ -95,6 +99,16 @@ npm run lint
 npm run test
 npm run build
 ```
+
+## 손익 계산 기준
+
+- 상품 순이익은 상품 매출에서 VAT, 광고비, 수량별 원가·기타비용, 수수료를 차감합니다. VAT는 기존 정책대로 상품 매출의 10%를 원 단위 반올림합니다.
+- API의 스토어 `estimatedNetProfit`은 상품 순이익 합계에 배송 마진을 더한 값입니다. 별도로 저장하는 가구매액은 대시보드·손익분석·엑셀에서 공통 함수로 한 번만 차감합니다.
+- 수수료는 결제·쇼핑 연동·판매·채널 수수료의 합입니다. 네 항목이 모두 없을 때만 설정된 수수료율로 계산합니다.
+- 원가 스냅샷과 개별 원가 API는 적용일이 더 최근인 설정을 사용합니다. 적용일이 같으면 비용을 나중에 저장한 설정을 사용하며, 종료일 변경은 이 우선순위를 바꾸지 않습니다. 전체 스냅샷에 누락된 상품이나 종료된 개별 설정은 새 비용 설정이 적용될 때까지 원가 미완료로 처리합니다.
+- 원가 엑셀의 빈 원가는 0원이 아닙니다. 원가가 없는 상품은 순이익을 확정하지 않으며, 명시적으로 입력한 0원만 유효합니다. 음수·잘못된 숫자·0~1 범위를 벗어난 수수료율은 업로드를 거부합니다.
+- 배송 단가를 바꾸면 저장된 손익을 갱신합니다. 이전 계산 버전의 집계는 조회에서 사용하지 않고 현재 로직으로 계산합니다. 과거에 잘못 파싱되어 저장된 원가는 원본 파일로 다시 입력해야 합니다.
+- `npm test`는 백엔드 계산·엑셀·집계 회귀 테스트와 프런트엔드 날짜·스토어·가구매 연동 테스트를 함께 실행합니다.
 
 ## Docker
 

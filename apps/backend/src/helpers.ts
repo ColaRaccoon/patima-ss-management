@@ -569,39 +569,52 @@ export const getAdMappingStatus = (
   return item.canonicalSalesUnitId ? "MAPPED" : "UNMAPPED";
 };
 
-/**
- * paymentDate 기준으로 적용할 비용 entry 를 찾는다.
- * 알고리즘: paymentDate ≤ effectiveFrom 인 가장 최근 스냅샷을 고른 뒤,
- *           그 스냅샷에서 canonicalSalesUnitId 매칭 entry 반환.
- * 매칭 entry 없으면 null → 손익에서 INCOMPLETE_COST 처리.
+type CostValues = Pick<SalesUnitCostSnapshotEntry, "unitCost" | "feeRate" | "otherCost">;
+const validCostValues = (cost: CostValues | null): CostValues | null =>
+  cost && Number.isFinite(cost.unitCost) && cost.unitCost >= 0 &&
+  Number.isFinite(cost.otherCost) && cost.otherCost >= 0 &&
+  (cost.feeRate == null || (Number.isFinite(cost.feeRate) && cost.feeRate >= 0 && cost.feeRate <= 1)) ? cost : null;
+const costValuesUpdatedAt = (setting: SalesUnitCostSetting) => setting.costValuesUpdatedAt ?? setting.updatedAt;
+
+/** Latest effective cost source wins. A full snapshot also supersedes omitted units.
+ * On the same effective date, the most recently saved source wins.
+ * An expired manual setting stays incomplete until a newer cost source takes effect.
  */
 export const getCostSettingForDate = (
   snapshotsForUnit: Array<{ snapshot: SalesUnitCostSnapshot; entry: SalesUnitCostSnapshotEntry | null }>,
   targetDate: string | null,
-): SalesUnitCostSnapshotEntry | null => {
+  manualSettings: SalesUnitCostSetting[] = [],
+): CostValues | null => {
   if (!targetDate) {
     return null;
   }
 
-  // snapshotsForUnit 은 calculateDailyProfitRows 가 미리 효과 시작일 오름차순으로 빌드해서 넘김.
-  // 가장 최근부터 역방향으로 첫 매칭을 찾음.
+  let selected: (typeof snapshotsForUnit)[number] | undefined;
   for (let i = snapshotsForUnit.length - 1; i >= 0; i -= 1) {
-    const { snapshot, entry } = snapshotsForUnit[i];
-    if (snapshot.effectiveFrom <= targetDate) {
-      return entry; // entry 가 null 이면 그 스냅샷에 해당 판매단위가 없음 → INCOMPLETE_COST
+    if (snapshotsForUnit[i].snapshot.effectiveFrom <= targetDate) {
+      selected = snapshotsForUnit[i];
+      break;
     }
   }
-
-  return null;
+  const manual = manualSettings
+    .filter((item) => item.isActive && item.effectiveFrom <= targetDate)
+    .sort((left, right) => right.effectiveFrom.localeCompare(left.effectiveFrom) || right.updatedAt.localeCompare(left.updatedAt))[0];
+  if (manual && (!selected || manual.effectiveFrom > selected.snapshot.effectiveFrom ||
+    (manual.effectiveFrom === selected.snapshot.effectiveFrom && costValuesUpdatedAt(manual) >= selected.snapshot.updatedAt))) {
+    return manual.effectiveTo && targetDate > manual.effectiveTo ? null : validCostValues(manual);
+  }
+  return validCostValues(selected?.entry ?? null);
 };
 
 export const calculateFee = (
   orderItem: OrderItem,
-  costSetting: SalesUnitCostSnapshotEntry | null,
+  costSetting: CostValues | null,
 ): { totalFeeCost: number; usedFallback: boolean; incomplete: boolean } => {
   const apiFee = sumNullable(
     orderItem.paymentCommission,
     orderItem.knowledgeShoppingSellingInterlockCommission,
+    orderItem.saleCommission,
+    orderItem.channelCommission,
   );
 
   if (apiFee != null) {
@@ -737,6 +750,12 @@ export const calculateDailyProfitRows = (
 
   // Step 1: 자식 + 단독 판매단위의 주문 집계
   const childRowMap = new Map<string, DailySalesUnitProfit & { fallbackIncomplete: boolean }>();
+  const manualSettingsByUnit = new Map<string, SalesUnitCostSetting[]>();
+  database.salesUnitCostSettings.filter((item) => item.storeId === storeId).forEach((item) => {
+    const settings = manualSettingsByUnit.get(item.canonicalSalesUnitId) ?? [];
+    settings.push(item);
+    manualSettingsByUnit.set(item.canonicalSalesUnitId, settings);
+  });
 
   const activeUploadIds = getActiveConfirmedUploadIds(database, storeId);
 
@@ -785,7 +804,10 @@ export const calculateDailyProfitRows = (
         return;
       }
       const key = `${item.paymentDate}:${item.canonicalSalesUnitId}`;
-      const costSetting = getCostSettingForDate(costSettingsByUnit.get(item.canonicalSalesUnitId!) ?? [], item.paymentDate);
+      const costSetting = getCostSettingForDate(
+        costSettingsByUnit.get(item.canonicalSalesUnitId!) ?? [], item.paymentDate,
+        manualSettingsByUnit.get(item.canonicalSalesUnitId!),
+      );
       const fee = calculateFee(item, costSetting);
       const row =
         childRowMap.get(key) ??
@@ -1080,17 +1102,15 @@ export const calculateDashboardSummary = (
       continue;
 
     const status = getAdMappingStatus(item);
-    if (status === "UNMAPPED") {
+    if (item.mappingReason === "INTENTIONALLY_UNMAPPED") {
+      intentionalUnmappedCampaignCount++;
+      excludedIntentionalUnmappedAdCost += item.totalCost;
+    } else if (status === "UNMAPPED") {
       unmappedCampaignCount++;
       excludedUnmappedAdCost += item.totalCost;
     } else if (status === "CONFLICT") {
       conflictCampaignCount++;
       excludedConflictAdCost += item.totalCost;
-    }
-
-    if (item.mappingReason === "INTENTIONALLY_UNMAPPED") {
-      intentionalUnmappedCampaignCount++;
-      excludedIntentionalUnmappedAdCost += item.totalCost;
     }
   }
 

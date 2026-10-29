@@ -268,6 +268,8 @@ export interface SalesUnitCostSetting {
   deactivatedAt: string | null;
   effectiveFrom: string;
   effectiveTo: string | null;
+  // Cost precedence must not change merely because the period was closed.
+  costValuesUpdatedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

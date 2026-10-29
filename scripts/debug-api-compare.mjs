@@ -1,3 +1,5 @@
+import "dotenv/config";
+
 // 네이버 API 반환 건수 vs DB 건수 비교 진단
 // 실행: node scripts/debug-api-compare.mjs
 
@@ -6,10 +8,14 @@ import bcrypt from "bcryptjs";
 
 const { Client } = pg;
 
+for (const key of ["DATABASE_URL","NAVER_CLIENT_ID","NAVER_CLIENT_SECRET","NAVER_ACCOUNT_UID"]) {
+  if (!process.env[key]?.trim()) throw new Error(`Missing required environment variable: ${key}`);
+}
+
 const NAVER_API_BASE_URL = "https://api.commerce.naver.com/external";
-const CLIENT_ID = process.env.NAVER_CLIENT_ID ?? "79637ozpsgViSKrcRsy9L7";
-const CLIENT_SECRET = process.env.NAVER_CLIENT_SECRET ?? "$2a$04$R6b3ZZXRBxAfw/gHRdnXxu";
-const ACCOUNT_UID = process.env.NAVER_ACCOUNT_UID ?? "ncp_2vBqbbyI2AVn4hCZdi1cN";
+const CLIENT_ID = process.env.NAVER_CLIENT_ID;
+const CLIENT_SECRET = process.env.NAVER_CLIENT_SECRET;
+const ACCOUNT_UID = process.env.NAVER_ACCOUNT_UID;
 const TARGET_DATE = "2026-04-16";
 
 // --- Naver Auth ---
@@ -184,7 +190,7 @@ function extractCursor(obj) {
 // --- DB 조회 ---
 async function getDbOrderIds(targetDate) {
   const client = new Client({
-    connectionString: "postgresql://patima_app:664066@localhost:5432/patima_naver_ss",
+    connectionString: process.env.DATABASE_URL,
   });
   await client.connect();
 

@@ -4,6 +4,7 @@ import { AuditLogService } from "./audit-log.service";
 import { DatabaseService } from "./database.service";
 import { ensureStoreExists, createId, formatApiSuccess, nowIso } from "./helpers";
 import { OperationService } from "./operation.service";
+import { ProfitSummaryService } from "./profit-summary.service";
 
 interface StorePayload {
   name: string;
@@ -20,6 +21,7 @@ export class StoreService {
     private readonly databaseService: DatabaseService,
     private readonly auditLogService: AuditLogService,
     private readonly operationService: OperationService,
+    private readonly profitSummaryService?: ProfitSummaryService,
   ) {}
 
   list() {
@@ -149,6 +151,14 @@ export class StoreService {
         afterJson: updated,
       });
     });
+
+    if (previous.deliveryUnitCost !== updated.deliveryUnitCost) {
+      await this.profitSummaryService?.refreshStoreDatesSinceBestEffort({
+        storeId,
+        dateFrom: "1970-01-01",
+        reason: "COST_CHANGE",
+      });
+    }
 
     return formatApiSuccess({
       storeId: updated.id,

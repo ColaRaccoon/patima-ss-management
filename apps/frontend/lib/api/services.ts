@@ -867,33 +867,38 @@ export async function getShellData(): Promise<ShellData> {
 export async function getDashboardPageData(params?: {
   storeId?: string;
 }): Promise<DashboardPageData> {
-  const storeResponse = await getStores();
+  const storeResponse = await getStores(USE_PROFITS_MOCK_FALLBACK);
   const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
 
   if (!primaryStore) {
     return {
       primaryStore: null,
-      selectedDate: MOCK_SELECTED_DATE,
+      selectedDate: nowInSeoul(),
       summary: mockDashboardSummary,
+      fakePurchase: null,
       profits: [],
       recentOperations: [],
       sources: collectSources(storeResponse),
     };
   }
 
-  const [summaryResponse, profitResponse, operationResponse] = await Promise.all([
-    getDashboardSummary(primaryStore.id, MOCK_SELECTED_DATE),
-    getProfitRows(primaryStore.id, MOCK_SELECTED_DATE, MOCK_SELECTED_DATE),
+  const latestDateResponse = await getLatestProfitDate(primaryStore.id, USE_PROFITS_MOCK_FALLBACK);
+  const selectedDate = latestDateResponse.data.date || nowInSeoul();
+  const [summaryResponse, profitResponse, operationResponse, fakePurchaseResponse] = await Promise.all([
+    getDashboardSummary(primaryStore.id, selectedDate, USE_PROFITS_MOCK_FALLBACK),
+    getProfitRows(primaryStore.id, selectedDate, selectedDate, USE_PROFITS_MOCK_FALLBACK),
     getOperations(primaryStore.id),
+    getDailyFakePurchase(primaryStore.id, selectedDate, USE_PROFITS_MOCK_FALLBACK),
   ]);
 
   return {
     primaryStore,
-    selectedDate: MOCK_SELECTED_DATE,
+    selectedDate,
     summary: summaryResponse.data,
+    fakePurchase: fakePurchaseResponse.data,
     profits: profitResponse.data,
     recentOperations: operationResponse.data.slice(0, 4),
-    sources: collectSources(storeResponse, summaryResponse, profitResponse, operationResponse),
+    sources: collectSources(storeResponse, latestDateResponse, summaryResponse, profitResponse, operationResponse, fakePurchaseResponse),
   };
 }
 

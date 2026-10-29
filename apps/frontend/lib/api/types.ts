@@ -399,6 +399,7 @@ export interface DashboardPageData {
   primaryStore: StoreListItem | null;
   selectedDate: string;
   summary: DashboardSummary;
+  fakePurchase: DailyFakePurchaseResponse | null;
   profits: DailySalesUnitProfit[];
   recentOperations: OperationListItem[];
   sources: SourceState[];

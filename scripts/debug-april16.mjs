@@ -1,11 +1,17 @@
+import "dotenv/config";
+
 // 4/16 주문 데이터 불일치 디버깅 스크립트
 // 실행: node scripts/debug-april16.mjs
 
 import pg from "pg";
 const { Client } = pg;
 
+for (const key of ["DATABASE_URL"]) {
+  if (!process.env[key]?.trim()) throw new Error(`Missing required environment variable: ${key}`);
+}
+
 const client = new Client({
-  connectionString: "postgresql://patima_app:664066@localhost:5432/patima_naver_ss",
+  connectionString: process.env.DATABASE_URL,
 });
 
 await client.connect();

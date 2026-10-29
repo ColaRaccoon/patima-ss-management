@@ -11,6 +11,8 @@ import { DatabaseService } from "./database.service";
 import {
   createId,
   ensureNoCrossStoreReference,
+  ensureDateString,
+  getCostSettingForDate,
   formatApiSuccess,
   nowIso,
   repairMojibakeText,
@@ -67,6 +69,7 @@ export class CostService {
     effectiveFrom: string;
   }) {
     this.storeService.ensureWritable(payload.storeId);
+    ensureDateString(payload.effectiveFrom, "effectiveFrom");
     const snapshot = this.databaseService.getSnapshot();
     const salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === payload.canonicalSalesUnitId);
     if (!salesUnit) {
@@ -130,7 +133,8 @@ export class CostService {
       isActive: true,
       deactivatedAt: null,
       effectiveFrom: payload.effectiveFrom,
-      effectiveTo: null,
+      effectiveTo: nextRow ? this.minusOneDay(nextRow.effectiveFrom) : null,
+      costValuesUpdatedAt: nowIso(),
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
@@ -138,6 +142,7 @@ export class CostService {
     await this.databaseService.writeCommitted((draft) => {
       const previous = draft.salesUnitCostSettings.find((item) => item.id === previousRow?.id);
       if (previous && !previous.effectiveTo) {
+        previous.costValuesUpdatedAt ??= previous.updatedAt;
         previous.effectiveTo = this.minusOneDay(payload.effectiveFrom);
         previous.updatedAt = nowIso();
       }
@@ -165,6 +170,7 @@ export class CostService {
       });
     }
     this.storeService.ensureWritable(existing.storeId);
+    ensureDateString(payload.effectiveFrom, "effectiveFrom");
     const appliedCount = snapshot.orderItems.filter(
       (orderItem) =>
         orderItem.storeId === existing.storeId &&
@@ -182,6 +188,14 @@ export class CostService {
     }
     this.validateValues(payload.unitCost, payload.otherCost, payload.feeRate);
 
+    if (!existing.isActive || (existing.effectiveTo && payload.effectiveFrom > existing.effectiveTo) ||
+      snapshot.salesUnitCostSettings.some((item) => item.id !== existing.id && item.isActive &&
+        item.storeId === existing.storeId && item.canonicalSalesUnitId === existing.canonicalSalesUnitId &&
+        item.effectiveFrom <= (existing.effectiveTo ?? "9999-12-31") &&
+        (item.effectiveTo ?? "9999-12-31") >= payload.effectiveFrom)) {
+      throw new BadRequestException("비용 적용 기간이 다른 설정과 겹치거나 유효하지 않습니다.");
+    }
+
     await this.databaseService.writeCommitted((draft) => {
       const target = draft.salesUnitCostSettings.find((item) => item.id === costSettingId)!;
       target.unitCost = payload.unitCost;
@@ -189,6 +203,7 @@ export class CostService {
       target.otherCost = payload.otherCost;
       target.effectiveFrom = payload.effectiveFrom;
       target.updatedAt = nowIso();
+      target.costValuesUpdatedAt = target.updatedAt;
     });
     await this.recalculateProfitSummariesSince(
       existing.storeId,
@@ -204,6 +219,7 @@ export class CostService {
   }
 
   async close(costSettingId: string, payload: { effectiveTo: string }) {
+    ensureDateString(payload.effectiveTo, "effectiveTo");
     const snapshot = this.databaseService.getSnapshot();
     const existing = snapshot.salesUnitCostSettings.find((item) => item.id === costSettingId);
     if (!existing) {
@@ -221,13 +237,21 @@ export class CostService {
         errors: [{ field: "effectiveTo", reason: "INVALID_DATE_RANGE" }],
       });
     }
+    if (!existing.isActive || snapshot.salesUnitCostSettings.some((item) =>
+      item.id !== existing.id && item.storeId === existing.storeId &&
+      item.canonicalSalesUnitId === existing.canonicalSalesUnitId && item.isActive &&
+      item.effectiveFrom > existing.effectiveFrom && item.effectiveFrom <= payload.effectiveTo)) {
+      throw new BadRequestException("종료일이 다른 비용 설정과 겹치거나 비활성 설정입니다.");
+    }
 
     await this.databaseService.writeCommitted((draft) => {
       const target = draft.salesUnitCostSettings.find((item) => item.id === costSettingId)!;
+      target.costValuesUpdatedAt ??= target.updatedAt;
       target.effectiveTo = payload.effectiveTo;
       target.updatedAt = nowIso();
     });
-    await this.recalculateProfitSummariesSince(existing.storeId, payload.effectiveTo);
+    await this.recalculateProfitSummariesSince(existing.storeId,
+      existing.effectiveTo && existing.effectiveTo < payload.effectiveTo ? existing.effectiveTo : payload.effectiveTo);
 
     return formatApiSuccess({
       costSettingId,
@@ -279,14 +303,14 @@ export class CostService {
   }
 
   private validateValues(unitCost: number, otherCost: number, feeRate: number | null) {
-    if (unitCost < 0 || otherCost < 0) {
+    if (!Number.isFinite(unitCost) || !Number.isFinite(otherCost) || unitCost < 0 || otherCost < 0) {
       throw new BadRequestException({
         success: false,
         message: "원가와 기타비용은 0 이상이어야 합니다.",
         errors: [{ field: "unitCost", reason: "INVALID_VALUE" }],
       });
     }
-    if (feeRate != null && (feeRate < 0 || feeRate > 1)) {
+    if (feeRate != null && (!Number.isFinite(feeRate) || feeRate < 0 || feeRate > 1)) {
       throw new BadRequestException({
         success: false,
         message: "feeRate는 0 이상 1 이하여야 합니다.",
@@ -296,14 +320,9 @@ export class CostService {
   }
 
   private minusOneDay(dateString: string) {
-    const date = new Date(`${dateString}T00:00:00+09:00`);
-    date.setDate(date.getDate() - 1);
-    return new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Asia/Seoul",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).format(date);
+    const date = new Date(`${dateString}T00:00:00Z`);
+    date.setUTCDate(date.getUTCDate() - 1);
+    return date.toISOString().slice(0, 10);
   }
 
   /**
@@ -323,6 +342,7 @@ export class CostService {
   }> {
     // 1. 쓰기 권한 확인
     this.storeService.ensureWritable(storeId);
+    ensureDateString(effectiveFrom, "effectiveFrom");
 
     // 2. 파일 형식 검증
     const originalFileName = file.originalname;
@@ -410,6 +430,7 @@ export class CostService {
     }
 
     const parsedRows: ParsedRow[] = [];
+    const seenSalesUnitIds = new Set<string>();
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i] as (string | number)[];
 
@@ -424,8 +445,19 @@ export class CostService {
       const getNumberValue = (header: string): number | null => {
         const val = getCellValue(header);
         if (val === null) return null;
-        const num = typeof val === "number" ? val : parseFloat(String(val));
-        return isNaN(num) ? null : num;
+        const text = String(val).trim();
+        if (!text) return null;
+        // Accept thousands separators, but never parse only the numeric prefix.
+        const valid = typeof val === "number" || /^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$/.test(text);
+        const num = Number(text.replace(/,/g, ""));
+        if (!valid || !Number.isFinite(num) || num < 0 || (header === "feeRate" && num > 1)) {
+          throw new BadRequestException({
+            success: false,
+            message: `${i + 1}행 ${header}: 유효한 ${header === "feeRate" ? "0~1 사이 비율" : "0 이상의 숫자"}을 입력하세요.`,
+            errors: [{ field: header, row: i + 1, reason: "INVALID_COST_VALUE" }],
+          });
+        }
+        return num;
       };
 
       const getStringValue = (header: string): string | null => {
@@ -436,6 +468,16 @@ export class CostService {
 
       const salesUnitId = getStringValue("salesUnitId") || "";
       const displayName = getStringValue("displayName") || "";
+      if (!salesUnitId && !displayName) {
+        if (["unitCost", "feeRate", "otherCost"].some((header) => getCellValue(header) != null)) {
+          throw new BadRequestException(`${i + 1}행: 비용을 적용할 판매단위가 없습니다.`);
+        }
+        continue;
+      }
+      if (salesUnitId && seenSalesUnitIds.has(salesUnitId)) {
+        throw new BadRequestException(`${i + 1}행: 판매단위가 중복되었습니다.`);
+      }
+      if (salesUnitId) seenSalesUnitIds.add(salesUnitId);
 
       parsedRows.push({
         salesUnitId,
@@ -469,11 +511,15 @@ export class CostService {
       for (const parsedRow of parsedRows) {
         const { salesUnitId, displayName, matchAliases, linkedProductIds, linkedOptionCodes, linkedManageCodes, memo, unitCost, feeRate, otherCost } =
           parsedRow;
+        let effectiveUnitId = salesUnitId;
 
         // 그룹/isStoreLevel 은 엑셀에서 읽기 전용 (무시)
         if (salesUnitId) {
           // 기존 판매단위 update
           const existing = draft.canonicalSalesUnits.find((u) => u.id === salesUnitId && u.storeId === storeId);
+          if (!existing) {
+            throw new BadRequestException(`판매단위 '${salesUnitId}'가 이 스토어에 없습니다.`);
+          }
           if (existing) {
             // 그룹 또는 스토어레벨 판매단위는 메타 update 및 비용 entry 생성 전부 스킵
             if (existing.isGroup || existing.isStoreLevel) {
@@ -493,6 +539,7 @@ export class CostService {
           // 신규 판매단위 생성
           if (displayName) {
             const newId = createId();
+            effectiveUnitId = newId;
             draft.canonicalSalesUnits.push({
               id: newId,
               storeId,
@@ -515,10 +562,8 @@ export class CostService {
           }
         }
 
-        // 비용 entry 생성 (unitCost 또는 otherCost 중 하나라도 있으면)
-        const hasAnyCost = unitCost !== null || otherCost !== null;
-        if (hasAnyCost) {
-          const effectiveUnitId = salesUnitId || draft.canonicalSalesUnits[draft.canonicalSalesUnits.length - 1]?.id;
+        // A blank unit cost is missing, not an explicit zero-cost product.
+        if (unitCost !== null) {
           if (effectiveUnitId) {
             // 그룹/isStoreLevel 판매단위는 비용 entry 생성 스킵
             const targetUnit = draft.canonicalSalesUnits.find((u) => u.id === effectiveUnitId);
@@ -528,7 +573,7 @@ export class CostService {
                 snapshotId: "", // 스냅샷 생성 후 업데이트
                 storeId,
                 canonicalSalesUnitId: effectiveUnitId,
-                unitCost: unitCost || 0,
+                unitCost,
                 feeRate: feeRate,
                 otherCost: otherCost || 0,
                 createdAt: nowIso(),
@@ -536,11 +581,11 @@ export class CostService {
               });
             }
           }
-        } else if (salesUnitId) {
+        } else if (effectiveUnitId) {
           // 비용 없으면 mismatch에 기록 (그룹/storeLevel은 제외)
-          const existingUnit = draft.canonicalSalesUnits.find((u) => u.id === salesUnitId && u.storeId === storeId);
+          const existingUnit = draft.canonicalSalesUnits.find((u) => u.id === effectiveUnitId && u.storeId === storeId);
           if (existingUnit && !existingUnit.isGroup && !existingUnit.isStoreLevel) {
-            missingSalesUnitIds.push(salesUnitId);
+            missingSalesUnitIds.push(effectiveUnitId);
           }
         }
       }
@@ -676,6 +721,7 @@ export class CostService {
    */
   exportExcel(storeId: string, effectiveFrom?: string): Buffer {
     const snapshot = this.databaseService.getSnapshot();
+    if (effectiveFrom) ensureDateString(effectiveFrom, "effectiveFrom");
 
     // 적용될 스냅샷 결정
     let targetSnapshot: SalesUnitCostSnapshot | undefined;
@@ -712,9 +758,17 @@ export class CostService {
     // 엑셀 행 생성
     const headers = ["salesUnitId", "displayName", "unitCost", "feeRate", "otherCost", "matchAliases", "linkedProductIds", "linkedOptionCodes", "linkedManageCodes", "memo"];
     const data: unknown[][] = [headers];
+    const manualSettings = snapshot.salesUnitCostSettings.filter((item) => item.storeId === storeId);
+    const targetDate = effectiveFrom ?? [
+      targetSnapshot?.effectiveFrom ?? "", ...manualSettings.filter((item) => item.isActive).map((item) => item.effectiveFrom),
+    ].sort().at(-1) ?? null;
 
     for (const unit of activeSalesUnits) {
-      const entry = entryIndex.get(unit.id);
+      const entry = getCostSettingForDate(
+        targetSnapshot ? [{ snapshot: targetSnapshot, entry: entryIndex.get(unit.id) ?? null }] : [],
+        targetDate,
+        manualSettings.filter((item) => item.canonicalSalesUnitId === unit.id),
+      );
       data.push([
         unit.id,
         unit.displayName,

@@ -19,6 +19,35 @@ export class EnvironmentBootstrapService implements OnApplicationBootstrap {
       return;
     }
 
+    const snapshot = this.databaseService.getSnapshot();
+    const existingStore = snapshot.stores.find(
+      (item) =>
+        item.platformType === "NAVER_SMARTSTORE" &&
+        item.sellerAccountId === bootstrapStore.sellerAccountId &&
+        item.channelNo === bootstrapStore.channelNo,
+    );
+    if (existingStore) {
+      const environmentCredential = this.naverCommerceConfigService.getEnvCredentialForStore(existingStore);
+      const credential = snapshot.commerceCredentials.find((item) => item.storeId === existingStore.id);
+      if (!environmentCredential) return;
+      if (
+        credential &&
+        credential.clientId === environmentCredential.clientId &&
+        credential.accessType === "SELLER" &&
+        credential.isEnabled
+      ) {
+        try {
+          // Encryption uses a random IV. Compare plaintext before encrypting so
+          // an unchanged startup does not rewrite the entire database snapshot.
+          if (this.cryptoService.decrypt(credential.clientSecretEncrypted) === environmentCredential.clientSecret) {
+            return;
+          }
+        } catch {
+          // A changed master key or invalid ciphertext needs to be repaired below.
+        }
+      }
+    }
+
     await this.databaseService.writeCommitted((draft) => {
       const now = nowIso();
       let store = draft.stores.find(

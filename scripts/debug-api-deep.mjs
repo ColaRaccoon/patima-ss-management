@@ -1,12 +1,18 @@
+import "dotenv/config";
+
 // PAYED_DATETIME API 세부 조사
 // 실행: node scripts/debug-api-deep.mjs
 
 import bcrypt from "bcryptjs";
 
+for (const key of ["NAVER_CLIENT_ID","NAVER_CLIENT_SECRET","NAVER_ACCOUNT_UID"]) {
+  if (!process.env[key]?.trim()) throw new Error(`Missing required environment variable: ${key}`);
+}
+
 const NAVER_API_BASE_URL = "https://api.commerce.naver.com/external";
-const CLIENT_ID = process.env.NAVER_CLIENT_ID ?? "79637ozpsgViSKrcRsy9L7";
-const CLIENT_SECRET = process.env.NAVER_CLIENT_SECRET ?? "$2a$04$R6b3ZZXRBxAfw/gHRdnXxu";
-const ACCOUNT_UID = process.env.NAVER_ACCOUNT_UID ?? "ncp_2vBqbbyI2AVn4hCZdi1cN";
+const CLIENT_ID = process.env.NAVER_CLIENT_ID;
+const CLIENT_SECRET = process.env.NAVER_CLIENT_SECRET;
+const ACCOUNT_UID = process.env.NAVER_ACCOUNT_UID;
 const TARGET_DATE = "2026-04-16";
 
 function createSign(clientId, clientSecret, timestamp) {

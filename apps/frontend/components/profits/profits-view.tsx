@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useTransition, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
+import { calculateNetProfitAfterFakePurchase } from "@patima/shared";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
@@ -321,10 +322,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
         />
         {(() => {
           const hasFakePurchase = savedAmount > 0;
-          const displayProfit =
-            data.summary.estimatedNetProfit == null
-              ? null
-              : data.summary.estimatedNetProfit - savedAmount;
+          const displayProfit = calculateNetProfitAfterFakePurchase(data.summary.estimatedNetProfit, savedAmount);
           const hintText = hasFakePurchase
             ? "가구매 데이터 제외 완료"
             : data.summary.profitStatus === "INCOMPLETE_COST"

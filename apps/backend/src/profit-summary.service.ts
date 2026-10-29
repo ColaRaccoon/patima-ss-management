@@ -6,6 +6,7 @@ import type {
   StoredDailySalesUnitProfit,
   StoredDailyStoreSummary,
 } from "@patima/shared";
+import { DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import { DatabaseService } from "./database.service";
 import {
   calculateDashboardSummary,
@@ -17,7 +18,7 @@ import {
   nowIso,
 } from "./helpers";
 
-export const PROFIT_CALCULATION_VERSION = "profit-v1";
+export const PROFIT_CALCULATION_VERSION = "profit-v2";
 
 export type ProfitSummaryRecalculateReason =
   | "ORDER_SYNC"
@@ -285,9 +286,10 @@ export class ProfitSummaryService {
   }
 
   getDashboardSummary(storeId: string, date: string): DashboardSummary | null {
-    const row = this.databaseService
-      .getSnapshot()
-      .dailyStoreSummaries.find((item) => item.storeId === storeId && item.date === date);
+    const snapshot = this.databaseService.getSnapshot();
+    const deliveryUnitCost = snapshot.stores.find((store) => store.id === storeId)?.deliveryUnitCost ?? DEFAULT_DELIVERY_UNIT_COST;
+    const row = snapshot.dailyStoreSummaries.find((item) => item.storeId === storeId && item.date === date &&
+      item.calculationVersion === PROFIT_CALCULATION_VERSION && item.deliveryUnitCost === deliveryUnitCost);
     return row ? stripStoredStoreSummaryFields(row) : null;
   }
 
@@ -300,9 +302,14 @@ export class ProfitSummaryService {
   }): DailySalesUnitProfit[] | null {
     const dates = enumerateDates(query.dateFrom, query.dateTo);
     const snapshot = this.databaseService.getSnapshot();
+    const outdatedDates = new Set(snapshot.dailySalesUnitProfits
+      .filter((row) => row.storeId === query.storeId && row.calculationVersion !== PROFIT_CALCULATION_VERSION)
+      .map((row) => row.date));
     const summaryDates = new Set(
       snapshot.dailyStoreSummaries
-        .filter((row) => row.storeId === query.storeId && row.date >= query.dateFrom && row.date <= query.dateTo)
+        .filter((row) => row.storeId === query.storeId && row.date >= query.dateFrom && row.date <= query.dateTo &&
+          row.calculationVersion === PROFIT_CALCULATION_VERSION &&
+          !outdatedDates.has(row.date))
         .map((row) => row.date),
     );
 

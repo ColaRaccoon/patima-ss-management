@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
-import { VAT_RATE, SalesUnitCostSnapshotEntry } from "@patima/shared";
+import { VAT_RATE, SalesUnitCostSnapshotEntry, calculateNetProfitAfterFakePurchase } from "@patima/shared";
 import type { DailySalesUnitProfit } from "@patima/shared";
 import * as XLSX from "xlsx";
 import { DatabaseService } from "./database.service";
@@ -141,14 +141,22 @@ export class ProfitService {
     const dailyStoreSummaries = this.buildDailyStoreProfitSummaryMap(
       snapshot,
       query.storeId,
-      rows.map((row) => row.date),
+      [...rows.map((row) => row.date), ...snapshot.dailyFakePurchases
+        .filter((row) => row.storeId === query.storeId && row.date >= query.dateFrom && row.date <= query.dateTo)
+        .map((row) => row.date)],
     );
     const flatRows = this.flattenDailyProfitRowsForExport(rows, dailyStoreSummaries);
-    const totalAdCost = rows.reduce((total, row) => total + row.totalAdCost, 0);
-    const totalSalesQuantity = rows.reduce(
+    // Child details repeat values already rolled up into their group parent.
+    const summaryRows = rows.filter((row) => !row.parentSalesUnitId);
+    const productRows = summaryRows.filter((row) => !row.isStoreLevel);
+    const totalAdCost = summaryRows.reduce((total, row) => total + row.totalAdCost, 0);
+    const totalSalesQuantity = summaryRows.reduce(
       (total, row) => total + (row.isStoreLevel ? 0 : row.totalQuantity),
       0,
     );
+    const totalFixedCost = productRows.reduce((total, row) => total +
+      row.totalFeeCost + row.vatAmount + row.totalUnitCost + row.totalOtherCost, 0);
+    const hasIncompleteCost = productRows.some((row) => row.estimatedNetProfit == null);
     const headers = [
       "일자",
       "판매단위명",
@@ -172,6 +180,22 @@ export class ProfitService {
       [],
       headers,
       ...flatRows,
+      [
+        "합계",
+        "단가: 수량 가중평균",
+        totalSalesQuantity,
+        "",
+        productRows.reduce((total, row) => total + row.totalProductRevenue, 0),
+        productRows.reduce((total, row) => total + row.vatAmount, 0),
+        totalAdCost,
+        productRows.reduce((total, row) => total + row.totalFeeCost, 0),
+        !hasIncompleteCost && totalSalesQuantity > 0 ? roundHalfUp(totalFixedCost / totalSalesQuantity) : "",
+        "",
+        productRows.reduce((total, row) => total + row.totalUnitCost, 0),
+        hasIncompleteCost
+          ? ""
+          : productRows.reduce((total, row) => total + (row.estimatedNetProfit ?? 0), 0),
+      ],
     ];
 
     const workbook = XLSX.utils.book_new();
@@ -215,7 +239,7 @@ export class ProfitService {
       const fakePurchaseAmount =
         database.dailyFakePurchases.find((row) => row.storeId === storeId && row.date === date)?.amount ?? 0;
       const storeNetProfit =
-        summary.estimatedNetProfit == null ? "" : summary.estimatedNetProfit - fakePurchaseAmount;
+        calculateNetProfitAfterFakePurchase(summary.estimatedNetProfit, fakePurchaseAmount) ?? "";
 
       summaryMap.set(date, {
         fakePurchaseAmount,
@@ -232,7 +256,7 @@ export class ProfitService {
     dailyStoreSummaries: Map<string, ExportStoreSummary>,
   ): unknown[][] {
     const flatRows: unknown[][] = [];
-    let hasWrittenStoreSummary = false;
+    const writtenDates = new Set<string>();
 
     rows.forEach((row) => {
       const storeSummary = dailyStoreSummaries.get(row.date) ?? {
@@ -240,7 +264,7 @@ export class ProfitService {
         deliveryMargin: 0,
         storeNetProfit: "",
       };
-      const storeSummaryForRow: ExportStoreSummary = hasWrittenStoreSummary
+      const storeSummaryForRow: ExportStoreSummary = writtenDates.has(row.date)
         ? { fakePurchaseAmount: "", deliveryMargin: "", storeNetProfit: "" }
         : storeSummary;
 
@@ -253,7 +277,7 @@ export class ProfitService {
           displayQuantity: row.isGroup ? "" : undefined,
         }),
       );
-      hasWrittenStoreSummary = true;
+      writtenDates.add(row.date);
 
       row.childRows?.forEach((childRow) => {
         flatRows.push(
@@ -267,7 +291,13 @@ export class ProfitService {
       });
     });
 
-    return flatRows;
+    dailyStoreSummaries.forEach((summary, date) => {
+      if (!writtenDates.has(date)) {
+        flatRows.push([date, "스토어 합계", "", "", "", "", "", "", "", "", "", "", "",
+          summary.fakePurchaseAmount, summary.deliveryMargin, summary.storeNetProfit]);
+      }
+    });
+    return flatRows.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
   }
 
   private createDailyProfitExportRow(params: {
@@ -283,10 +313,7 @@ export class ProfitService {
     const salePrice = shouldShowPerUnitValues && row.totalQuantity > 0
       ? roundHalfUp(row.totalProductRevenue / row.totalQuantity)
       : "";
-    const fixedCostPerProduct =
-      shouldShowPerUnitValues && row.totalQuantity > 0
-        ? roundHalfUp((row.totalFeeCost + row.vatAmount + row.totalUnitCost) / row.totalQuantity)
-        : "";
+    const fixedCostPerProduct = shouldShowPerUnitValues ? this.getFixedCostPerProduct(row) : "";
     const fixedCostMarginRate =
       typeof salePrice === "number" && salePrice > 0 && typeof fixedCostPerProduct === "number"
         ? (salePrice - fixedCostPerProduct) / salePrice
@@ -310,6 +337,12 @@ export class ProfitService {
       storeSummary.deliveryMargin,
       storeSummary.storeNetProfit,
     ];
+  }
+
+  private getFixedCostPerProduct(row: DailySalesUnitProfit): number | "" {
+    return row.totalQuantity > 0 && row.estimatedNetProfit != null
+      ? roundHalfUp((row.totalFeeCost + row.vatAmount + row.totalUnitCost + row.totalOtherCost) / row.totalQuantity)
+      : "";
   }
 
   private formatExportDisplayName(row: DailySalesUnitProfit): string {
@@ -393,6 +426,8 @@ export class ProfitService {
       snapshot,
       entry: entryIndex.get(snapshot.id)?.get(salesUnitId) ?? null,
     }));
+    const manualSettings = snapshot.salesUnitCostSettings.filter((item) =>
+      item.storeId === storeId && item.canonicalSalesUnitId === salesUnitId);
 
     const orderItems = snapshot.orderItems.filter(
       (item) =>
@@ -426,11 +461,11 @@ export class ProfitService {
       },
     );
     const fallbackFeeCostPortion = orderItems.reduce((total, item) => {
-      const costSetting = getCostSettingForDate(costSettingsByUnit, item.paymentDate);
+      const costSetting = getCostSettingForDate(costSettingsByUnit, item.paymentDate, manualSettings);
       const fee = calculateFee(item, costSetting);
       return total + (fee.usedFallback ? fee.totalFeeCost : 0);
     }, 0);
-    const activeCostSetting = getCostSettingForDate(costSettingsByUnit, date);
+    const activeCostSetting = getCostSettingForDate(costSettingsByUnit, date, manualSettings);
     const excludedSummary = this.profitSummaryService?.getDashboardSummary(storeId, date) ??
       calculateDashboardSummary(snapshot, storeId, date);
     const deliverySummary = calculateStoreDeliverySummary(snapshot, storeId, date, date);
@@ -582,15 +617,15 @@ export class ProfitService {
       if (!activeUploadIds.has(item.sourceUploadId)) continue;
 
       const status = getAdMappingStatus(item);
-      if (status === "UNMAPPED") {
+      if (item.mappingReason === "INTENTIONALLY_UNMAPPED") {
+        intentionalUnmappedCampaignCount++;
+        intentionalUnmappedAdCost += item.totalCost;
+      } else if (status === "UNMAPPED") {
         unmappedCampaignCount++;
         unmappedAdCost += item.totalCost;
       } else if (status === "CONFLICT") {
         conflictCampaignCount++;
         conflictAdCost += item.totalCost;
-      } else if (item.mappingReason === "INTENTIONALLY_UNMAPPED") {
-        intentionalUnmappedCampaignCount++;
-        intentionalUnmappedAdCost += item.totalCost;
       }
     }
 

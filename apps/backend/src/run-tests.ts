@@ -57,7 +57,9 @@ import { runNaverReliabilityTests } from "./naver-reliability-tests";
 import { OperationService } from "./operation.service";
 import { OperationWorkerService } from "./operation-worker.service";
 import { ProfitService } from "./profit.service";
-import { ProfitSummaryService } from "./profit-summary.service";
+import { ProfitSummaryService, PROFIT_CALCULATION_VERSION } from "./profit-summary.service";
+import { runProfitRegressionTests } from "./profit-regression-tests";
+import { runStartupRegressionTests } from "./startup-regression-tests";
 import {
   DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS,
   getKstRetentionCutoffDate,
@@ -1068,7 +1070,7 @@ const createStoredDailySalesUnitProfitForTest = (
     childRows: overrides.childRows,
     costSnapshotId: overrides.costSnapshotId ?? null,
     mappingBasisHash: overrides.mappingBasisHash ?? null,
-    calculationVersion: overrides.calculationVersion ?? "profit-v1",
+    calculationVersion: overrides.calculationVersion ?? PROFIT_CALCULATION_VERSION,
     calculatedAt: overrides.calculatedAt ?? "2026-04-01T00:00:00.000Z",
     createdAt: overrides.createdAt ?? "2026-04-01T00:00:00.000Z",
     updatedAt: overrides.updatedAt ?? "2026-04-01T00:00:00.000Z",
@@ -1113,7 +1115,7 @@ const createStoredDailyStoreSummaryForTest = (
     estimatedDeliveryBaseCost: overrides.estimatedDeliveryBaseCost ?? DEFAULT_DELIVERY_UNIT_COST,
     customerPaidDeliveryFee: overrides.customerPaidDeliveryFee ?? 0,
     deliveryMargin: overrides.deliveryMargin ?? -DEFAULT_DELIVERY_UNIT_COST,
-    calculationVersion: overrides.calculationVersion ?? "profit-v1",
+    calculationVersion: overrides.calculationVersion ?? PROFIT_CALCULATION_VERSION,
     calculatedAt: overrides.calculatedAt ?? "2026-04-01T00:00:00.000Z",
     createdAt: overrides.createdAt ?? "2026-04-01T00:00:00.000Z",
     updatedAt: overrides.updatedAt ?? "2026-04-01T00:00:00.000Z",
@@ -2733,7 +2735,7 @@ run("NaverCommerceConfigService resolves matching env credentials", () => {
   });
 });
 
-run("calculateFee falls back to feeRate only when both API fees are null", () => {
+run("calculateFee falls back to feeRate when all API fees are missing", () => {
   const result = calculateFee(
     {
       paymentCommission: null,
@@ -5167,7 +5169,7 @@ run("createEmptyDatabase includes daily profit summary collections", () => {
   assert.deepEqual(database.dailyStoreSummaries, []);
 });
 
-run("ProfitService Excel export shows total ad cost and sales quantity above the detail table", () => {
+run("ProfitService Excel export totals group parents without counting child details twice", () => {
   const database = createEmptyDatabase();
   const date = "2026-04-02";
   database.dailySalesUnitProfits.push(
@@ -5177,6 +5179,11 @@ run("ProfitService Excel export shows total ad cost and sales quantity above the
       canonicalSalesUnitId: "group-1",
       displayName: "Group Unit",
       totalQuantity: 5,
+      totalProductRevenue: 1000,
+      vatAmount: 100,
+      totalFeeCost: 50,
+      totalUnitCost: 350,
+      estimatedNetProfit: 400,
       totalAdCost: 100,
       isGroup: true,
       childRows: [
@@ -5185,6 +5192,11 @@ run("ProfitService Excel export shows total ad cost and sales quantity above the
           date,
           canonicalSalesUnitId: "child-1",
           totalQuantity: 2,
+          totalProductRevenue: 400,
+          vatAmount: 40,
+          totalFeeCost: 20,
+          totalUnitCost: 140,
+          estimatedNetProfit: 160,
           totalAdCost: 40,
           parentSalesUnitId: "group-1",
         }),
@@ -5193,6 +5205,11 @@ run("ProfitService Excel export shows total ad cost and sales quantity above the
           date,
           canonicalSalesUnitId: "child-2",
           totalQuantity: 3,
+          totalProductRevenue: 600,
+          vatAmount: 60,
+          totalFeeCost: 30,
+          totalUnitCost: 210,
+          estimatedNetProfit: 240,
           totalAdCost: 60,
           parentSalesUnitId: "group-1",
         }),
@@ -5203,6 +5220,11 @@ run("ProfitService Excel export shows total ad cost and sales quantity above the
       date,
       canonicalSalesUnitId: "standalone-1",
       totalQuantity: 4,
+      totalProductRevenue: 800,
+      vatAmount: 80,
+      totalFeeCost: 40,
+      totalUnitCost: 280,
+      estimatedNetProfit: -20,
       totalAdCost: 20,
     }),
     createStoredDailySalesUnitProfitForTest({
@@ -5237,6 +5259,15 @@ run("ProfitService Excel export shows total ad cost and sales quantity above the
   assert.equal(sheet.D1?.v, 9);
   assert.equal(sheet.A2, undefined);
   assert.equal(sheet.A3?.v, "일자");
+  const exportedRows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1 });
+  assert.equal(exportedRows.length, 9);
+  assert.deepEqual(exportedRows.at(-1), [
+    "합계", "단가: 수량 가중평균", 9, "", 1800, 180, 150, 90, 100, "", 630, 380,
+  ]);
+  // The group quantity stays blank and the two child details remain in the export.
+  assert.equal(sheet.C4?.v, "");
+  assert.equal(sheet.C5?.v, 2);
+  assert.equal(sheet.C6?.v, 3);
 });
 
 runAsync("ProfitSummaryService skips committed writes for empty date refresh", async () => {
@@ -6939,6 +6970,8 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
 });
 
 runAsync("Naver API schema, pagination, timeout and retry reliability", runNaverReliabilityTests);
+runAsync("Profit calculation regressions", runProfitRegressionTests);
+runAsync("Application startup regressions", runStartupRegressionTests);
 
 void Promise.all(pendingAsyncTests).then(() => {
   console.log("All backend checks passed.");

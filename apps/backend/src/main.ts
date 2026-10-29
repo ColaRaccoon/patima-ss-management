@@ -18,6 +18,8 @@ if (envPath) {
 }
 
 async function bootstrap() {
+  const startedAt = Date.now();
+  console.log("[Startup] Loading application and database...");
   const app = await NestFactory.create(AppModule, { cors: true });
   app.useGlobalPipes(
     new ValidationPipe({
@@ -28,6 +30,10 @@ async function bootstrap() {
   const port = Number(process.env.PORT ?? 4000);
   const host = process.env.BACKEND_HOST ?? "127.0.0.1";
   await app.listen(port, host);
+  console.log(`[Startup] Ready at http://${host}:${port} (${Date.now() - startedAt} ms)`);
 }
 
-bootstrap();
+void bootstrap().catch((error: unknown) => {
+  console.error("[Startup] Application failed to start:", error instanceof Error ? error.message : "Unknown error");
+  process.exit(1);
+});

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { calculateNetProfitAfterFakePurchase } from "@patima/shared";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
@@ -51,7 +52,7 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
       <SourceBanner sources={data.sources} />
 
       <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-950">
-        <p className="font-semibold">순손익 = 판매단위별 순손익 합 + 배송 마진</p>
+        <p className="font-semibold">순손익 = 판매단위별 순손익 합 + 배송 마진 - 가구매 금액</p>
         <p className="mt-1">
           각 판매단위의 순손익은 VAT 차감 매출 기준으로 계산되며, 배송 마진은 대시보드 레벨에서만 합산됩니다.
         </p>
@@ -77,11 +78,11 @@ export function DashboardView({ data }: { data: DashboardPageData }) {
         />
         <StatCard
           label="순손익(예상)"
-          value={formatCurrency(data.summary.estimatedNetProfit)}
+          value={formatCurrency(calculateNetProfitAfterFakePurchase(data.summary.estimatedNetProfit, data.fakePurchase?.amount ?? 0))}
           hint={
             data.summary.profitStatus === "INCOMPLETE_COST"
               ? "일부 원가 설정이 완료되지 않았습니다."
-              : "모든 추적된 원가 항목이 적용되었습니다."
+              : `배송 마진 및 가구매 ${formatCurrency(data.fakePurchase?.amount ?? 0)} 반영`
           }
           tone={toneForProfitStatus(data.summary.profitStatus)}
         />
