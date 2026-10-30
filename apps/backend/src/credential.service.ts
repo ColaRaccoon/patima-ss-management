@@ -5,6 +5,7 @@ import { DatabaseService } from "./database.service";
 import { createId, ensureStoreExists, formatApiSuccess, nowIso } from "./helpers";
 import { NaverCommerceService } from "./naver-commerce.service";
 import { StoreService } from "./store.service";
+import { synchronizeApplicationSecrets } from "./application-credentials";
 
 @Injectable()
 export class CredentialService {
@@ -41,7 +42,10 @@ export class CredentialService {
     let credentialId = "";
 
     await this.databaseService.writeCommitted((draft) => {
-      ensureStoreExists(draft, storeId);
+      const store = ensureStoreExists(draft, storeId);
+      store.credentialConnectionStatus = "NOT_TESTED";
+      store.lastCredentialTestAt = null;
+      store.updatedAt = nowIso();
       const existing = draft.commerceCredentials.find(
         (item) => item.storeId === storeId,
       );
@@ -50,6 +54,8 @@ export class CredentialService {
         existing.clientSecretEncrypted = encrypted;
         existing.accessType = payload.accessType ?? "SELLER";
         existing.isEnabled = true;
+        existing.lastTokenIssuedAt = null;
+        existing.lastTokenExpiresAt = null;
         existing.updatedAt = nowIso();
         credentialId = existing.id;
       } else {
@@ -68,6 +74,8 @@ export class CredentialService {
         draft.commerceCredentials.push(created);
         credentialId = created.id;
       }
+
+      synchronizeApplicationSecrets(draft, payload.clientId, payload.clientSecret, this.cryptoService, nowIso());
 
       this.auditLogService.appendToDraft(draft, {
         storeId,

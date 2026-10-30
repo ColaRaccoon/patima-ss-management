@@ -10,6 +10,9 @@ import { DatabaseService } from "./database.service";
 import { EnvironmentBootstrapService } from "./environment-bootstrap.service";
 import { createEmptyDatabase } from "./helpers";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
+import { CredentialService } from "./credential.service";
+import { NaverCommerceService, ResolvedCommerceCredential } from "./naver-commerce.service";
+import { mock } from "node:test";
 
 export async function runStartupRegressionTests() {
   const crypto = new CryptoService();
@@ -56,6 +59,67 @@ export async function runStartupRegressionTests() {
     assert.equal(crypto.decrypt(saved.clientSecretEncrypted), "secret");
   }
   console.log("PASS startup repairs changed and missing credentials");
+
+  const sharedFixture = () => {
+    const state = fixture();
+    for (const [id, clientId, enabled] of [["sibling", "client", true], ["disabled", "client", false], ["other", "other-client", true]] as const) {
+      state.data.stores.push({ id, sellerAccountId: `seller-${id}`, channelNo: `channel-${id}`, credentialConnectionStatus: "SUCCEEDED" } as never);
+      state.data.commerceCredentials.push({ ...state.data.commerceCredentials[0], id, storeId: id, clientId, isEnabled: enabled, clientSecretEncrypted: crypto.encrypt("old-secret") });
+    }
+    return state;
+  };
+  const shared = sharedFixture();
+  const independent = structuredClone(shared.data.commerceCredentials.find((item) => item.id === "other"));
+  const accountBindings = shared.data.stores.map(({ id, sellerAccountId, channelNo }) => ({ id, sellerAccountId, channelNo }));
+  await new EnvironmentBootstrapService(shared.database, crypto, config).onApplicationBootstrap();
+  assert.equal(shared.writes(), 1, "stale sibling credentials must prevent the unchanged-primary early return");
+  for (const item of shared.data.commerceCredentials.filter((item) => item.clientId === "client")) {
+    assert.equal(crypto.decrypt(item.clientSecretEncrypted), "secret");
+  }
+  assert.equal(shared.data.commerceCredentials.find((item) => item.id === "disabled")?.isEnabled, false);
+  assert.deepEqual(shared.data.commerceCredentials.find((item) => item.id === "other"), independent);
+  assert.deepEqual(shared.data.stores.map(({ id, sellerAccountId, channelNo }) => ({ id, sellerAccountId, channelNo })), accountBindings);
+  const afterRotation = structuredClone(shared.data);
+  await new EnvironmentBootstrapService(shared.database, crypto, config).onApplicationBootstrap();
+  assert.equal(shared.writes(), 1, "a subsequent unchanged startup must not write again");
+  assert.deepEqual(shared.data, afterRotation);
+  console.log("PASS environment rotation updates all stores sharing the app and preserves other app/store bindings");
+
+  const fromUi = sharedFixture();
+  const credentialService = new CredentialService(fromUi.database, crypto, { appendToDraft: () => {} } as never, { ensureWritable: () => {} } as never, {} as never);
+  await credentialService.upsert("sibling", { clientId: "client", clientSecret: "ui-rotated-secret" });
+  for (const item of fromUi.data.commerceCredentials.filter((item) => item.clientId === "client")) {
+    assert.equal(crypto.decrypt(item.clientSecretEncrypted), "ui-rotated-secret");
+  }
+  assert.equal(crypto.decrypt(fromUi.data.commerceCredentials.find((item) => item.id === "other")!.clientSecretEncrypted), "old-secret");
+  assert.equal(fromUi.data.commerceCredentials.find((item) => item.id === "disabled")?.isEnabled, false);
+  console.log("PASS saving credentials propagates the application secret without enabling disabled stores");
+
+  let tokenRequests = 0;
+  const authorization: string[] = [];
+  const activeCredential: ResolvedCommerceCredential = { credentialId: null, clientId: "client", clientSecret: "$2a$04$abcdefghijklmnopqrstuv", accessType: "SELLER", source: "ENV" };
+  const commerce = new NaverCommerceService({} as never, crypto, config);
+  commerce.getResolvedConfiguration = () => ({ store: { sellerAccountId: "seller", channelNo: "channel" } as never, credential: activeCredential });
+  const fetchMock = mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).endsWith("/oauth2/token")) {
+      tokenRequests++;
+      assert.equal(new URLSearchParams(String(init?.body)).get("account_id"), "seller");
+      return Response.json({ access_token: `token-${tokenRequests}`, expires_in: 3600 });
+    }
+    authorization.push(new Headers(init?.headers).get("Authorization") ?? "");
+    return Response.json([{ channelNo: "channel", channelName: "Store" }]);
+  });
+  try {
+    await commerce.testConnection("store");
+    await commerce.testConnection("store");
+    activeCredential.clientSecret = "$2a$04$zyxwvutsrqponmlkjihgfe";
+    await commerce.testConnection("store");
+    assert.equal(tokenRequests, 2, "rotating a secret must bypass the token cached under the old secret");
+    assert.deepEqual(authorization, ["Bearer token-1", "Bearer token-1", "Bearer token-2"]);
+  } finally {
+    fetchMock.mock.restore();
+  }
+  console.log("PASS token cache renews after secret rotation while retaining the store account");
 
   const directory = mkdtempSync(join(tmpdir(), "patima-startup-test-"));
   const overrides: Record<string, string | undefined> = {

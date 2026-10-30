@@ -5,6 +5,7 @@ import {
 } from "@nestjs/common";
 import { SaleStatus, Store, normalizeText } from "@patima/shared";
 import bcrypt from "bcryptjs";
+import { createHash } from "node:crypto";
 import {
   NaverRequestError,
   requestNaverJson,
@@ -1154,6 +1155,7 @@ export class NaverCommerceService {
   }
 
   private buildCacheKey(store: Store, credential: ResolvedCommerceCredential) {
-    return `${store.sellerAccountId}:${credential.clientId}:${normalizeText(store.channelNo)}`;
+    const secretVersion = createHash("sha256").update(credential.clientSecret).digest("hex");
+    return `${store.sellerAccountId}:${credential.clientId}:${normalizeText(store.channelNo)}:${secretVersion}`;
   }
 }

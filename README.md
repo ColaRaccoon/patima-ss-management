@@ -27,6 +27,7 @@ The backend now supports three layers for Naver Commerce integration:
 - PostgreSQL persistence through `DATABASE_URL`
 - Environment-driven Naver solution credentials through `NAVER_*`
 - Store + credential bootstrap on startup when all required `NAVER_*` values exist
+- An application secret is shared by credentials with the same client ID. Environment bootstrap and credential saves update those records together while preserving each store's account/channel and enabled state. Token caches are separated by secret version.
 - Order raw payload retention through `ORDER_RAW_PAYLOAD_RETENTION_DAYS` (default `0`)
 
 Required Naver values:

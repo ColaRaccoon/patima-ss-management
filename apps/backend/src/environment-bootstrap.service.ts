@@ -4,6 +4,7 @@ import { CryptoService } from "./crypto.service";
 import { DatabaseService } from "./database.service";
 import { createId, nowIso } from "./helpers";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
+import { hasApplicationSecret, synchronizeApplicationSecrets } from "./application-credentials";
 
 @Injectable()
 export class EnvironmentBootstrapService implements OnApplicationBootstrap {
@@ -36,14 +37,15 @@ export class EnvironmentBootstrapService implements OnApplicationBootstrap {
         credential.accessType === "SELLER" &&
         credential.isEnabled
       ) {
-        try {
-          // Encryption uses a random IV. Compare plaintext before encrypting so
-          // an unchanged startup does not rewrite the entire database snapshot.
-          if (this.cryptoService.decrypt(credential.clientSecretEncrypted) === environmentCredential.clientSecret) {
-            return;
-          }
-        } catch {
-          // A changed master key or invalid ciphertext needs to be repaired below.
+        // Include sibling stores: a matching bootstrap store alone does not
+        // mean every credential for this application has the current secret.
+        if (
+          hasApplicationSecret(credential, environmentCredential.clientSecret, this.cryptoService) &&
+          snapshot.commerceCredentials
+            .filter((item) => item.clientId === environmentCredential.clientId)
+            .every((item) => hasApplicationSecret(item, environmentCredential.clientSecret, this.cryptoService))
+        ) {
+          return;
         }
       }
     }
@@ -100,14 +102,15 @@ export class EnvironmentBootstrapService implements OnApplicationBootstrap {
           updatedAt: now,
         } satisfies CommerceCredential;
         draft.commerceCredentials.push(credential);
-        return;
+      } else {
+        credential.clientId = environmentCredential.clientId;
+        credential.accessType = "SELLER";
+        credential.isEnabled = true;
+        credential.updatedAt = now;
       }
-
-      credential.clientId = environmentCredential.clientId;
-      credential.clientSecretEncrypted = encryptedSecret;
-      credential.accessType = "SELLER";
-      credential.isEnabled = true;
-      credential.updatedAt = now;
+      synchronizeApplicationSecrets(
+        draft, environmentCredential.clientId, environmentCredential.clientSecret, this.cryptoService, now,
+      );
     });
   }
 }
