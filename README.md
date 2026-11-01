@@ -28,6 +28,7 @@ The backend now supports three layers for Naver Commerce integration:
 - Environment-driven Naver solution credentials through `NAVER_*`
 - Store + credential bootstrap on startup when all required `NAVER_*` values exist
 - An application secret is shared by credentials with the same client ID. Environment bootstrap and credential saves update those records together while preserving each store's account/channel and enabled state. Token caches are separated by secret version.
+- PostgreSQL token renewal, credential saves/tests, and environment credential bootstrap persist only credential/store/audit tables as needed. They do not upload the full order history before continuing an API request.
 - Order raw payload retention through `ORDER_RAW_PAYLOAD_RETENTION_DAYS` (default `0`)
 
 Required Naver values:
@@ -110,6 +111,14 @@ npm run build
 - 원가 엑셀의 빈 원가는 0원이 아닙니다. 원가가 없는 상품은 순이익을 확정하지 않으며, 명시적으로 입력한 0원만 유효합니다. 음수·잘못된 숫자·0~1 범위를 벗어난 수수료율은 업로드를 거부합니다.
 - 배송 단가를 바꾸면 저장된 손익을 갱신합니다. 이전 계산 버전의 집계는 조회에서 사용하지 않고 현재 로직으로 계산합니다. 과거에 잘못 파싱되어 저장된 원가는 원본 파일로 다시 입력해야 합니다.
 - `npm test`는 백엔드 계산·엑셀·집계 회귀 테스트와 프런트엔드 날짜·스토어·가구매 연동 테스트를 함께 실행합니다.
+
+## 광고 일괄 업로드
+
+- 광고 업로드 화면에서 두 스토어의 파일을 함께 선택합니다. `YYMMDD_인피니티.xlsx`, `YYMMDD_파티마.xlsx`와 각 이름 뒤에 `메인`·`서브`가 붙는 파일명을 지원합니다. 예: `261031_인피니티메인.xlsx` → 인피니티스토어, 2026-10-31. 스토어 설정의 이름은 `인피니티스토어`, `파티마스토어`와 일치해야 하며 누락·중복·비활성 스토어는 거부합니다.
+- 파일별 자동 분류를 화면에서 확인한 뒤 업로드합니다. 파일당 최대 10MB, 한 번에 최대 100개입니다. 파일명 날짜, 엑셀 필수 컬럼, 요일, 파일 내부 및 파일 간·기존 활성 업로드와의 캠페인 중복을 검증합니다. 중복 기준은 스토어 + 날짜 + 캠페인 ID입니다.
+- `POST /api/v1/ad-uploads/batch`는 `files` multipart 필드로 여러 파일을 받습니다. 모든 파일을 하나의 트랜잭션으로 반영하므로 검증 또는 저장 실패 시 일부 파일만 반영하지 않습니다. 파일별 업로드 이력과 원본 파일명은 유지합니다. 기존 단일 파일 `/ad-uploads/preview` API도 유지합니다.
+- PostgreSQL에서는 광고 업로드·광고 행·캠페인 매핑·필요한 판매단위·감사 기록 중 변경된 행만 저장합니다. 기존 주문 데이터는 복사·재전송하지 않습니다. 손익 집계는 모든 파일 저장 후 스토어마다 한 번 호출하며 해당 날짜 목록을 중복 없이 갱신합니다.
+- 손익 집계 실패는 이미 저장된 광고와 구분해 경고로 반환합니다. 응답 유실 시 업로드 이력을 확인하세요. 같은 파일을 재전송해도 기존 캠페인 중복 검증이 적용됩니다. 업로드 이력은 화면에서 선택한 스토어 기준으로 표시합니다.
 
 ## Docker
 

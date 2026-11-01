@@ -4,6 +4,42 @@ import { calculateNetProfitAfterFakePurchase } from "@patima/shared";
 import { getDashboardPageData, getProfitsPageData } from "./services";
 import nextConfig from "../../next.config";
 import { PHASE_DEVELOPMENT_SERVER, PHASE_PRODUCTION_BUILD, PHASE_PRODUCTION_SERVER } from "next/constants";
+import { parseAdUploadFileName } from "@patima/shared";
+import { POST as uploadAdBatch } from "../../app/api/ad-uploads/batch/route";
+
+test("daily ad filenames classify both stores, suffixes and calendar dates", () => {
+  for (const store of ["파티마", "인피니티"]) for (const suffix of ["", "메인", "서브"]) {
+    assert.deepEqual(parseAdUploadFileName(`261031_${store}${suffix}.xlsx`), { reportDate: "2026-10-31", storeName: `${store}스토어` });
+  }
+  for (const name of ["260229_파티마.xlsx", "261331_파티마.xlsx", "261031_다른스토어.xlsx"]) assert.equal(parseAdUploadFileName(name), null);
+});
+
+test("batch upload proxy forwards every file together and preserves server errors", async (context) => {
+  const files = ["261031_인피니티.xlsx", "261031_파티마.xlsx"];
+  let upstreamStatus = 201;
+  const error = { message: "중복 캠페인입니다.", fileName: files[1] };
+  const fetchMock = context.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    assert.ok(String(input).endsWith("/ad-uploads/batch"));
+    const form = init?.body as FormData;
+    assert.deepEqual(form.getAll("files").map((file) => (file as File).name), files);
+    assert.equal(form.has("storeId"), false);
+    assert.equal(form.has("reportDate"), false);
+    return Response.json(upstreamStatus === 201 ? { success: true, data: { items: [] } } : error, { status: upstreamStatus });
+  });
+  const request = () => {
+    const form = new FormData();
+    for (const name of files) form.append("files", new Blob(["fixture"]), name);
+    return new Request("http://localhost/api/ad-uploads/batch", { method: "POST", body: form });
+  };
+  assert.equal((await uploadAdBatch(request())).status, 201);
+  upstreamStatus = 400;
+  const response = await uploadAdBatch(request());
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), error);
+  const empty = await uploadAdBatch(new Request("http://localhost/api/ad-uploads/batch", { method: "POST", body: new FormData() }));
+  assert.equal(empty.status, 400);
+  assert.equal(fetchMock.mock.callCount(), 2);
+});
 
 test("development and production builds use separate output directories", () => {
   const previous = process.env.NEXT_DIST_DIR;

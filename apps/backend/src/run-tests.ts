@@ -60,6 +60,7 @@ import { ProfitService } from "./profit.service";
 import { ProfitSummaryService, PROFIT_CALCULATION_VERSION } from "./profit-summary.service";
 import { runProfitRegressionTests } from "./profit-regression-tests";
 import { runStartupRegressionTests } from "./startup-regression-tests";
+import { runAdUploadRegressionTests } from "./ad-upload-regression-tests";
 import {
   DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS,
   getKstRetentionCutoffDate,
@@ -164,6 +165,9 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
     return this.write(mutator);
   },
   async commitOrderSync(mutator: (draft: typeof database) => unknown) {
+    return this.writeCommitted(mutator);
+  },
+  async commitAdUpload(mutator: (draft: typeof database) => unknown) {
     return this.writeCommitted(mutator);
   },
   async saveDailyFakePurchaseCommitted(params: Parameters<DatabaseService["saveDailyFakePurchaseCommitted"]>[0]) {
@@ -3927,6 +3931,40 @@ runAsync("DatabaseService writeCommitted propagates PostgreSQL failures without 
   assert.equal(service.getPersistenceStatus().lastPersistenceError?.message, "POSTGRES_COMMIT_FAILED");
 });
 
+runAsync("DatabaseService credential commits skip order tables and preserve memory on rollback", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  service.database = createEmptyDatabase();
+  service.database.commerceCredentials.push({ id: "credential", updatedAt: "before" } as never);
+  service.database.orders.push({ id: "existing-order" } as never);
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  let failCommit = false;
+  const queries: string[] = [];
+  service.pool = { connect: async () => ({
+    query: async (sql: string) => {
+      queries.push(sql);
+      if (sql === "COMMIT" && failCommit) throw new Error("COMMIT_FAILED");
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  }) };
+  await service.writeCommitted((draft: ReturnType<typeof createEmptyDatabase>) => {
+    draft.commerceCredentials[0].updatedAt = "committed";
+  }, ["commerceCredentials"]);
+  assert.equal(service.getSnapshot().commerceCredentials[0].updatedAt, "committed");
+  assert.ok(queries.some((sql) => sql.includes("INSERT INTO commerce_api_credentials")));
+  assert.equal(queries.some((sql) => /(?:INSERT INTO|DELETE FROM) (?:orders|order_items|operations)\b/.test(sql)), false);
+  assert.deepEqual(service.getSnapshot().orders, [{ id: "existing-order" }]);
+  failCommit = true;
+  await assert.rejects(service.writeCommitted((draft: ReturnType<typeof createEmptyDatabase>) => {
+    draft.commerceCredentials[0].updatedAt = "must-rollback";
+  }, ["commerceCredentials"]), /COMMIT_FAILED/);
+  assert.equal(service.getSnapshot().commerceCredentials[0].updatedAt, "committed");
+  assert.ok(queries.includes("ROLLBACK"));
+});
+
 runAsync("DatabaseService file mode writes committed snapshots atomically under DATA_DIR", async () => {
   const originalDatabaseUrl = process.env.DATABASE_URL;
   const originalDataDir = process.env.DATA_DIR;
@@ -6972,6 +7010,7 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
 runAsync("Naver API schema, pagination, timeout and retry reliability", runNaverReliabilityTests);
 runAsync("Profit calculation regressions", runProfitRegressionTests);
 runAsync("Application startup regressions", runStartupRegressionTests);
+runAsync("Ad batch upload regressions", runAdUploadRegressionTests);
 
 void Promise.all(pendingAsyncTests).then(() => {
   console.log("All backend checks passed.");

@@ -5,6 +5,7 @@ import {
   AdUploadPreviewRow,
   DatabaseShape,
   normalizeText,
+  parseAdUploadFileName,
 } from "@patima/shared";
 import * as XLSX from "xlsx";
 import { AuditLogService } from "./audit-log.service";
@@ -18,6 +19,7 @@ import {
 import { DatabaseService } from "./database.service";
 import {
   createId,
+  ensureDateString,
   formatApiSuccess,
   getActiveConfirmedUploadIds,
   getAdMappingStatus,
@@ -61,7 +63,34 @@ export class AdsService implements OnModuleInit {
   }
 
   async previewUpload(storeId: string, reportDate: string, file: Express.Multer.File) {
+    const results = await this.commitPreparedUploads([this.prepareUpload(storeId, reportDate, file)]);
+    return formatApiSuccess(results[0]);
+  }
+
+  async uploadBatch(files: Express.Multer.File[]) {
+    if (!files?.length || files.length > 100) throw new BadRequestException("1~100개의 엑셀 파일을 선택하세요.");
+    const snapshot = this.databaseService.getSnapshot();
+    const prepared = files.map((file) => {
+      const fileName = repairMojibakeText(file.originalname);
+      const target = parseAdUploadFileName(fileName);
+      if (!target) throw new BadRequestException({
+        message: "파일명은 YYMMDD_인피니티[메인/서브].xlsx 또는 YYMMDD_파티마[메인/서브].xlsx 형식이어야 합니다. 날짜도 확인하세요.",
+        fileName, errors: [{ field: "file", reason: "AD_UPLOAD_INVALID_FILENAME" }],
+      });
+      const stores = snapshot.stores.filter((store) => store.name.normalize("NFC").trim() === target.storeName);
+      if (stores.length !== 1) throw new BadRequestException({
+        message: `${target.storeName}를 하나로 식별할 수 없습니다. 스토어 설정을 확인하세요.`, fileName,
+        errors: [{ field: "storeId", reason: "AD_UPLOAD_STORE_AMBIGUOUS_OR_MISSING" }],
+      });
+      return this.prepareUpload(stores[0].id, target.reportDate, file);
+    });
+    const items = await this.commitPreparedUploads(prepared);
+    return formatApiSuccess({ items, fileCount: items.length, confirmedRowCount: items.reduce((sum, item) => sum + item.confirmedRowCount, 0) });
+  }
+
+  private prepareUpload(storeId: string, reportDate: string, file: Express.Multer.File) {
     this.storeService.ensureWritable(storeId);
+    ensureDateString(reportDate, "reportDate");
     const originalFileName = repairMojibakeText(file?.originalname);
     if (!file || !/\.xlsx$/i.test(originalFileName)) {
       throw new BadRequestException({
@@ -72,7 +101,13 @@ export class AdsService implements OnModuleInit {
       });
     }
 
-    const workbook = XLSX.read(file.buffer, { type: "buffer" });
+    let workbook: XLSX.WorkBook;
+    try {
+      workbook = XLSX.read(file.buffer, { type: "buffer" });
+      if (!workbook.SheetNames.length) throw new Error("EMPTY_WORKBOOK");
+    } catch {
+      throw new BadRequestException({ message: "엑셀 파일을 읽을 수 없습니다.", fileName: originalFileName });
+    }
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1, raw: false });
     const header = (rows[0] ?? []).map((value) => this.normalizeHeaderCell(value));
@@ -101,14 +136,8 @@ export class AdsService implements OnModuleInit {
     }
 
     const snapshot = this.databaseService.getSnapshot();
-    const activeConfirmedRows = this.getActiveConfirmedRows(snapshot, storeId, reportDate);
     const campaignIds = campaigns.map((campaign) => campaign.campaignId);
-    this.assertNoDuplicateCampaignIds(campaignIds, "AD_UPLOAD_DUPLICATE_IN_FILE");
-    this.assertNoCampaignIdOverlap(
-      campaignIds,
-      activeConfirmedRows,
-      "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
-    );
+    this.assertNoDuplicateCampaignIds(campaignIds, "AD_UPLOAD_DUPLICATE_IN_FILE", originalFileName);
 
     // 요일 검증 실패 시 즉시 예외 던지기
     if (weekdayValidationStatus !== "PASSED") {
@@ -142,76 +171,112 @@ export class AdsService implements OnModuleInit {
       updatedAt: nowIso(),
     };
 
-    const confirmedRows: AdCampaignDailyCost[] = [];
+    return { upload, campaigns };
+  }
 
-    await this.databaseService.writeCommitted((draft) => {
-      const touchedSignatureIds = new Set<string>();
-      draft.adExcelUploads.push(upload);
-      campaigns.forEach((campaign) => {
-        const normalizedCampaignName = normalizeText(campaign.campaignName);
-        const signature = upsertAdCampaignSignature(draft, {
-          storeId,
-          campaignId: campaign.campaignId,
-          campaignName: campaign.campaignName,
-          normalizedCampaignName,
-          reportDate,
+  private async commitPreparedUploads(prepared: Array<ReturnType<AdsService["prepareUpload"]>>) {
+    await this.databaseService.commitAdUpload((draft) => {
+      const groups = new Map<string, { storeId: string; reportDate: string; signatureIds: Set<string> }>();
+      for (const { upload, campaigns } of prepared) {
+        const { storeId, reportDate, originalFileName } = upload;
+        // Recheck after queued writes, before publishing any part of this batch.
+        this.storeService.ensureWritable(storeId);
+        this.assertNoCampaignIdOverlap(
+          campaigns.map((campaign) => campaign.campaignId),
+          this.getActiveConfirmedRows(draft, storeId, reportDate),
+          "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
+          originalFileName,
+        );
+        // Mapping snapshots must also reflect writes that completed while this request waited.
+        upload.previewRuleSnapshotHash = getRuleSnapshotHash(draft, storeId);
+        upload.previewOverrideSnapshotHash = getOverrideSnapshotHash(draft, storeId);
+        const groupKey = `${storeId}:${reportDate}`;
+        let group = groups.get(groupKey);
+        if (!group) {
+          group = { storeId, reportDate, signatureIds: new Set<string>() };
+          groups.set(groupKey, group);
+        }
+        const touchedSignatureIds = group.signatureIds;
+        draft.adExcelUploads.push(upload);
+        campaigns.forEach((campaign) => {
+          const normalizedCampaignName = normalizeText(campaign.campaignName);
+          const signature = upsertAdCampaignSignature(draft, {
+            storeId,
+            campaignId: campaign.campaignId,
+            campaignName: campaign.campaignName,
+            normalizedCampaignName,
+            reportDate,
+          });
+          touchedSignatureIds.add(signature.id);
+          const confirmed: AdCampaignDailyCost = {
+            id: createId(),
+            uploadId: upload.id,
+            sourceUploadId: upload.id,
+            adCampaignSignatureId: signature.id,
+            storeId,
+            reportDate,
+            campaignId: campaign.campaignId,
+            campaignName: campaign.campaignName,
+            normalizedCampaignName,
+            weekday: campaign.weekday,
+            adType: campaign.adType,
+            status: campaign.status,
+            totalCost: campaign.totalCost,
+            impressions: campaign.impressions,
+            clicks: campaign.clicks,
+            totalConversions: campaign.totalConversions,
+            totalConversionSales: campaign.totalConversionSales,
+            matchedRuleCount: signature.matchedRuleCount,
+            canonicalSalesUnitId: signature.canonicalSalesUnitId,
+            mappingReason: signature.mappingReason,
+            reasonNote: signature.reasonNote,
+            reasonNoteInherited: signature.reasonNoteInherited,
+            createdAt: nowIso(),
+            updatedAt: nowIso(),
+          };
+          draft.adCampaignDailyCosts.push(confirmed);
         });
-        touchedSignatureIds.add(signature.id);
-        const confirmed: AdCampaignDailyCost = {
-          id: createId(),
-          uploadId: upload.id,
-          sourceUploadId: upload.id,
-          adCampaignSignatureId: signature.id,
+        this.auditLogService.appendToDraft(draft, {
           storeId,
-          reportDate,
-          campaignId: campaign.campaignId,
-          campaignName: campaign.campaignName,
-          normalizedCampaignName,
-          weekday: campaign.weekday,
-          adType: campaign.adType,
-          status: campaign.status,
-          totalCost: campaign.totalCost,
-          impressions: campaign.impressions,
-          clicks: campaign.clicks,
-          totalConversions: campaign.totalConversions,
-          totalConversionSales: campaign.totalConversionSales,
-          matchedRuleCount: signature.matchedRuleCount,
-          canonicalSalesUnitId: signature.canonicalSalesUnitId,
-          mappingReason: signature.mappingReason,
-          reasonNote: signature.reasonNote,
-          reasonNoteInherited: signature.reasonNoteInherited,
-          createdAt: nowIso(),
-          updatedAt: nowIso(),
-        };
-        confirmedRows.push(confirmed);
-        draft.adCampaignDailyCosts.push(confirmed);
-      });
-      recalculateAdCampaignSignaturesForStore(draft, storeId, {
-        signatureIds: touchedSignatureIds,
-        applyToRowsFrom: reportDate,
-        applyToRowsTo: reportDate,
-      });
-      this.auditLogService.appendToDraft(draft, {
-        storeId,
-        domain: "AD_UPLOAD",
-        action: "CREATE",
-        targetId: upload.id,
-        actorIdentifier: "LOCALHOST_ADMIN",
-        beforeJson: null,
-        afterJson: { reportDate, originalFileName, confirmedRowCount: confirmedRows.length },
-      });
+          domain: "AD_UPLOAD",
+          action: "CREATE",
+          targetId: upload.id,
+          actorIdentifier: "LOCALHOST_ADMIN",
+          beforeJson: null,
+          afterJson: { reportDate, originalFileName, confirmedRowCount: campaigns.length },
+        });
+      }
+      for (const group of groups.values()) {
+        recalculateAdCampaignSignaturesForStore(draft, group.storeId, {
+          signatureIds: group.signatureIds,
+          applyToRowsFrom: group.reportDate,
+          applyToRowsTo: group.reportDate,
+        });
+      }
     });
-
-    await this.recalculateProfitSummaryForAdDate(storeId, reportDate);
-
-    return formatApiSuccess({
+    const datesByStore = new Map<string, Set<string>>();
+    for (const { upload } of prepared) {
+      const dates = datesByStore.get(upload.storeId) ?? new Set<string>();
+      dates.add(upload.reportDate);
+      datesByStore.set(upload.storeId, dates);
+    }
+    const summaries = new Map<string, boolean>();
+    for (const [storeId, dates] of datesByStore) {
+      const result = await this.profitSummaryService?.refreshStoreDateListBestEffort({ storeId, dates: [...dates], reason: "AD_UPLOAD" });
+      summaries.set(storeId, !!result);
+    }
+    return prepared.map(({ upload, campaigns }) => ({
       uploadId: upload.id,
-      reportDate,
+      originalFileName: upload.originalFileName,
+      storeId: upload.storeId,
+      storeName: this.databaseService.getSnapshot().stores.find((store) => store.id === upload.storeId)?.name,
+      reportDate: upload.reportDate,
       detectedWeekday: upload.detectedWeekday,
-      weekdayValidationStatus,
-      status: "CONFIRMED",
-      confirmedRowCount: confirmedRows.length,
-    });
+      weekdayValidationStatus: upload.weekdayValidationStatus,
+      status: "CONFIRMED" as const,
+      confirmedRowCount: campaigns.length,
+      summaryStatus: summaries.get(upload.storeId) ? "SUCCEEDED" : "WARNING",
+    }));
   }
 
   listPreviewRows(uploadId: string, page?: number, pageSize?: number) {
@@ -854,7 +919,7 @@ export class AdsService implements OnModuleInit {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  private assertNoDuplicateCampaignIds(campaignIds: string[], reason: string) {
+  private assertNoDuplicateCampaignIds(campaignIds: string[], reason: string, fileName?: string) {
     const duplicateCampaignIds = this.findDuplicateCampaignIds(campaignIds);
     if (duplicateCampaignIds.length === 0) {
       return;
@@ -863,6 +928,7 @@ export class AdsService implements OnModuleInit {
     throw new BadRequestException({
       success: false,
       message: `Duplicate campaignId values are not allowed in one upload. (${this.summarizeCampaignIds(duplicateCampaignIds)})`,
+      fileName,
       errors: [{ field: "campaignId", reason }],
     });
   }
@@ -871,6 +937,7 @@ export class AdsService implements OnModuleInit {
     candidateCampaignIds: string[],
     activeConfirmedRows: AdCampaignDailyCost[],
     reason: string,
+    fileName?: string,
   ) {
     const activeConfirmedCampaignIds = new Set(activeConfirmedRows.map((item) => item.campaignId));
     const duplicateCampaignIds = Array.from(
@@ -883,6 +950,7 @@ export class AdsService implements OnModuleInit {
     throw new BadRequestException({
       success: false,
       message: `campaignId already exists in active confirmed uploads for this date. (${this.summarizeCampaignIds(duplicateCampaignIds)})`,
+      fileName,
       errors: [{ field: "campaignId", reason }],
     });
   }

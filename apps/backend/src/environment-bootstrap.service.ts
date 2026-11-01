@@ -111,6 +111,6 @@ export class EnvironmentBootstrapService implements OnApplicationBootstrap {
       synchronizeApplicationSecrets(
         draft, environmentCredential.clientId, environmentCredential.clientSecret, this.cryptoService, now,
       );
-    });
+    }, ["stores", "commerceCredentials"]);
   }
 }

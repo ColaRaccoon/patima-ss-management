@@ -89,7 +89,7 @@ export class CredentialService {
           accessType: payload.accessType ?? "SELLER",
         },
       });
-    });
+    }, ["stores", "commerceCredentials", "auditLogs"]);
 
     return formatApiSuccess({
       credentialId,
@@ -156,7 +156,7 @@ export class CredentialService {
             error: error instanceof Error ? error.message : "UNKNOWN",
           },
         });
-      });
+      }, ["stores", "auditLogs"]);
 
       throw error;
     }
@@ -181,7 +181,7 @@ export class CredentialService {
           channelName: result.channelName,
         },
       });
-    });
+    }, ["stores", "auditLogs"]);
 
     return formatApiSuccess({
       storeId,

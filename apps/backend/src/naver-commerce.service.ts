@@ -1151,7 +1151,7 @@ export class NaverCommerceService {
       credential.lastTokenIssuedAt = issuedAtIso;
       credential.lastTokenExpiresAt = expiresAtIso;
       credential.updatedAt = issuedAtIso;
-    });
+    }, ["commerceCredentials"]);
   }
 
   private buildCacheKey(store: Store, credential: ResolvedCommerceCredential) {

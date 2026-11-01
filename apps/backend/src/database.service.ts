@@ -1377,7 +1377,12 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return result;
   }
 
-  async writeCommitted<T>(mutator: (draft: DatabaseShape) => T): Promise<T> {
+  async writeCommitted<T>(
+    mutator: (draft: DatabaseShape) => T,
+    // Scoped PostgreSQL callers must include every collection changed by the mutator.
+    // File storage still commits the complete snapshot atomically.
+    tableKeys?: ReadonlyArray<keyof DatabaseShape>,
+  ): Promise<T> {
     this.pendingWriteCount += 1;
 
     const operation = this.persistenceQueue
@@ -1385,7 +1390,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       .then(async () => {
         const draft = this.cloneSnapshot(this.database);
         const result = mutator(draft);
-        await this.persistSnapshotWithStatus(draft);
+        await this.persistSnapshotWithStatus(draft, tableKeys);
         this.database = draft;
         return result;
       });
@@ -1397,6 +1402,41 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       });
 
     return operation;
+  }
+
+  /** Serialize ad admissions with other writers; persist only new/changed ad rows. */
+  async commitAdUpload<T>(mutator: (draft: DatabaseShape) => T): Promise<T> {
+    if (this.storageMode !== "postgres") return this.writeCommitted(mutator);
+    return this.runPostgresCommitted(async () => {
+      const keys = ["adExcelUploads", "adCampaignDailyCosts", "adCampaignSignatures", "canonicalSalesUnits", "auditLogs"] as const;
+      const draft = { ...this.database };
+      const before = new Map<keyof DatabaseShape, Map<string, string>>();
+      for (const key of keys) {
+        before.set(key, new Map(this.database[key].map((row) => [row.id, hashPayload(row)])));
+        (draft[key] as unknown[]) = this.cloneSnapshot(this.database[key]);
+      }
+      const result = mutator(draft);
+      const client = await this.acquirePostgresClient();
+      try {
+        await client.query("BEGIN");
+        for (const key of keys) {
+          const rows = draft[key] as Array<{ id: string }>;
+          const nextIds = new Set(rows.map((row) => row.id));
+          // Upload admission is additive; existing records must never disappear.
+          if ([...before.get(key)!.keys()].some((id) => !nextIds.has(id))) throw new Error("AD_UPLOAD_CANNOT_DELETE_EXISTING_ROWS");
+          const changed = rows.filter((row) => before.get(key)!.get(row.id) !== hashPayload(row));
+          if (changed.length) await this.upsertTableRows(client, STORAGE_TABLES.find((table) => table.key === key)!, changed);
+        }
+        await client.query("COMMIT");
+        this.database = draft;
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
   }
 
   async saveDailyFakePurchaseCommitted(params: {
@@ -3076,10 +3116,13 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       });
   }
 
-  private async persistSnapshotWithStatus(snapshot: DatabaseShape): Promise<void> {
+  private async persistSnapshotWithStatus(
+    snapshot: DatabaseShape,
+    tableKeys?: ReadonlyArray<keyof DatabaseShape>,
+  ): Promise<void> {
     try {
       if (this.storageMode === "postgres") {
-        await this.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false });
+        await this.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false, tableKeys });
       } else {
         this.persistSnapshotToFile(snapshot);
       }
@@ -3157,7 +3200,10 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
   private async persistSnapshotToPostgres(
     snapshot: DatabaseShape,
-    options: { includeQueueOwnedTables?: boolean } = {},
+    options: {
+      includeQueueOwnedTables?: boolean;
+      tableKeys?: ReadonlyArray<keyof DatabaseShape>;
+    } = {},
   ) {
     const client = await this.acquirePostgresClient();
 
@@ -3172,6 +3218,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       );
 
       for (const table of STORAGE_TABLES) {
+        if (options.tableKeys && !options.tableKeys.includes(table.key)) continue;
         if (table.queueOwned && !options.includeQueueOwnedTables) {
           continue;
         }
