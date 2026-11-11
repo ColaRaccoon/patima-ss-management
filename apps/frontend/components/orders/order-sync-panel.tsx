@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Panel } from "@/components/shared/panel";
 import { formatDateTime } from "@/lib/format";
+import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 import { isActiveBatch, useOrderSync } from "./order-sync-provider";
 
 const statuses: Record<string, string> = {
@@ -40,6 +41,7 @@ export function OrderSyncPanel() {
   const sync = useOrderSync();
   const params = useSearchParams();
   const selectedId = params.get("batchId");
+  const selectedStoreId = params.get(STORE_ID_QUERY_KEY);
   const batch = selectedId
     ? sync.batches.find((item) => item.batchId === selectedId)
     : (sync.batches.find(isActiveBatch) ?? sync.batches[0]);
@@ -48,7 +50,7 @@ export function OrderSyncPanel() {
       title="주문 동기화"
       description="기본 조회 날짜는 한국시간 기준 어제입니다. 선택 날짜 동기화는 해당 날짜에 결제된 주문만 조회하고 갱신합니다."
       aside={
-        <Link href="/operations" className="button-shell button-ghost">
+        <Link href={buildHrefWithStore("/operations", null, selectedStoreId)} className="button-shell button-ghost">
           작업 이력
         </Link>
       }
@@ -183,7 +185,7 @@ export function OrderSyncPanel() {
                       주문 저장 완료 · 손익 집계 갱신 필요{" "}
                       <Link
                         className="underline"
-                        href={`/operations?operationId=${encodeURIComponent(item.operationId ?? "")}`}
+                        href={buildHrefWithStore("/operations", new URLSearchParams({ operationId: item.operationId ?? "" }), item.storeId)}
                       >
                         복구 작업 확인
                       </Link>
@@ -299,7 +301,7 @@ export function OrderSyncPanel() {
                 <Link
                   className="underline"
                   key={item.batchId}
-                  href={`/orders?batchId=${encodeURIComponent(item.batchId)}`}
+                  href={buildHrefWithStore("/orders", new URLSearchParams({ batchId: item.batchId }), selectedStoreId)}
                 >
                   {formatDateTime(item.createdAt)} · {statuses[item.status]}
                 </Link>
@@ -307,10 +309,13 @@ export function OrderSyncPanel() {
             </div>
           )}
         </div>
-      ) : (
-        <p className="text-sm text-ink/60">
-          동기화 작업을 조회하고 있습니다. 작업이 없으면 위 버튼으로 시작할 수
-          있습니다.
+      ) : sync.connectionError ? null : (
+        <p role="status" className="text-sm text-ink/60">
+          {sync.lastCheckedAt
+            ? selectedId
+              ? "선택한 동기화 작업을 찾을 수 없습니다. 작업 이력에서 확인해 주세요."
+              : "최근 동기화 작업이 없습니다. 위 버튼으로 주문 동기화를 시작할 수 있습니다."
+            : "동기화 작업을 조회하고 있습니다…"}
         </p>
       )}
     </Panel>

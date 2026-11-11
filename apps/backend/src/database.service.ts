@@ -1,4 +1,4 @@
-import { Injectable, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
 import {
   AdCampaignDailyCost,
   AdCampaignSignature,
@@ -81,6 +81,14 @@ interface DailyProfitSummaryRows {
 }
 
 interface DailyProfitSummaryReplacementResult<T> extends DailyProfitSummaryRows {
+  result: T;
+}
+
+interface AdUploadsCommitReplacement<T> {
+  uploads: DatabaseShape["adExcelUploads"];
+  signatures: DatabaseShape["adCampaignSignatures"];
+  rows: DatabaseShape["adCampaignDailyCosts"];
+  auditLogs: DatabaseShape["auditLogs"];
   result: T;
 }
 
@@ -285,9 +293,19 @@ const POSTGRES_JSONB_INDEXES: PostgresJsonbIndex[] = [
           ON ad_campaign_signatures ((payload->>'storeId'), (payload->>'lastSeenDate'), (payload->>'updatedAt'))`,
   },
   {
+    name: "idx_ad_signatures_store_campaign",
+    sql: `CREATE INDEX IF NOT EXISTS idx_ad_signatures_store_campaign
+          ON ad_campaign_signatures ((payload->>'storeId'), (BTRIM(payload->>'campaignId')))`,
+  },
+  {
     name: "idx_ad_costs_store_report_campaign",
     sql: `CREATE INDEX IF NOT EXISTS idx_ad_costs_store_report_campaign
           ON ad_campaign_daily_costs ((payload->>'storeId'), (payload->>'reportDate'), (payload->>'campaignId'))`,
+  },
+  {
+    name: "idx_ad_uploads_store_report",
+    sql: `CREATE INDEX IF NOT EXISTS idx_ad_uploads_store_report
+          ON ad_excel_uploads ((payload->>'storeId'), (payload->>'reportDate'))`,
   },
   {
     name: "idx_ad_costs_store_signature_upload_report",
@@ -1397,6 +1415,139 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       });
 
     return operation;
+  }
+
+  async commitAdUploadsCommitted<T>(params: {
+    storeId: string;
+    reportDate: string;
+    campaignIds: string[];
+    build: (working: DatabaseShape) => AdUploadsCommitReplacement<T>;
+  }): Promise<T> {
+    const campaignIds = Array.from(new Set(params.campaignIds.map((id) => id.trim()).filter(Boolean)));
+    const campaignIdSet = new Set(campaignIds);
+    const assertWritableStore = (store: DatabaseShape["stores"][number] | undefined) => {
+      if (!store) {
+        throw new NotFoundException({
+          success: false,
+          message: "스토어를 찾을 수 없습니다.",
+          errors: [{ field: "storeId", reason: "STORE_NOT_FOUND" }],
+        });
+      }
+      if (!store.isActive) {
+        throw new BadRequestException({
+          success: false,
+          message: "비활성화된 스토어에는 쓰기 작업을 할 수 없습니다.",
+          errors: [{ field: "storeId", reason: "STORE_INACTIVE" }],
+        });
+      }
+    };
+    const build = (working: DatabaseShape) => {
+      const replacement = params.build(working);
+      if (
+        replacement.uploads.some((row) => row.storeId !== params.storeId || row.reportDate !== params.reportDate) ||
+        replacement.rows.some((row) => row.storeId !== params.storeId || row.reportDate !== params.reportDate ||
+          !campaignIdSet.has(row.campaignId.trim())) ||
+        replacement.signatures.some((row) => row.storeId !== params.storeId ||
+          !campaignIdSet.has(row.campaignId?.trim() ?? "")) ||
+        replacement.auditLogs.some((row) => row.storeId !== params.storeId)
+      ) {
+        throw new Error("AD_UPLOAD_COMMIT_SCOPE_MISMATCH");
+      }
+      for (const rows of [replacement.uploads, replacement.signatures, replacement.rows, replacement.auditLogs]) {
+        if (new Set(rows.map((row) => row.id)).size !== rows.length || rows.some((row) => !row.id)) {
+          throw new Error("AD_UPLOAD_COMMIT_INVALID_IDS");
+        }
+      }
+      return replacement;
+    };
+    const mergeRows = <R extends { id: string }>(existing: R[], changed: R[]): R[] => {
+      if (changed.length === 0) return existing;
+      const changes = new Map(changed.map((row) => [row.id, this.cloneSnapshot(row)]));
+      const merged = existing.map((row) => {
+        const replacement = changes.get(row.id);
+        if (!replacement) return row;
+        changes.delete(row.id);
+        return replacement;
+      });
+      for (const row of changes.values()) merged.push(row);
+      return merged;
+    };
+    const publish = (database: DatabaseShape, replacement: AdUploadsCommitReplacement<T>) => {
+      database.adExcelUploads = mergeRows(database.adExcelUploads, replacement.uploads);
+      database.adCampaignSignatures = mergeRows(database.adCampaignSignatures, replacement.signatures);
+      database.adCampaignDailyCosts = mergeRows(database.adCampaignDailyCosts, replacement.rows);
+      database.auditLogs = mergeRows(database.auditLogs, replacement.auditLogs);
+    };
+
+    if (this.storageMode !== "postgres") {
+      return this.writeCommitted((draft) => {
+        assertWritableStore(draft.stores.find((store) => store.id === params.storeId));
+        const replacement = build(draft);
+        publish(draft, replacement);
+        return replacement.result;
+      });
+    }
+
+    return this.runPostgresCommitted(async () => {
+      const client = await this.acquirePostgresClient();
+      try {
+        await client.query("BEGIN");
+        const storeResult = await client.query<{ payload: DatabaseShape["stores"][number] }>(
+          "SELECT payload FROM stores WHERE id = $1 FOR UPDATE", [params.storeId],
+        );
+        assertWritableStore(storeResult.rows[0]?.payload);
+        const uploads = await client.query<{ payload: DatabaseShape["adExcelUploads"][number] }>(
+          "SELECT payload FROM ad_excel_uploads WHERE payload->>'storeId' = $1 AND payload->>'reportDate' = $2 FOR UPDATE",
+          [params.storeId, params.reportDate],
+        );
+        const rows = await client.query<{ payload: DatabaseShape["adCampaignDailyCosts"][number] }>(
+          "SELECT payload FROM ad_campaign_daily_costs WHERE payload->>'storeId' = $1 AND payload->>'reportDate' = $2 FOR UPDATE",
+          [params.storeId, params.reportDate],
+        );
+        const signatures = await client.query<{ payload: DatabaseShape["adCampaignSignatures"][number] }>(
+          "SELECT payload FROM ad_campaign_signatures WHERE payload->>'storeId' = $1 AND BTRIM(payload->>'campaignId') = ANY($2::text[]) FOR UPDATE",
+          [params.storeId, campaignIds],
+        );
+        // Only these four collections are writable. Other collections are read-only inputs to mapping.
+        const working: DatabaseShape = {
+          ...this.database,
+          adExcelUploads: uploads.rows.map((row) => this.cloneSnapshot(row.payload)),
+          adCampaignDailyCosts: rows.rows.map((row) => this.cloneSnapshot(row.payload)),
+          adCampaignSignatures: signatures.rows.map((row) => this.cloneSnapshot(row.payload)),
+          auditLogs: [],
+        };
+        const replacement = build(working);
+        await this.upsertTableRows(client, { key: "adExcelUploads", tableName: "ad_excel_uploads" }, replacement.uploads);
+        await this.upsertTableRows(client, { key: "adCampaignSignatures", tableName: "ad_campaign_signatures" }, replacement.signatures);
+        await this.upsertTableRows(client, { key: "adCampaignDailyCosts", tableName: "ad_campaign_daily_costs" }, replacement.rows);
+        await this.upsertTableRows(client, { key: "auditLogs", tableName: "audit_logs" }, replacement.auditLogs);
+        await client.query("COMMIT");
+        // Refresh the locked scope as well as our changes: another process may have added,
+        // edited or deleted same-day rows since this process loaded its memory snapshot.
+        const isSameDate = (row: { storeId: string; reportDate: string }) =>
+          row.storeId === params.storeId && row.reportDate === params.reportDate;
+        this.database.adExcelUploads = mergeRows(
+          this.database.adExcelUploads.filter((row) => !isSameDate(row)),
+          mergeRows(uploads.rows.map((row) => row.payload), replacement.uploads),
+        );
+        this.database.adCampaignDailyCosts = mergeRows(
+          this.database.adCampaignDailyCosts.filter((row) => !isSameDate(row)),
+          mergeRows(rows.rows.map((row) => row.payload), replacement.rows),
+        );
+        this.database.adCampaignSignatures = mergeRows(
+          this.database.adCampaignSignatures.filter((row) => row.storeId !== params.storeId ||
+            !campaignIdSet.has(row.campaignId?.trim() ?? "")),
+          mergeRows(signatures.rows.map((row) => row.payload), replacement.signatures),
+        );
+        this.database.auditLogs = mergeRows(this.database.auditLogs, replacement.auditLogs);
+        return replacement.result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
   }
 
   async saveDailyFakePurchaseCommitted(params: {
@@ -3042,7 +3193,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return [
       signature.storeId,
       signature.channel,
-      signature.campaignId ? `id:${signature.campaignId}` : `name:${signature.normalizedCampaignName}`,
+      signature.campaignId?.trim() ? `id:${signature.campaignId.trim()}` : `name:${signature.normalizedCampaignName}`,
     ].join("|");
   }
 
@@ -3050,7 +3201,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return [
       row.storeId,
       "NAVER_DA",
-      row.campaignId ? `id:${row.campaignId}` : `name:${row.normalizedCampaignName}`,
+      row.campaignId?.trim() ? `id:${row.campaignId.trim()}` : `name:${row.normalizedCampaignName}`,
     ].join("|");
   }
 

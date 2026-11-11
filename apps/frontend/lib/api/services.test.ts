@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { calculateNetProfitAfterFakePurchase } from "@patima/shared";
-import { getDashboardPageData, getProfitsPageData } from "./services";
+import { getDashboardPageData, getProfitsPageData, getOrdersPageData, getSalesUnitsPageData } from "./services";
+import { fetchApi } from "./client";
 import nextConfig from "../../next.config";
 import { PHASE_DEVELOPMENT_SERVER, PHASE_PRODUCTION_BUILD, PHASE_PRODUCTION_SERVER } from "next/constants";
 
@@ -121,4 +122,93 @@ test("empty stores do not request mock store profit data", async (context) => {
   assert.equal(page.primaryStore, null);
   assert.equal(page.fakePurchase, null);
   assert.equal(requests, 1);
+});
+
+test("orders request only the selected page of each list and retain total counts", async (context) => {
+  const requests: URL[] = [];
+  context.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    requests.push(url);
+    if (url.pathname.endsWith("/stores")) return Response.json({ success: true, data: [{ id: "s", isPrimary: true }] });
+    return Response.json({ success: true, data: {
+      items: [], page: Number(url.searchParams.get("page")), pageSize: 50,
+      totalCount: 451, totalPages: 10, hasNext: true,
+    } });
+  });
+  const result = await getOrdersPageData({ storeId: "s", orderPage: 3, signaturePage: 2, productName: "상품" });
+  assert.equal(result.orderPage.page, 3);
+  assert.equal(result.signaturePage.page, 2);
+  assert.equal(result.orderPage.totalCount, 451);
+  assert.equal(requests.length, 3, "does not eagerly download remaining signature pages");
+  for (const url of requests.slice(1)) assert.equal(url.searchParams.get("pageSize"), "50");
+  requests.length = 0;
+  const normalized = await getOrdersPageData({ orderPage: NaN, signaturePage: 0.5 });
+  assert.equal(normalized.orderPage.page, 1);
+  assert.equal(normalized.signaturePage.page, 1);
+});
+
+test("all-page readers honor hasNext even when totalPages is omitted", async (context) => {
+  const pages: number[] = [];
+  context.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith("/stores")) return Response.json({ success: true, data: [{ id: "s", isPrimary: true }] });
+    if (url.pathname.endsWith("/canonical-sales-units")) {
+      const page = Number(url.searchParams.get("page"));
+      pages.push(page);
+      return Response.json({ success: true, data: { items: [{ id: `unit-${page}` }], hasNext: page < 2 } });
+    }
+    return Response.json({ success: true, data: [] });
+  });
+  const result = await getSalesUnitsPageData();
+  assert.deepEqual(pages, [1, 2]);
+  assert.equal(result.salesUnits.length, 2);
+});
+
+test("orders recover a stale page URL by fetching the last available page once", async (context) => {
+  const requestedPages: number[] = [];
+  context.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith("/stores")) return Response.json({ success: true, data: [{ id: "s", isPrimary: true }] });
+    const page = Number(url.searchParams.get("page"));
+    if (url.pathname.endsWith("/order-items")) requestedPages.push(page);
+    return Response.json({ success: true, data: {
+      items: page === 2 ? [{ id: "last-order" }] : [], page, pageSize: 50,
+      totalCount: 60, totalPages: 2, hasNext: page < 2,
+    } });
+  });
+  const result = await getOrdersPageData({ orderPage: 10 });
+  assert.deepEqual(requestedPages, [10, 2]);
+  assert.equal(result.orderPage.page, 2);
+  assert.equal(result.orderItems[0].id, "last-order");
+});
+
+test("empty pages with hasNext fail instead of silently truncating or looping", async (context) => {
+  context.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    return Response.json({ success: true, data: url.pathname.endsWith("/stores")
+      ? [{ id: "s", isPrimary: true }]
+      : { items: [], hasNext: true } });
+  });
+  await assert.rejects(() => getSalesUnitsPageData(), /페이지 응답/);
+});
+
+test("management API errors remain errors unless sample fallback is explicitly enabled", async (context) => {
+  const previous = process.env.API_ALLOW_MOCK_FALLBACK;
+  try {
+    delete process.env.API_ALLOW_MOCK_FALLBACK;
+    context.mock.method(globalThis, "fetch", async () => Response.json({ message: "서버 연결 확인" }, { status: 503 }));
+    await assert.rejects(() => getOrdersPageData(), /서버 연결 확인/);
+    await assert.rejects(() => fetchApi({ label: "test", path: "/test", fallback: [] }), /서버 연결 확인/);
+    process.env.API_ALLOW_MOCK_FALLBACK = "true";
+    const fallback = await fetchApi({ label: "test", path: "/test", fallback: [] });
+    assert.equal(fallback.source, "mock");
+  } finally {
+    if (previous === undefined) delete process.env.API_ALLOW_MOCK_FALLBACK;
+    else process.env.API_ALLOW_MOCK_FALLBACK = previous;
+  }
+});
+
+test("HTTP 200 with a failed envelope and no data is still an error", async (context) => {
+  context.mock.method(globalThis, "fetch", async () => Response.json({ success: false, message: "잘못된 요청" }));
+  await assert.rejects(() => fetchApi({ label: "test", path: "/test" }), /잘못된 요청/);
 });

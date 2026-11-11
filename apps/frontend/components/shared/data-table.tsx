@@ -1,3 +1,5 @@
+"use client";
+
 import { cn } from "@/lib/cn";
 
 export interface DataTableColumn<T> {
@@ -34,10 +36,10 @@ export function DataTable<T>({
         {caption ? (
           <caption className="sr-only">{caption}</caption>
         ) : null}
-        <thead className="sticky top-0 z-20 bg-[var(--bg)]">
+        <thead className="sticky top-0 z-10 bg-[var(--bg)]">
           <tr className="border-b border-ink/10 text-xs tracking-tight text-ink/70">
             {columns.map((column) => (
-              <th key={column.key} className={cn("px-3 py-3 font-medium", column.className)}>
+              <th key={column.key} scope="col" className={cn("px-3 py-3 font-medium", column.className)}>
                 {column.title}
               </th>
             ))}
@@ -64,12 +66,27 @@ export function DataTable<T>({
                 <tr
                   key={rowKey}
                   className={cn(
-                    "border-b border-ink/8 text-sm text-ink transition cursor-pointer",
+                    "border-b border-ink/8 text-sm text-ink transition",
+                    onRowClick && "cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--accent)]",
                     isSelected
                       ? "bg-[rgba(201,106,74,0.08)] border-l-4 border-l-[var(--accent)]"
                       : "hover:bg-white/60",
                   )}
-                  onClick={() => onRowClick?.(row)}
+                  tabIndex={onRowClick ? 0 : undefined}
+                  aria-selected={onRowClick ? isSelected : undefined}
+                  onClick={onRowClick ? (event) => {
+                    if (event.defaultPrevented) return;
+                    const target = event.target as Element;
+                    if (target.closest("a,button,input,select,textarea,summary,[role='button'],[role='link'],[contenteditable='true']")) return;
+                    onRowClick(row);
+                  } : undefined}
+                  onKeyDown={onRowClick ? (event) => {
+                    if (event.target !== event.currentTarget) return;
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onRowClick(row);
+                    }
+                  } : undefined}
                 >
                   {columns.map((column) => (
                     <td

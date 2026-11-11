@@ -1,7 +1,7 @@
 import type { PaginationResult } from "@patima/shared";
 
-const DEFAULT_PAGE_SIZE = 50;
-const MAX_PAGE_SIZE = 200;
+export const DEFAULT_PAGE_SIZE = 50;
+export const MAX_PAGE_SIZE = 200;
 const CONDITION_PARAM_TOKEN = "{param}";
 
 export interface SqlQueryParts {
@@ -33,10 +33,15 @@ export const normalizePagination = (
   page = 1,
   pageSize = DEFAULT_PAGE_SIZE,
 ): NormalizedPagination => {
-  const normalizedPage = Math.max(1, page);
   const normalizedPageSize = Math.min(
     MAX_PAGE_SIZE,
-    Math.max(1, pageSize),
+    Math.max(1, Number.isFinite(pageSize) ? Math.floor(pageSize) : DEFAULT_PAGE_SIZE),
+  );
+  // Keep SQL offsets and in-memory slices finite, integral and precisely representable.
+  const maxPage = Math.floor(Number.MAX_SAFE_INTEGER / normalizedPageSize);
+  const normalizedPage = Math.min(
+    maxPage,
+    Math.max(1, Number.isFinite(page) ? Math.floor(page) : 1),
   );
 
   return {

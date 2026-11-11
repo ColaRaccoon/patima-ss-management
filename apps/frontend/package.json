@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --tsconfig tsconfig.json --test lib/api/services.test.ts"
+    "test": "tsx --tsconfig tsconfig.json --test lib/*.test.ts lib/api/*.test.ts"
   },
   "dependencies": {
     "@patima/shared": "0.1.0",

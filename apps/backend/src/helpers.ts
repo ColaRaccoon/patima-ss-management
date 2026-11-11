@@ -24,9 +24,9 @@ import {
 } from "@patima/shared";
 import { BadRequestException, NotFoundException } from "@nestjs/common";
 import { v4 as uuid } from "uuid";
+import { buildPaginationResult, DEFAULT_PAGE_SIZE, normalizePagination } from "./query-builders";
 
-export const DEFAULT_PAGE_SIZE = 50;
-export const MAX_PAGE_SIZE = 200;
+export { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "./query-builders";
 export const KST_TIMEZONE = "Asia/Seoul";
 
 export const nowIso = () => new Date().toISOString();
@@ -212,21 +212,9 @@ export const paginate = <T>(
   page = 1,
   pageSize = DEFAULT_PAGE_SIZE,
 ): PaginationResult<T> => {
-  const normalizedPage = Math.max(1, page);
-  const normalizedPageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, pageSize));
-  const totalCount = items.length;
-  const totalPages = Math.max(1, Math.ceil(totalCount / normalizedPageSize));
-  const start = (normalizedPage - 1) * normalizedPageSize;
-  const pagedItems = items.slice(start, start + normalizedPageSize);
-
-  return {
-    page: normalizedPage,
-    pageSize: normalizedPageSize,
-    totalCount,
-    totalPages,
-    hasNext: normalizedPage < totalPages,
-    items: pagedItems,
-  };
+  const pagination = normalizePagination(page, pageSize);
+  const pagedItems = items.slice(pagination.offset, pagination.offset + pagination.limit);
+  return buildPaginationResult(pagedItems, items.length, pagination);
 };
 
 export const hashJson = (value: unknown): string =>

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
 import {
   BarChart3,
@@ -9,10 +10,12 @@ import {
   FolderSync,
   LayoutDashboard,
   Map,
+  Menu,
   Receipt,
   Settings2,
   Store,
   Upload,
+  X,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
@@ -33,25 +36,44 @@ export function SidebarNav() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const selectedStoreId = searchParams.get(STORE_ID_QUERY_KEY);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    setIsMenuOpen(false);
+  }, [pathname, selectedStoreId]);
   const hrefWithStore = (href: string) =>
     buildHrefWithStore(href, null, selectedStoreId);
 
   return (
-    <aside className="border-b border-ink/10 bg-ink text-white lg:sticky lg:top-0 lg:h-screen lg:border-b-0 lg:border-r lg:border-r-white/10">
-      <div className="flex h-full flex-col px-4 py-5 sm:px-6">
-        <div className="mb-6 flex items-center gap-3 rounded-3xl border border-white/10 bg-white/5 px-4 py-4">
-          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-coral/20 text-coral">
-            <FolderSync className="h-6 w-6" />
-          </div>
-          <div>
-            <p className="text-xs uppercase tracking-wider text-white/55">
-              내부 관리 콘솔
-            </p>
-            <h1 className="mt-1 text-lg font-semibold">Patima Naver SS</h1>
-          </div>
+    <aside
+      className="border-b border-ink/10 bg-ink text-white lg:sticky lg:top-0 lg:h-screen lg:overflow-y-auto lg:border-b-0 lg:border-r lg:border-r-white/10"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && isMenuOpen) {
+          setIsMenuOpen(false);
+          menuButton.current?.focus();
+        }
+      }}
+    >
+      <div className="flex h-full flex-col px-4 py-3 lg:py-5">
+        <div className="flex items-center justify-between gap-3 lg:mb-6 lg:px-2">
+          <Link href={hrefWithStore("/")} onClick={() => setIsMenuOpen(false)} className="flex min-w-0 items-center gap-2 rounded-lg py-2 font-semibold">
+            <FolderSync aria-hidden="true" className="h-5 w-5 shrink-0 text-coral" />
+            <span>Patima Naver SS</span>
+          </Link>
+          <button
+            ref={menuButton}
+            type="button"
+            aria-expanded={isMenuOpen}
+            aria-controls="primary-navigation"
+            aria-label={isMenuOpen ? "메뉴 닫기" : "메뉴 열기"}
+            className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/20 lg:hidden"
+            onClick={() => setIsMenuOpen((current) => !current)}
+          >
+            {isMenuOpen ? <X aria-hidden="true" className="h-5 w-5" /> : <Menu aria-hidden="true" className="h-5 w-5" />}
+          </button>
         </div>
 
-        <nav className="space-y-1">
+        <nav id="primary-navigation" aria-label="주요 메뉴" className={cn("mt-3 gap-1 sm:grid-cols-3 lg:mt-0 lg:flex lg:flex-col", isMenuOpen ? "grid grid-cols-2" : "hidden")}>
           {navItems.map(({ href, label, icon: Icon }) => {
             const active =
               href === "/" ? pathname === href : pathname.startsWith(href);
@@ -60,6 +82,8 @@ export function SidebarNav() {
               <Link
                 key={href}
                 href={hrefWithStore(href)}
+                aria-current={active ? "page" : undefined}
+                onClick={() => setIsMenuOpen(false)}
                 className={cn(
                   "flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-medium transition",
                   active
@@ -67,22 +91,13 @@ export function SidebarNav() {
                     : "text-white/72 hover:bg-white/8 hover:text-white",
                 )}
               >
-                <Icon className="h-4 w-4" />
+                <Icon aria-hidden="true" className="h-4 w-4 shrink-0" />
                 <span>{label}</span>
               </Link>
             );
           })}
         </nav>
 
-        <div className="mt-auto rounded-3xl border border-white/10 bg-white/5 p-4">
-          <p className="text-xs uppercase tracking-wider text-white/45">
-            MVP Principle
-          </p>
-          <p className="mt-3 text-sm leading-6 text-white/72">
-            조회보다 일관성, 자동화보다 수동 확정, 저장보다 재현 가능성을
-            우선하는 운영 툴 UI입니다.
-          </p>
-        </div>
       </div>
     </aside>
   );

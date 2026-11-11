@@ -7,6 +7,7 @@ import { createSourceSignature, normalizeText, DEFAULT_DELIVERY_UNIT_COST } from
 import type {
   AdCampaignDailyCost,
   AdCampaignSignature,
+  CanonicalSalesUnit,
   OperationRecord,
   OperationType,
   OrderItem,
@@ -21,6 +22,8 @@ import {
   getAdMappingOverride,
   ensureAdCampaignSignaturesForStore,
   recalculateAdCampaignSignaturesForStore,
+  recalculateAdMappingsForStore,
+  getRuleSnapshotHash,
 } from "./ad-mapping-engine";
 import { AD_UPLOAD_REQUIRED_HEADERS, AdsService } from "./ads.service";
 import { DatabaseService, POSTGRES_UPSERT_BATCH_SIZE, hashPayload, stableStringify } from "./database.service";
@@ -60,6 +63,8 @@ import { ProfitService } from "./profit.service";
 import { ProfitSummaryService, PROFIT_CALCULATION_VERSION } from "./profit-summary.service";
 import { runProfitRegressionTests } from "./profit-regression-tests";
 import { runStartupRegressionTests } from "./startup-regression-tests";
+import { runAdUploadPersistenceTests } from "./ad-upload-persistence-tests";
+import { runAdMappingPerformanceTests } from "./ad-mapping-performance-tests";
 import {
   DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS,
   getKstRetentionCutoffDate,
@@ -71,6 +76,7 @@ import {
   resolveOrderSignatureAutoMapping,
 } from "./sales-unit-auto-mapper";
 import { SalesUnitService } from "./sales-unit.service";
+import { CampaignMappingService } from "./campaign-mapping.service";
 import { isMeaningfulName, extractNameFromOptionInfo, enrichSignatureDisplayName } from "./signature-enrichment";
 import { buildPaginationResult, createSqlBuilder, normalizePagination } from "./query-builders";
 
@@ -145,6 +151,7 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   createCanonicalSalesUnitCommittedCalls: 0,
   saveOrderManualMappingsCommittedCalls: 0,
   saveAdCampaignMappingsCommittedCalls: 0,
+  commitAdUploadsCommittedCalls: 0,
   replaceDailyProfitSummariesCommittedCalls: 0,
   removeDailyProfitSummariesCommittedCalls: 0,
   getStorageMode() {
@@ -165,6 +172,48 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   },
   async commitOrderSync(mutator: (draft: typeof database) => unknown) {
     return this.writeCommitted(mutator);
+  },
+  async commitAdUploadsCommitted<T>(params: {
+    storeId: string;
+    reportDate: string;
+    campaignIds: string[];
+    build: (draft: typeof database) => {
+      uploads: typeof database.adExcelUploads;
+      signatures: typeof database.adCampaignSignatures;
+      rows: typeof database.adCampaignDailyCosts;
+      auditLogs: typeof database.auditLogs;
+      result: T;
+    };
+  }): Promise<T> {
+    this.commitAdUploadsCommittedCalls += 1;
+    const apply = (draft: typeof database): T => {
+      const store = draft.stores.find((item) => item.id === params.storeId);
+      if (!store) throw new Error("STORE_NOT_FOUND");
+      if (!store.isActive) throw new Error("STORE_INACTIVE");
+      const replacement = params.build(draft);
+      const merge = <R extends { id: string }>(existing: R[], changed: R[]) => {
+        const positions = new Map(existing.map((item, index) => [item.id, index]));
+        for (const item of changed) {
+          const index = positions.get(item.id);
+          if (index === undefined) {
+            positions.set(item.id, existing.length);
+            existing.push(item);
+          } else {
+            existing[index] = item;
+          }
+        }
+      };
+      merge(draft.adExcelUploads, replacement.uploads);
+      merge(draft.adCampaignSignatures, replacement.signatures);
+      merge(draft.adCampaignDailyCosts, replacement.rows);
+      merge(draft.auditLogs, replacement.auditLogs);
+      return replacement.result;
+    };
+    if (this.storageMode !== "postgres") return this.writeCommitted(apply) as Promise<T>;
+    const draft = this.getSnapshot();
+    const result = apply(draft);
+    this.database = draft;
+    return result;
   },
   async saveDailyFakePurchaseCommitted(params: Parameters<DatabaseService["saveDailyFakePurchaseCommitted"]>[0]) {
     return this.writeCommitted((draft) => {
@@ -766,6 +815,7 @@ const createAuditLogServiceDouble = (auditCalls: Array<Record<string, unknown>> 
 
 const createAdsServiceHarness = (params?: { withProfitSummaryService?: boolean }) => {
   const databaseService = createMemoryDatabaseService();
+  databaseService.database.stores.push(createStoreRecord("store-1", "Main Store"));
   const profitSummaryService = params?.withProfitSummaryService
     ? new ProfitSummaryService(databaseService as never)
     : undefined;
@@ -1290,6 +1340,31 @@ run("query builders normalize pagination and keep user values in params", () => 
   assert.equal(result.page, 1);
   assert.equal(result.pageSize, 200);
   assert.equal(result.totalPages, 3);
+});
+
+run("file and SQL pagination agree for fractional and non-finite inputs", () => {
+  const items = Array.from({ length: 120 }, (_, index) => index);
+  for (const [page, pageSize, expectedPage, expectedPageSize] of [
+    [2.9, 10.9, 2, 10],
+    [Number.NaN, Number.NaN, 1, 50],
+    [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1, 50],
+    [-4, 0, 1, 1],
+    [1, 999, 1, 200],
+  ]) {
+    const pagination = normalizePagination(page, pageSize);
+    const result = paginate(items, page, pageSize);
+    assert.equal(result.page, expectedPage);
+    assert.equal(result.pageSize, expectedPageSize);
+    assert.deepEqual(result, buildPaginationResult(
+      items.slice(pagination.offset, pagination.offset + pagination.limit),
+      items.length,
+      pagination,
+    ));
+    assert.equal(result.items[0], (expectedPage - 1) * expectedPageSize);
+  }
+  const hugePage = normalizePagination(Number.MAX_VALUE, 200);
+  assert.equal(Number.isSafeInteger(hugePage.offset), true);
+  assert.equal(Number.isSafeInteger(hugePage.offset + hugePage.limit), true);
 });
 
 runAsync("DatabaseService queryOperations uses PostgreSQL count, page, and bound params", async () => {
@@ -3730,6 +3805,115 @@ run("evaluateAdMapping falls back to alias matching without a campaign rule", ()
   assert.equal(result.mappingReason, "RULE_MATCHED");
 });
 
+run("ad aliases include groups and deduplicate children by their active parent", () => {
+  const database = createEmptyDatabase();
+  const group = Object.assign(createSalesUnit("group", "넥워머 그룹", ["넥워머"]), { isGroup: true }) as CanonicalSalesUnit;
+  const child = Object.assign(createSalesUnit("child", "넥워머 단품", ["넥워머", "목토시"]), { parentSalesUnitId: "group" });
+  database.canonicalSalesUnits.push(group, child);
+  for (const campaign of ["모바일피드_넥워머", "모바일피드_목토시"]) {
+    const result = evaluateAdMapping(database, "store-1", normalizeText(campaign));
+    assert.equal(result.canonicalSalesUnitId, "group");
+    assert.equal(result.matchedRuleCount, 1);
+  }
+  // 주문은 그룹에 직접 매핑하지 않는다.
+  database.orderSourceSignatures.push(createOrderSourceSignature("sig-order", "넥워머"));
+  recalculateOrderMappingsForStore(database, "store-1");
+  assert.equal(database.orderSourceSignatures[0].canonicalSalesUnitId, "child");
+  const originalHash = getRuleSnapshotHash(database, "store-1");
+  group.normalizedMatchAliases.push("방한");
+  assert.notEqual(getRuleSnapshotHash(database, "store-1"), originalHash);
+  group.isActive = false;
+  assert.equal(evaluateAdMapping(database, "store-1", "넥워머").mappingReason, "NO_RULE");
+});
+
+run("group aliases still conflict with distinct active targets and respect store boundaries", () => {
+  const database = createEmptyDatabase();
+  database.canonicalSalesUnits.push(
+    Object.assign(createSalesUnit("group", "넥워머 그룹", ["넥워머"]), { isGroup: true }),
+    createSalesUnit("other", "별도 상품", ["넥워머"]),
+  );
+  assert.equal(evaluateAdMapping(database, "store-1", "넥워머").mappingReason, "MULTIPLE_RULES");
+  database.canonicalSalesUnits[1].storeId = "store-2";
+  assert.equal(evaluateAdMapping(database, "store-1", "넥워머").canonicalSalesUnitId, "group");
+});
+
+run("ad mapping uses configured aliases without hidden product or store-wide rules", () => {
+  const database = createEmptyDatabase();
+  database.canonicalSalesUnits.push(
+    createSalesUnit("calf", "카프슬리브", ["카프슬리브"]),
+    createSalesUnit("cool", "쿨토시", ["쿨토시"]),
+    Object.assign(createSalesUnit("store-wide", "스토어 전체 광고비", []), { isStoreLevel: true }),
+  );
+  assert.equal(evaluateAdMapping(database, "store-1", "모바일피드_카프슬리브").canonicalSalesUnitId, "calf");
+  for (const campaign of ["카탈로그", "키워드타겟", "무릎보호대", "인피니티가드"]) {
+    assert.equal(evaluateAdMapping(database, "store-1", campaign).mappingReason, "NO_RULE");
+  }
+  database.campaignMappings.push({
+    id: "explicit", storeId: "store-1", channel: "NAVER_DA", canonicalSalesUnitId: "cool",
+    campaignPattern: "카프슬리브", normalizedCampaignPattern: "카프슬리브", isActive: true,
+    deactivatedAt: null, createdAt: "2026-04-01", updatedAt: "2026-04-01",
+  });
+  assert.equal(evaluateAdMapping(database, "store-1", "모바일피드_카프슬리브").canonicalSalesUnitId, "cool");
+});
+
+run("store ad recalculation repairs all historical rows and preserves confirmed decisions", () => {
+  const database = createEmptyDatabase();
+  const group = Object.assign(createSalesUnit("group", "넥워머", ["넥워머"]), { isGroup: true }) as CanonicalSalesUnit;
+  database.canonicalSalesUnits.push(group, createSalesUnit("manual", "수동 상품", []));
+  const auto = createAdCampaignSignature({ id: "auto", campaignId: "auto", campaignName: "넥워머" }) as AdCampaignSignature;
+  const manual = createAdCampaignSignature({ id: "manual", campaignId: "manual", campaignName: "넥워머", canonicalSalesUnitId: "manual", mappingReason: "MANUAL_MAPPED" }) as AdCampaignSignature;
+  const intentional = createAdCampaignSignature({ id: "intentional", campaignId: "intentional", campaignName: "넥워머", mappingReason: "INTENTIONALLY_UNMAPPED", reasonNote: "공통 광고로 제외" }) as AdCampaignSignature;
+  database.adCampaignSignatures.push(auto, manual, intentional);
+  for (const signature of [auto, manual, intentional]) {
+    for (const reportDate of ["2026-04-01", "2026-10-29"]) {
+      const row = createConfirmedUploadRow({ uploadId: reportDate, reportDate, campaignId: signature.campaignId!, campaignName: "넥워머", canonicalSalesUnitId: null, totalCost: 1855 }) as AdCampaignDailyCost;
+      row.adCampaignSignatureId = signature.id;
+      database.adCampaignDailyCosts.push(row);
+    }
+  }
+  // 시그니처가 아직 없는 과거 업로드도 연결하여 재계산한다.
+  database.adCampaignDailyCosts.push(createConfirmedUploadRow({ uploadId: "legacy", reportDate: "2026-03-01", campaignId: "legacy", campaignName: "넥워머", canonicalSalesUnitId: null, totalCost: 100 }));
+  const confirmedAt = manual.confirmedAt;
+  recalculateAdMappingsForStore(database, "store-1");
+  for (const row of database.adCampaignDailyCosts) {
+    assert.equal(row.canonicalSalesUnitId, row.campaignId === "manual" ? "manual" : row.campaignId === "intentional" ? null : "group");
+    if (row.campaignId === "intentional") {
+      assert.equal(row.mappingReason, "INTENTIONALLY_UNMAPPED");
+      assert.equal(row.reasonNote, "공통 광고로 제외");
+    }
+  }
+  assert.equal(manual.confirmedAt, confirmedAt);
+  group.matchAliases = [];
+  group.normalizedMatchAliases = [];
+  recalculateAdMappingsForStore(database, "store-1");
+  assert.equal(auto.canonicalSalesUnitId, null);
+  assert.equal(manual.canonicalSalesUnitId, "manual");
+  assert.ok(database.adCampaignDailyCosts.filter(row => row.campaignId === "auto" || row.campaignId === "legacy").every(row => row.mappingReason === "NO_RULE" && row.canonicalSalesUnitId === null));
+});
+
+runAsync("campaign mapping startup repairs history and profit summaries without seeding product rules", async () => {
+  const database = createEmptyDatabase();
+  database.canonicalSalesUnits.push(createSalesUnit("calf", "쿨토시", []));
+  database.adCampaignDailyCosts.push(createConfirmedUploadRow({ uploadId: "history", reportDate: "2026-04-01", campaignId: "history", campaignName: "카프슬리브", canonicalSalesUnitId: "calf", totalCost: 100 }));
+  const refreshes: unknown[] = [];
+  const service = new CampaignMappingService(
+    { getSnapshot: () => database, writeCommitted: async (fn: (draft: typeof database) => void) => fn(database) } as never,
+    {} as never,
+    { registerRetryExecutor: () => {} } as never,
+    {} as never,
+    { ensureStoreLevelSalesUnit: async () => {} } as never,
+    { refreshStoreDateListBestEffort: async (params: unknown) => { refreshes.push(params); } } as never,
+  );
+  await service.onModuleInit();
+  assert.equal(refreshes.length, 0);
+  // PostgreSQL finishes loading after the concurrent module initialization hooks.
+  database.stores.push({ id: "store-1" } as never);
+  await service.onApplicationBootstrap();
+  assert.equal(database.campaignMappings.length, 0);
+  assert.equal(database.adCampaignDailyCosts[0].canonicalSalesUnitId, null);
+  assert.deepEqual(refreshes, [{ storeId: "store-1", dates: ["2026-04-01"], reason: "MAPPING_CHANGE" }]);
+});
+
 run("evaluateAdMapping returns conflict when multiple aliases match", () => {
   const database = createEmptyDatabase();
   database.canonicalSalesUnits.push(
@@ -5664,7 +5848,6 @@ runAsync("AdsService recalculates daily profit summaries after confirmed upload 
   const date = "2026-04-03";
 
   databaseService.write((draft) => {
-    draft.stores.push(createStoreRecord("store-1", "Main Store"));
     draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha"]));
   });
 
@@ -5717,6 +5900,107 @@ runAsync("AdsService confirms two same-date uploads and sums ad cost across acti
 
   assert.equal(activeConfirmedUploads.length, 2);
   assert.equal(summary.totalAdCost, 200);
+});
+
+runAsync("AdsService batch upload commits valid files once and refreshes the shared date once", async () => {
+  for (const storageMode of ["file", "postgres"] as const) {
+    const { databaseService, adsService, profitSummaryService } = createAdsServiceHarness({ withProfitSummaryService: true });
+    databaseService.storageMode = storageMode;
+    const date = "2026-04-03";
+    const refreshCalls: Array<{ storeId: string; dateFrom: string; dateTo: string; reason: string }> = [];
+    const originalRefresh = profitSummaryService!.refreshStoreDatesBestEffort.bind(profitSummaryService);
+    profitSummaryService!.refreshStoreDatesBestEffort = ((params) => {
+      refreshCalls.push({ ...params });
+      return originalRefresh(params);
+    }) as ProfitSummaryService["refreshStoreDatesBestEffort"];
+    databaseService.write((draft) => {
+      draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Alpha Unit", ["alpha", "beta"]));
+      draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "batch-existing", reportDate: date }));
+      draft.adCampaignDailyCosts.push(createConfirmedUploadRow({
+        uploadId: "batch-existing", reportDate: date, campaignId: "cmp-existing",
+        campaignName: "alpha existing", canonicalSalesUnitId: "sales-1", totalCost: 55,
+      }));
+    });
+    const previousRow = databaseService.getSnapshot().adCampaignDailyCosts[0];
+    const file = (name: string, campaignId: string, totalCost: number) => Object.assign(
+      createAdUploadFile(date, [{ campaignId, campaignName: "alpha launch", totalCost }]) as Express.Multer.File,
+      { originalname: name },
+    );
+    const response = await adsService.previewUploads("store-1", date, [
+      file("valid-first.xlsx", "cmp-batch-a", 120),
+      { originalname: "wrong-format.csv", buffer: Buffer.from("invalid") } as Express.Multer.File,
+      file("duplicate-in-batch.xlsx", "  cmp-batch-a  ", 999),
+      file("valid-last.xlsx", "cmp-batch-b", 80),
+      file("existing-campaign.xlsx", " cmp-existing ", 999),
+      createAdUploadFile(date, [
+        { campaignId: "cmp-in-file", campaignName: "alpha duplicate", totalCost: 999 },
+        { campaignId: " cmp-in-file ", campaignName: "beta duplicate", totalCost: 999 },
+      ]),
+    ]);
+    assert.equal(response.data.confirmedFileCount, 2);
+    assert.deepEqual(response.data.results.map((result) => [result.index, result.success]), [
+      [0, true], [1, false], [2, false], [3, true], [4, false], [5, false],
+    ]);
+    assert.deepEqual(response.data.results.filter((result) => result.success).map((result) => result.fileName), [
+      "valid-first.xlsx", "valid-last.xlsx",
+    ]);
+    assert.ok(response.data.results.filter((result) => !result.success).every((result) => result.message));
+    assert.equal(databaseService.commitAdUploadsCommittedCalls, 1);
+    assert.equal(databaseService.writeCommittedCalls, storageMode === "file" ? 2 : 0, "file mode writes the uploads and the summary once each");
+    assert.deepEqual(refreshCalls, [{ storeId: "store-1", dateFrom: date, dateTo: date, reason: "AD_UPLOAD" }]);
+    assert.equal(databaseService.replaceDailyProfitSummariesCommittedCalls, storageMode === "postgres" ? 1 : 0);
+
+    const snapshot = databaseService.getSnapshot();
+    assert.equal(snapshot.adExcelUploads.length, 3);
+    assert.equal(snapshot.adCampaignDailyCosts.length, 3);
+    assert.deepEqual(snapshot.adCampaignDailyCosts.find((row: AdCampaignDailyCost) => row.id === previousRow.id), previousRow);
+    assert.deepEqual(snapshot.adCampaignDailyCosts.map((row: AdCampaignDailyCost) => row.campaignId).sort(), [
+      "cmp-batch-a", "cmp-batch-b", "cmp-existing",
+    ]);
+    assert.equal(snapshot.dailyStoreSummaries[0].totalAdCost, 255);
+    assert.equal(snapshot.adCampaignSignatures.length, 2);
+    assert.equal(new Set(snapshot.adCampaignSignatures.map((signature: AdCampaignSignature) => signature.id)).size, 2);
+    for (const signature of snapshot.adCampaignSignatures) {
+      assert.equal(signature.usageCount, 1);
+      assert.equal(signature.canonicalSalesUnitId, "sales-1");
+      assert.equal(signature.mappingReason, "RULE_MATCHED");
+      assert.equal(signature.firstSeenDate, date);
+      assert.equal(signature.lastSeenDate, date);
+      const cost = snapshot.adCampaignDailyCosts.find((row: AdCampaignDailyCost) => row.adCampaignSignatureId === signature.id);
+      assert.ok(cost);
+      assert.equal(cost.canonicalSalesUnitId, signature.canonicalSalesUnitId);
+    }
+    assert.equal(snapshot.auditLogs.length, 2);
+    const savedUploadIds = response.data.results.filter((result) => result.success).map((result) => result.uploadId).sort();
+    assert.deepEqual(snapshot.auditLogs.map((audit: { targetId: string }) => audit.targetId).sort(), savedUploadIds);
+    assert.ok(snapshot.auditLogs.every((audit: { domain: string; action: string }) => audit.domain === "AD_UPLOAD" && audit.action === "CREATE"));
+  }
+});
+
+runAsync("AdsService batch upload performs no commit or summary refresh when every file fails parsing", async () => {
+  const { databaseService, adsService, profitSummaryService } = createAdsServiceHarness({ withProfitSummaryService: true });
+  let refreshCalls = 0;
+  profitSummaryService!.refreshStoreDatesBestEffort = (() => {
+    refreshCalls += 1;
+    return Promise.resolve(null);
+  }) as ProfitSummaryService["refreshStoreDatesBestEffort"];
+  const before = databaseService.getSnapshot();
+  const date = "2026-04-03";
+  const response = await adsService.previewUploads("store-1", date, [
+    { originalname: "wrong.csv", buffer: Buffer.from("wrong") } as Express.Multer.File,
+    createAdUploadFile(date, [
+      { campaignId: "duplicate", campaignName: "alpha", totalCost: 1 },
+      { campaignId: "duplicate", campaignName: "beta", totalCost: 2 },
+    ]),
+    createAdUploadFile("2026-04-04", [{ campaignId: "wrong-day", campaignName: "alpha", totalCost: 3 }]),
+  ]);
+  assert.equal(response.data.confirmedFileCount, 0);
+  assert.equal(response.data.results.length, 3);
+  assert.ok(response.data.results.every((result) => !result.success && result.message));
+  assert.equal(databaseService.commitAdUploadsCommittedCalls, 0);
+  assert.equal(databaseService.writeCommittedCalls, 0);
+  assert.equal(refreshCalls, 0);
+  assert.deepEqual(databaseService.getSnapshot(), before);
 });
 
 runAsync("AdsService rejects preview when campaignId overlaps an active confirmed upload on the same date", async () => {
@@ -6243,7 +6527,6 @@ runAsync("AdsService saveManualMappings skips profit summary refresh when affect
   }) as ProfitSummaryService["refreshStoreDateListBestEffort"];
 
   databaseService.write((draft) => {
-    draft.stores.push(createStoreRecord("store-1", "Main Store"));
     draft.canonicalSalesUnits.push(createSalesUnit("sales-1", "Signature Unit", ["signature"]));
     draft.adCampaignSignatures.push(
       createAdCampaignSignature({
@@ -6283,7 +6566,6 @@ runAsync("AdsService PostgreSQL mapping APIs bypass writeCommitted snapshot pers
   }) as ProfitSummaryService["refreshStoreDateListBestEffort"];
 
   databaseService.write((draft) => {
-    draft.stores.push(createStoreRecord("store-1", "Main Store"));
     draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-direct", reportDate: "2026-04-01" }));
     draft.adExcelUploads.push(createConfirmedUpload({ uploadId: "upload-direct-2", reportDate: "2026-04-02" }));
     draft.canonicalSalesUnits.push(
@@ -6972,6 +7254,8 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
 runAsync("Naver API schema, pagination, timeout and retry reliability", runNaverReliabilityTests);
 runAsync("Profit calculation regressions", runProfitRegressionTests);
 runAsync("Application startup regressions", runStartupRegressionTests);
+run("Ad mapping batch performance regressions", runAdMappingPerformanceTests);
+runAsync("Ad upload committed persistence regressions", runAdUploadPersistenceTests);
 
 void Promise.all(pendingAsyncTests).then(() => {
   console.log("All backend checks passed.");

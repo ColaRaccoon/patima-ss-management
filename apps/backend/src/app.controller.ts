@@ -13,9 +13,10 @@ import {
   Query,
   Res,
   UploadedFile,
+  UploadedFiles,
   UseInterceptors,
 } from "@nestjs/common";
-import { FileInterceptor } from "@nestjs/platform-express";
+import { FileInterceptor, FilesInterceptor } from "@nestjs/platform-express";
 import type { Response } from "express";
 import { AdsService } from "./ads.service";
 import { CampaignMappingService } from "./campaign-mapping.service";
@@ -496,6 +497,16 @@ export class AppController {
     @Body("reportDate") reportDate: string,
   ) {
     return this.adsService.previewUpload(storeId, reportDate, file);
+  }
+
+  @Post("ad-uploads/batch")
+  @UseInterceptors(FilesInterceptor("files", 10))
+  previewAdUploads(
+    @UploadedFiles() files: Express.Multer.File[],
+    @Body("storeId") storeId: string,
+    @Body("reportDate") reportDate: string,
+  ) {
+    return this.adsService.previewUploads(storeId, reportDate, files);
   }
 
   @Get("ad-uploads/:uploadId/preview-rows")

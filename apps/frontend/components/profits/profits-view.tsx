@@ -12,33 +12,26 @@ import { StatCard } from "@/components/shared/stat-card";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { readApiResponse } from "@/lib/api/browser";
 import type {
-  DailySalesUnitDetail,
   DailySalesUnitProfit,
   ProfitsPageData,
 } from "@/lib/api/types";
 import { formatCurrency, formatCurrencyWithSign, formatDate, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
 import { STORE_ID_QUERY_KEY } from "@/lib/store-selection";
+import { useProfitDetail } from "./use-profit-detail";
 
 interface ExpandedGroups {
   [groupId: string]: boolean;
 }
 
 export function ProfitsView({ data }: { data: ProfitsPageData }) {
+  return <StoreProfitsView key={`${data.primaryStore?.id ?? "no-store"}:${data.dateFrom}:${data.dateTo}`} data={data} />;
+}
+
+function StoreProfitsView({ data }: { data: ProfitsPageData }) {
   const router = useRouter();
-  const [selectedProfitKey, setSelectedProfitKey] = useState<string | null>(
-    data.selectedDetail
-      ? `${data.selectedDetail.canonicalSalesUnitId}-${data.selectedDetail.date}`
-      : data.profits[0]
-        ? `${data.profits[0].canonicalSalesUnitId}-${data.profits[0].date}`
-        : null,
-  );
-  const [selectedDetail, setSelectedDetail] = useState<DailySalesUnitDetail | null>(
-    data.selectedDetail,
-  );
+  const { selectedProfitKey, selectedDetail, detailError, isLoadingDetail, selectProfit, retryDetail } = useProfitDetail(data);
   const [selectedDate, setSelectedDate] = useState(data.dateTo);
-  const [detailError, setDetailError] = useState<string | null>(null);
-  const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
   const [expandedGroups, setExpandedGroups] = useState<ExpandedGroups>({});
   const [excludedSummaryExpanded, setExcludedSummaryExpanded] = useState(false);
@@ -62,25 +55,6 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
     setFakePurchaseError(null);
     setFakePurchaseNotice(null);
   }, [data.fakePurchase, data.dateTo]);
-
-  useEffect(() => {
-    if (
-      selectedProfitKey &&
-      data.profits.some((row) => `${row.canonicalSalesUnitId}-${row.date}` === selectedProfitKey)
-    ) {
-      return;
-    }
-
-    if (data.selectedDetail) {
-      setSelectedProfitKey(`${data.selectedDetail.canonicalSalesUnitId}-${data.selectedDetail.date}`);
-      setSelectedDetail(data.selectedDetail);
-      return;
-    }
-
-    if (data.profits[0]) {
-      setSelectedProfitKey(`${data.profits[0].canonicalSalesUnitId}-${data.profits[0].date}`);
-    }
-  }, [data.profits, data.selectedDetail, selectedProfitKey]);
 
   const applyDateFilter = (nextDate: string) => {
     const searchParams = new URLSearchParams();
@@ -380,36 +354,11 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
             const storeLevelRows = data.profits.filter((row) => row.isStoreLevel);
             const groupAndRegularRows = data.profits.filter((row) => !row.isStoreLevel && !row.parentSalesUnitId);
 
-            const handleRowClick = async (row: DailySalesUnitProfit & { _isChild?: boolean; _parentId?: string }) => {
+            const handleRowClick = (row: DailySalesUnitProfit & { _isChild?: boolean; _parentId?: string }) => {
               // 자식 행은 선택하지 않음
               if (row._isChild) return;
 
-              const rowKey = `${row.canonicalSalesUnitId}-${row.date}`;
-              if (rowKey === selectedProfitKey && selectedDetail?.date === row.date) {
-                return;
-              }
-
-              setSelectedProfitKey(rowKey);
-              setDetailError(null);
-              setIsLoadingDetail(true);
-              try {
-                const detail = await readApiResponse<DailySalesUnitDetail>(
-                  await fetch(
-                    `/api/profits/daily-sales-units/${row.canonicalSalesUnitId}?storeId=${data.primaryStore!.id}&date=${row.date}`,
-                    {
-                      cache: "no-store",
-                    },
-                  ),
-                  "손익 상세를 불러오지 못했습니다.",
-                );
-                setSelectedDetail(detail);
-              } catch (error) {
-                setDetailError(
-                  error instanceof Error ? error.message : "손익 상세를 불러오지 못했습니다.",
-                );
-              } finally {
-                setIsLoadingDetail(false);
-              }
+              selectProfit(row);
             };
 
             const renderExpandableTable = (rows: typeof data.profits, title: string) => {
@@ -448,6 +397,8 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                                   <button
                                     className="button-shell button-ghost p-1 text-xs shrink-0"
                                     type="button"
+                                    aria-label={`${row.displayName} 하위 판매단위 ${isGroupExpanded ? "접기" : "펼치기"}`}
+                                    aria-expanded={Boolean(isGroupExpanded)}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       setExpandedGroups((current) => ({
@@ -475,7 +426,7 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
                         key: "quantity",
                         title: "수량",
                         className: "text-right",
-                        render: (row) => (row.isStoreLevel || row.isGroup || row._isChild ? formatNumber(row.totalQuantity) : formatNumber(row.totalQuantity)),
+                        render: (row) => formatNumber(row.totalQuantity),
                       },
                       {
                         key: "revenue",
@@ -537,6 +488,9 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
 
             return (
               <>
+                {storeLevelRows.length === 0 && groupAndRegularRows.length === 0 ? (
+                  <EmptyState title="선택한 날짜의 손익 데이터가 없습니다." description="주문 동기화와 광고 업로드 상태를 확인하거나 다른 날짜를 선택해 주세요." />
+                ) : null}
                 {storeLevelRows.length > 0 && renderExpandableTable(storeLevelRows, "스토어 전체 광고비")}
                 {groupAndRegularRows.length > 0 && renderExpandableTable(groupAndRegularRows, "일자별 손익 행")}
               </>
@@ -599,13 +553,14 @@ export function ProfitsView({ data }: { data: ProfitsPageData }) {
 
           <Panel title="상세 미리보기">
             {detailError ? (
-              <div className="mb-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <div role="alert" className="mb-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
                 {detailError}
+                <button className="button-shell button-secondary mt-3" type="button" onClick={retryDetail}>다시 시도</button>
               </div>
             ) : null}
 
             {isLoadingDetail ? (
-              <div className="flex items-center justify-center py-12">
+              <div role="status" className="flex items-center justify-center py-12">
                 <p className="text-sm text-ink/60">상세를 불러오는 중...</p>
               </div>
             ) : selectedDetail ? (

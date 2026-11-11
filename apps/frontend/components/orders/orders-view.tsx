@@ -7,6 +7,7 @@ import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
 import { Panel } from "@/components/shared/panel";
+import { Pagination } from "@/components/shared/pagination";
 import { SourceBanner } from "@/components/shared/source-banner";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { OrderSyncPanel } from "./order-sync-panel";
@@ -31,6 +32,11 @@ const SALE_STATUS_OPTIONS = [
   "EXCHANGED",
   "UNKNOWN",
 ] as const;
+const STATUS_LABELS: Record<string, string> = {
+  ALL: "전체", SALE: "판매", CANCELED: "취소", CANCEL_REQUESTED: "취소 요청",
+  RETURNED: "반품", EXCHANGED: "교환", UNKNOWN: "확인 필요",
+  MAPPED: "매핑 완료", UNMAPPED: "미매핑", CONFLICT: "매핑 충돌",
+};
 
 export function OrdersView({ data }: { data: OrdersPageData }) {
   const router = useRouter();
@@ -64,9 +70,13 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
     data.primaryStore.id,
   );
 
-  const applyFilters = (nextFilters: OrdersPageFilters) => {
+  const applyFilters = (nextFilters: OrdersPageFilters, pages?: { orderPage: number; signaturePage: number }) => {
     const searchParams = new URLSearchParams();
     searchParams.set(STORE_ID_QUERY_KEY, data.primaryStore!.id);
+    if (pages) {
+      searchParams.set("orderPage", String(pages.orderPage));
+      searchParams.set("signaturePage", String(pages.signaturePage));
+    }
     Object.entries(nextFilters).forEach(([key, value]) => {
       if (!value || value === "ALL") {
         return;
@@ -79,6 +89,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
         searchParams.size > 0
           ? `/orders?${searchParams.toString()}`
           : "/orders",
+        { scroll: false },
       );
     });
   };
@@ -102,7 +113,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" aria-busy={isRefreshing}>
       <PageHeader
         eyebrow="Orders"
         title="주문 원본 데이터 검토"
@@ -120,7 +131,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
             <button
               className="button-shell button-secondary"
               type="button"
-              disabled={isBusy}
+              disabled={isBusy || !filters.dateFrom}
               onClick={() =>
                 void startOrderSync({
                   dateFrom: filters.dateFrom,
@@ -133,7 +144,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
             <button
               className="button-shell button-secondary"
               type="button"
-              disabled={isBusy}
+              disabled={isBusy || !filters.dateFrom}
               onClick={() => void startAllStoreOrderSync()}
             >
               전체 스토어 선택 날짜 동기화
@@ -151,7 +162,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
       <div className="grid gap-6">
         <Panel
           title="조회 필터"
-          description={`현재 선택 날짜 ${formatDate(filters.dateFrom)}`}
+          description={`조회 중인 날짜 ${formatDate(data.filters.dateFrom)} · 조건을 바꾼 뒤 필터 적용을 눌러 주세요.`}
         >
           <form
             className="space-y-4"
@@ -168,6 +179,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                 <input
                   className="input-shell"
                   type="date"
+                  required
                   value={filters.dateFrom}
                   onChange={(event) => {
                     setFilters((current) => ({
@@ -175,12 +187,6 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                       dateFrom: event.target.value,
                       dateTo: event.target.value,
                     }));
-                    const nextFilters = {
-                      ...filters,
-                      dateFrom: event.target.value,
-                      dateTo: event.target.value,
-                    };
-                    applyFilters(nextFilters);
                   }}
                 />
               </label>
@@ -218,7 +224,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               </label>
               <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">
-                  orderStatus
+                  주문 처리 상태
                 </span>
                 <input
                   className="input-shell"
@@ -234,7 +240,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               </label>
               <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">
-                  saleStatus
+                  판매 상태
                 </span>
                 <select
                   className="input-shell"
@@ -248,14 +254,14 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                 >
                   {SALE_STATUS_OPTIONS.map((option) => (
                     <option key={option} value={option}>
-                      {option}
+                      {STATUS_LABELS[option]}
                     </option>
                   ))}
                 </select>
               </label>
               <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">
-                  mappingStatus
+                  매핑 상태
                 </span>
                 <select
                   className="input-shell"
@@ -268,15 +274,15 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                     }))
                   }
                 >
-                  <option value="ALL">ALL</option>
-                  <option value="MAPPED">MAPPED</option>
-                  <option value="UNMAPPED">UNMAPPED</option>
-                  <option value="CONFLICT">CONFLICT</option>
+                  <option value="ALL">전체</option>
+                  <option value="MAPPED">매핑 완료</option>
+                  <option value="UNMAPPED">미매핑</option>
+                  <option value="CONFLICT">매핑 충돌</option>
                 </select>
               </label>
               <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">
-                  paymentDateStatus
+                  결제일 정보
                 </span>
                 <select
                   className="input-shell"
@@ -289,9 +295,9 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                     }))
                   }
                 >
-                  <option value="ALL">ALL</option>
-                  <option value="PRESENT">PRESENT</option>
-                  <option value="MISSING">MISSING</option>
+                  <option value="ALL">전체</option>
+                  <option value="PRESENT">결제일 있음</option>
+                  <option value="MISSING">결제일 없음</option>
                 </select>
               </label>
             </div>
@@ -300,14 +306,14 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               <button
                 className="button-shell button-primary"
                 type="submit"
-                disabled={isBusy}
+                disabled={isRefreshing}
               >
                 필터 적용
               </button>
               <button
                 className="button-shell button-ghost"
                 type="button"
-                disabled={isBusy}
+                disabled={isRefreshing}
                 onClick={() => {
                   const resetFilters: OrdersPageFilters = {
                     dateFrom: data.filters.dateFrom,
@@ -376,7 +382,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
               render: (row) => (
                 <div className="space-y-2">
                   <StatusBadge tone={toneForSaleStatus(row.saleStatus)}>
-                    {row.saleStatus}
+                    {STATUS_LABELS[row.saleStatus] ?? row.saleStatus}
                   </StatusBadge>
                   <p className="text-xs text-ink/55">{row.orderStatus}</p>
                 </div>
@@ -405,6 +411,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
           rows={data.orderItems}
           getRowKey={(row) => row.id}
         />
+        <Pagination page={data.orderPage} label="주문상품" pending={isRefreshing} onPageChange={(page) => applyFilters(data.filters, { orderPage: page, signaturePage: data.signaturePage.page })} />
       </Panel>
 
       <Panel
@@ -490,7 +497,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
                 <StatusBadge
                   tone={row.mappingStatus === "MAPPED" ? "success" : "warning"}
                 >
-                  {row.mappingStatus}
+                  {STATUS_LABELS[row.mappingStatus] ?? row.mappingStatus}
                 </StatusBadge>
               ),
             },
@@ -503,6 +510,7 @@ export function OrdersView({ data }: { data: OrdersPageData }) {
           rows={data.signatures}
           getRowKey={(row) => row.id}
         />
+        <Pagination page={data.signaturePage} label="원본 주문 조합" pending={isRefreshing} onPageChange={(page) => applyFilters(data.filters, { orderPage: data.orderPage.page, signaturePage: page })} />
       </Panel>
     </div>
   );

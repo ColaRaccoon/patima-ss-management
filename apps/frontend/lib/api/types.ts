@@ -427,7 +427,9 @@ export interface OrdersPageData {
   primaryStore: StoreListItem | null;
   filters: OrdersPageFilters;
   orderItems: OrderListItem[];
+  orderPage: PageMeta;
   signatures: OrderSourceSignatureListItem[];
+  signaturePage: PageMeta;
   latestOperation: OperationDetail | null;
   sources: SourceState[];
 }

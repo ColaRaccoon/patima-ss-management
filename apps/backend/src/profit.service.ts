@@ -357,7 +357,9 @@ export class ProfitService {
 
       const cell = sheet[cellAddress];
       if (cell?.t === "n") {
-        cell.z = "0";
+        // D1 contains the overall quantity, and column C contains the row quantities.
+        const isQuantity = cellAddress === "D1" || /^C\d+$/.test(cellAddress);
+        cell.z = isQuantity ? "0" : "#,##0";
       }
     });
   }
@@ -413,29 +415,48 @@ export class ProfitService {
       .filter((item) => item.storeId === storeId)
       .sort((left, right) => left.effectiveFrom.localeCompare(right.effectiveFrom));
 
-    const entryIndex = new Map<string, Map<string, SalesUnitCostSnapshotEntry>>();
-    snapshot.salesUnitCostSnapshotEntries
-      .filter((item) => item.storeId === storeId)
-      .forEach((entry) => {
-        const sub = entryIndex.get(entry.snapshotId) ?? new Map();
-        sub.set(entry.canonicalSalesUnitId, entry);
-        entryIndex.set(entry.snapshotId, sub);
-      });
+    const entryIndex = new Map<string, SalesUnitCostSnapshotEntry>();
+    for (const entry of snapshot.salesUnitCostSnapshotEntries) {
+      if (entry.storeId === storeId && entry.canonicalSalesUnitId === salesUnitId) {
+        entryIndex.set(entry.snapshotId, entry);
+      }
+    }
 
     const costSettingsByUnit = snapshots.map((snapshot) => ({
       snapshot,
-      entry: entryIndex.get(snapshot.id)?.get(salesUnitId) ?? null,
+      entry: entryIndex.get(snapshot.id) ?? null,
     }));
     const manualSettings = snapshot.salesUnitCostSettings.filter((item) =>
       item.storeId === storeId && item.canonicalSalesUnitId === salesUnitId);
 
-    const orderItems = snapshot.orderItems.filter(
-      (item) =>
-        item.storeId === storeId &&
-        item.canonicalSalesUnitId === salesUnitId &&
-        item.paymentDate === date &&
-        item.saleStatus === "SALE",
-    );
+    const orderItems: typeof snapshot.orderItems = [];
+    const excludedOrderStatusCounts = {
+      CANCELED: 0,
+      CANCEL_REQUESTED: 0,
+      RETURNED: 0,
+      EXCHANGED: 0,
+    };
+    for (const item of snapshot.orderItems) {
+      if (item.storeId !== storeId || item.paymentDate !== date) continue;
+      if (item.saleStatus === "SALE" && item.canonicalSalesUnitId === salesUnitId) {
+        orderItems.push(item);
+      } else if (
+        item.saleStatus === "CANCELED" || item.saleStatus === "CANCEL_REQUESTED" ||
+        item.saleStatus === "RETURNED" || item.saleStatus === "EXCHANGED"
+      ) {
+        excludedOrderStatusCounts[item.saleStatus] += 1;
+      }
+    }
+    const requestedOrderIds = new Set(orderItems.map((item) => item.orderId));
+    const externalOrderIds = new Map<string, string>();
+    if (requestedOrderIds.size > 0) {
+      for (const order of snapshot.orders) {
+        if (!requestedOrderIds.has(order.id)) continue;
+        externalOrderIds.set(order.id, order.externalOrderId);
+        requestedOrderIds.delete(order.id);
+        if (requestedOrderIds.size === 0) break;
+      }
+    }
     const adCampaigns = snapshot.adCampaignDailyCosts.filter(
       (item) =>
         item.storeId === storeId &&
@@ -460,12 +481,11 @@ export class ProfitService {
         channelCommission: 0,
       },
     );
+    const activeCostSetting = getCostSettingForDate(costSettingsByUnit, date, manualSettings);
     const fallbackFeeCostPortion = orderItems.reduce((total, item) => {
-      const costSetting = getCostSettingForDate(costSettingsByUnit, item.paymentDate, manualSettings);
-      const fee = calculateFee(item, costSetting);
+      const fee = calculateFee(item, activeCostSetting);
       return total + (fee.usedFallback ? fee.totalFeeCost : 0);
     }, 0);
-    const activeCostSetting = getCostSettingForDate(costSettingsByUnit, date, manualSettings);
     const excludedSummary = this.profitSummaryService?.getDashboardSummary(storeId, date) ??
       calculateDashboardSummary(snapshot, storeId, date);
     const deliverySummary = calculateStoreDeliverySummary(snapshot, storeId, date, date);
@@ -477,7 +497,7 @@ export class ProfitService {
       summary,
       orderItems: orderItems.map((item) => ({
         orderItemId: item.id,
-        orderId: snapshot.orders.find((order) => order.id === item.orderId)?.externalOrderId ?? item.orderId,
+        orderId: externalOrderIds.get(item.orderId) ?? item.orderId,
         orderStatus: item.orderStatus,
         saleStatus: item.saleStatus,
         quantity: item.quantity,
@@ -524,21 +544,7 @@ export class ProfitService {
         excludedUnmappedAdCost: excludedSummary.excludedUnmappedAdCost,
         excludedConflictAdCost: excludedSummary.excludedConflictAdCost,
         excludedIntentionalUnmappedAdCost: excludedSummary.excludedIntentionalUnmappedAdCost,
-        excludedOrderStatusCounts: {
-          CANCELED: snapshot.orderItems.filter(
-            (item) => item.storeId === storeId && item.paymentDate === date && item.saleStatus === "CANCELED",
-          ).length,
-          CANCEL_REQUESTED: snapshot.orderItems.filter(
-            (item) =>
-              item.storeId === storeId && item.paymentDate === date && item.saleStatus === "CANCEL_REQUESTED",
-          ).length,
-          RETURNED: snapshot.orderItems.filter(
-            (item) => item.storeId === storeId && item.paymentDate === date && item.saleStatus === "RETURNED",
-          ).length,
-          EXCHANGED: snapshot.orderItems.filter(
-            (item) => item.storeId === storeId && item.paymentDate === date && item.saleStatus === "EXCHANGED",
-          ).length,
-        },
+        excludedOrderStatusCounts,
       },
     });
   }

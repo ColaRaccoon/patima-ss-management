@@ -21,6 +21,20 @@ import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 
+const countPaymentDatesBefore = (dates: string[], boundary: string, includeBoundary = false) => {
+  let start = 0;
+  let end = dates.length;
+  while (start < end) {
+    const middle = start + Math.floor((end - start) / 2);
+    if (dates[middle] < boundary || (includeBoundary && dates[middle] === boundary)) {
+      start = middle + 1;
+    } else {
+      end = middle;
+    }
+  }
+  return start;
+};
+
 @Injectable()
 export class CostService {
   constructor(
@@ -33,19 +47,25 @@ export class CostService {
 
   list(storeId: string, canonicalSalesUnitId?: string) {
     const snapshot = this.databaseService.getSnapshot();
-    const items = snapshot.salesUnitCostSettings
-      .filter((item) => item.storeId === storeId)
-      .filter((item) => (canonicalSalesUnitId ? item.canonicalSalesUnitId === canonicalSalesUnitId : true))
-      .sort((left, right) => right.effectiveFrom.localeCompare(left.effectiveFrom))
+    const settings = snapshot.salesUnitCostSettings.filter((item) =>
+      item.storeId === storeId && (!canonicalSalesUnitId || item.canonicalSalesUnitId === canonicalSalesUnitId));
+    const datesByUnit = new Map<string, string[]>();
+    for (const setting of settings) datesByUnit.set(setting.canonicalSalesUnitId, []);
+    if (datesByUnit.size > 0) {
+      for (const orderItem of snapshot.orderItems) {
+        if (orderItem.storeId !== storeId || !orderItem.paymentDate || !orderItem.canonicalSalesUnitId) continue;
+        datesByUnit.get(orderItem.canonicalSalesUnitId)?.push(orderItem.paymentDate);
+      }
+      for (const dates of datesByUnit.values()) dates.sort();
+    }
+    const items = settings.sort((left, right) => right.effectiveFrom.localeCompare(left.effectiveFrom))
       .map((item) => {
-        const appliedOrderItemCount = snapshot.orderItems.filter(
-          (orderItem) =>
-            orderItem.storeId === storeId &&
-            orderItem.canonicalSalesUnitId === item.canonicalSalesUnitId &&
-            !!orderItem.paymentDate &&
-            orderItem.paymentDate >= item.effectiveFrom &&
-            (!item.effectiveTo || orderItem.paymentDate <= item.effectiveTo),
-        ).length;
+        const dates = datesByUnit.get(item.canonicalSalesUnitId)!;
+        const from = countPaymentDatesBefore(dates, item.effectiveFrom);
+        const to = item.effectiveTo
+          ? countPaymentDatesBefore(dates, item.effectiveTo, true)
+          : dates.length;
+        const appliedOrderItemCount = Math.max(0, to - from);
 
         return {
           ...item,

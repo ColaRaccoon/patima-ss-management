@@ -101,6 +101,30 @@ export const getActiveSalesUnitsForAutoMapping = (
     (item) => item.storeId === storeId && item.isActive && !item.isGroup && (item.normalizedMatchAliases ?? []).length > 0,
   );
 
+// 광고는 그룹에 귀속된다. 부모와 자식의 키워드가 함께 일치해도
+// 같은 광고 귀속 대상이면 후보 하나로 취급한다. 주문 매핑은 기존 정책을 유지한다.
+export const getActiveSalesUnitsForCampaignMapping = (
+  database: Pick<DatabaseShape, "canonicalSalesUnits">,
+  storeId: string,
+): CanonicalSalesUnit[] => {
+  const activeUnits = database.canonicalSalesUnits.filter((unit) => unit.storeId === storeId && unit.isActive);
+  const unitsById = new Map(activeUnits.map((unit) => [unit.id, unit]));
+  const targets = new Map<string, CanonicalSalesUnit>();
+  for (const unit of activeUnits) {
+    const target = unitsById.get(unit.parentSalesUnitId ?? unit.id);
+    if (!target || !unit.normalizedMatchAliases?.length) continue;
+    const existing = targets.get(target.id);
+    targets.set(target.id, {
+      ...target,
+      normalizedMatchAliases: Array.from(new Set([
+        ...(existing?.normalizedMatchAliases ?? []),
+        ...unit.normalizedMatchAliases,
+      ])),
+    });
+  }
+  return Array.from(targets.values());
+};
+
 export const getActiveSalesUnitsForIdMapping = (
   database: Pick<DatabaseShape, "canonicalSalesUnits">,
   storeId: string,

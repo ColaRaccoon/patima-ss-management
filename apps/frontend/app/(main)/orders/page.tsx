@@ -12,6 +12,8 @@ export default async function OrdersPage({
   const resolvedSearchParams = (await searchParams) ?? {};
   const data = await getOrdersPageData({
     storeId: readSearchParam(resolvedSearchParams.storeId),
+    orderPage: Number(readSearchParam(resolvedSearchParams.orderPage)),
+    signaturePage: Number(readSearchParam(resolvedSearchParams.signaturePage)),
     dateFrom: readSearchParam(resolvedSearchParams.dateFrom),
     dateTo: readSearchParam(resolvedSearchParams.dateTo),
     productName: readSearchParam(resolvedSearchParams.productName),

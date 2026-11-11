@@ -3,6 +3,7 @@ import { DatabaseService } from "./database.service";
 import {
   ensureNoCrossStoreReference,
   formatApiSuccess,
+  getSignatureIndex,
   nowIso,
 } from "./helpers";
 import { OperationService } from "./operation.service";
@@ -155,8 +156,9 @@ export class OrderMappingService implements OnModuleInit {
     }
 
     const snapshot = this.databaseService.getSnapshot();
+    const signaturesById = getSignatureIndex(snapshot);
     const signatures = dedupedIds.map((signatureId) => {
-      const signature = snapshot.orderSourceSignatures.find((item) => item.id === signatureId);
+      const signature = signaturesById.get(signatureId);
       if (!signature) {
         throw new NotFoundException({
           success: false,

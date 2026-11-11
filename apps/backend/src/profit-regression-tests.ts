@@ -141,19 +141,21 @@ const excel = (rows: unknown[][]) => {
     buffer: XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }),
   } as Express.Multer.File;
 };
-const exportRows = (service: ProfitService, dateTo = date) => {
+const readProfitExport = (service: ProfitService, dateTo = date) => {
   const workbook = XLSX.read(
     service.exportDailySalesUnitsExcel({
       storeId: "s",
       dateFrom: date,
       dateTo,
     }),
-    { type: "buffer" },
+    { type: "buffer", cellNF: true },
   );
-  return XLSX.utils.sheet_to_json<unknown[]>(workbook.Sheets.DailyProfitRows, {
+  const sheet = workbook.Sheets.DailyProfitRows;
+  const rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
     header: 1,
     defval: "",
   });
+  return { sheet, rows };
 };
 const rowFor = (db: ReturnType<typeof memory>, day = date) =>
   calculateDailyProfitRows(db.getSnapshot(), "s", day, day)[0];
@@ -163,6 +165,79 @@ export async function runProfitRegressionTests() {
     await fn();
     console.log(`PASS profit regression: ${name}`);
   };
+
+  await check("detail preserves order references, daily exclusions and fallback fees", () => {
+    const data = fixture();
+    const base = data.orderItems[0];
+    base.paymentCommission = null;
+    base.knowledgeShoppingSellingInterlockCommission = null;
+    base.saleCommission = null;
+    base.channelCommission = null;
+    data.orders.push({ id: "order", storeId: "s", externalOrderId: "external-order" } as never);
+    data.orderItems.push(
+      { ...base, id: "same-order-item" },
+      { ...base, id: "missing-order-item", orderId: "missing-order" },
+      { ...base, id: "other-unit-sale", canonicalSalesUnitId: "other-unit" },
+      ...(["CANCELED", "CANCEL_REQUESTED", "RETURNED", "EXCHANGED"] as const).map((saleStatus) => ({
+        ...base,
+        id: saleStatus,
+        canonicalSalesUnitId: "other-unit",
+        saleStatus,
+      })),
+      { ...base, id: "other-date-cancel", paymentDate: nextDate, saleStatus: "CANCELED" },
+      { ...base, id: "other-store-cancel", storeId: "another-store", saleStatus: "CANCELED" },
+    );
+    const detail = new ProfitService(memory(data) as never).getDailySalesUnitDetail("s", "u", date).data;
+    assert.deepEqual(detail.orderItems.map((item) => [item.orderItemId, item.orderId]), [
+      ["item", "external-order"],
+      ["same-order-item", "external-order"],
+      ["missing-order-item", "missing-order"],
+    ]);
+    assert.deepEqual(detail.excludedSummary.excludedOrderStatusCounts, {
+      CANCELED: 1,
+      CANCEL_REQUESTED: 1,
+      RETURNED: 1,
+      EXCHANGED: 1,
+    });
+    assert.equal(detail.costBreakdown.fallbackFeeCostPortion, 900);
+    assert.equal(detail.costBreakdown.unitCostPerQuantity, 2000);
+    assert.equal(detail.summary.totalProductRevenue, 30000);
+  });
+
+  await check("cost list counts inclusive periods without mixing units or stores", () => {
+    const data = fixture();
+    const base = data.orderItems[0];
+    data.orderItems.push(
+      { ...base, id: "duplicate-date", saleStatus: "CANCELED" },
+      { ...base, id: "next-date", paymentDate: nextDate },
+      { ...base, id: "previous-date", paymentDate: "2026-10-24" },
+      { ...base, id: "missing-date", paymentDate: null },
+      { ...base, id: "different-unit", canonicalSalesUnitId: "other-unit" },
+      { ...base, id: "different-store", storeId: "other-store" },
+    );
+    for (const [id, unit, effectiveFrom, effectiveTo, isActive] of [
+      ["one-day", "u", date, date, true],
+      ["two-days", "u", date, nextDate, true],
+      ["open-ended", "u", date, null, true],
+      ["future", "u", "2026-11-01", null, true],
+      ["inactive", "u", "2026-11-01", null, false],
+      ["other-unit", "other-unit", date, date, true],
+    ] as const) {
+      data.salesUnitCostSettings.push({
+        id, storeId: "s", canonicalSalesUnitId: unit, effectiveFrom, effectiveTo, isActive,
+      } as SalesUnitCostSetting);
+    }
+    const service = costs(memory(data));
+    const rows = service.list("s").data;
+    assert.deepEqual(Object.fromEntries(rows.map((row) => [row.id, row.appliedOrderItemCount])), {
+      future: 0, inactive: 0, "one-day": 2, "two-days": 3, "open-ended": 3, "other-unit": 1,
+    });
+    assert.equal(rows.find((row) => row.id === "one-day")!.canEdit, false);
+    assert.equal(rows.find((row) => row.id === "future")!.canEdit, true);
+    assert.equal(rows.find((row) => row.id === "inactive")!.canEdit, false);
+    assert.deepEqual(service.list("s", "other-unit").data.map((row) => row.id), ["other-unit"]);
+    assert.deepEqual(service.list("unknown-store").data, []);
+  });
 
   await check(
     "VAT remains 10 percent and all API fee fields are counted once",
@@ -599,7 +674,7 @@ export async function runProfitRegressionTests() {
       const db = memory(fixture());
       db.data.salesUnitCostSnapshotEntries[0].unitCost = -2000;
       assert.equal(rowFor(db).estimatedNetProfit, null);
-      const rows = exportRows(new ProfitService(db as never));
+      const { rows } = readProfitExport(new ProfitService(db as never));
       assert.equal(rows.find((row) => row[0] === date)![8], "");
       assert.equal(rows.at(-1)![8], "");
       assert.equal(rows.at(-1)![11], "");
@@ -666,10 +741,18 @@ export async function runProfitRegressionTests() {
         { storeId: "s", date: nextDate, amount: 200 } as never,
         { storeId: "s", date: "2026-10-27", amount: 300 } as never,
       );
-      const rows = exportRows(
+      const { sheet, rows } = readProfitExport(
         new ProfitService(memory(data) as never),
         "2026-10-27",
       );
+      assert.equal(sheet.B1.w, "1,000");
+      assert.equal(sheet.D1.z, "0");
+      assert.equal(sheet.C4.z, "0");
+      assert.equal(sheet.E4.v, 10000);
+      assert.equal(sheet.E4.w, "10,000");
+      assert.equal(sheet.J4.w, "57.0%");
+      assert.equal(sheet.P5.w, "42,500");
+      assert.equal(sheet.E7.w, "70,000");
       const first = rows.find((row) => row[0] === date)!;
       assert.equal(first[8], 4300);
       assert.equal(first[9], 0.57);

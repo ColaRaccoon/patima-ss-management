@@ -15,7 +15,8 @@ interface AppShellProps {
 export function AppShell({ children, shellData }: AppShellProps) {
   return (
     <OrderSyncProvider>
-      <div className="min-h-screen lg:grid lg:grid-cols-[280px_minmax(0,1fr)]">
+      <a href="#main-content" className="skip-link">본문으로 건너뛰기</a>
+      <div className="min-h-screen lg:grid lg:grid-cols-[240px_minmax(0,1fr)]">
         <Suspense fallback={<aside className="bg-ink" />}>
           <SidebarNav />
         </Suspense>
@@ -24,7 +25,7 @@ export function AppShell({ children, shellData }: AppShellProps) {
             <TopHeader shellData={shellData} />
           </Suspense>
           <OrderSyncIndicator />
-          <main className="px-4 pb-10 pt-4 sm:px-6 lg:px-8">
+          <main id="main-content" tabIndex={-1} className="px-4 pb-10 pt-4 sm:px-6 lg:px-8">
             <div className="mx-auto max-w-7xl">{children}</div>
           </main>
         </div>

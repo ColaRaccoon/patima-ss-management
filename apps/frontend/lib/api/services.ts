@@ -1,4 +1,4 @@
-import type { DashboardSummary, DailySalesUnitProfit, SaleStatus } from "@patima/shared";
+import type { DashboardSummary, DailySalesUnitProfit } from "@patima/shared";
 import { DEFAULT_DELIVERY_UNIT_COST } from "@patima/shared";
 import { fetchApi, withQuery } from "@/lib/api/client";
 import { pickPrimaryStore, resolveSelectedStore } from "@/lib/store-selection";
@@ -9,7 +9,6 @@ import {
   mockCredential,
   mockDashboardSummary,
   mockOrderItems,
-  mockPreviewRows,
   mockProfitDetailPreview,
   mockProfits,
   mockSalesUnits,
@@ -20,8 +19,6 @@ import {
   MOCK_SELECTED_DATE,
 } from "@/lib/api/mock-data";
 import type {
-  AdPreviewDetail,
-  AdPreviewRowItem,
   AdUploadListItem,
   AdUploadsPageData,
   CampaignCostListItem,
@@ -170,8 +167,12 @@ async function fetchAllRecordPages<T>(params: {
 
     collected.push(...response.data.items);
 
-    if (!response.data.hasNext || page >= (response.data.totalPages ?? page)) {
+    const hasNext = response.data.hasNext ?? (page < (response.data.totalPages ?? page));
+    if (!hasNext) {
       break;
+    }
+    if (response.data.items.length === 0 || page >= 10000) {
+      throw new Error(`${params.label}: 페이지 응답이 올바르지 않습니다.`);
     }
 
     page += 1;
@@ -191,9 +192,9 @@ async function fetchRecordPage<T>(params: {
   pageSize?: number;
   fallback?: T[];
 }) {
-  const requestedPage = params.page ?? 1;
+  let requestedPage = params.page ?? 1;
   const requestedPageSize = params.pageSize ?? MAX_FRONTEND_PAGE_SIZE;
-  const response = await fetchApi<{
+  const fetchPage = (pageNumber: number) => fetchApi<{
     items: T[];
     page?: number;
     pageSize?: number;
@@ -204,7 +205,7 @@ async function fetchRecordPage<T>(params: {
     label: params.label,
     path: withQuery(params.path, {
       ...params.query,
-      page: requestedPage,
+      page: pageNumber,
       pageSize: requestedPageSize,
     }),
     ...("fallback" in params
@@ -214,7 +215,14 @@ async function fetchRecordPage<T>(params: {
       : {}),
   });
 
-  const page = normalizePageMeta(response.data, requestedPage, requestedPageSize);
+  let response = await fetchPage(requestedPage);
+  let page = normalizePageMeta(response.data, requestedPage, requestedPageSize);
+  // Stored URLs can outlive the records that made their page valid.
+  if (page.page > page.totalPages) {
+    requestedPage = page.totalPages;
+    response = await fetchPage(requestedPage);
+    page = normalizePageMeta(response.data, requestedPage, requestedPageSize);
+  }
 
   return {
     ...response,
@@ -257,10 +265,10 @@ function normalizeMappingListState(input?: Partial<MappingListState>): MappingLi
   return {
     mappingStatus,
     q: input?.q?.trim() ?? "",
-    page: Number.isFinite(requestedPage) && requestedPage > 0 ? Math.floor(requestedPage) : 1,
+    page: Number.isFinite(requestedPage) && requestedPage > 0 ? Math.max(1, Math.floor(requestedPage)) : 1,
     pageSize:
       Number.isFinite(requestedPageSize) && requestedPageSize > 0
-        ? Math.min(MAX_FRONTEND_PAGE_SIZE, Math.floor(requestedPageSize))
+        ? Math.max(1, Math.min(MAX_FRONTEND_PAGE_SIZE, Math.floor(requestedPageSize)))
         : DEFAULT_MAPPING_PAGE_SIZE,
   };
 }
@@ -521,10 +529,11 @@ async function getOperationDetail(operationId: string) {
   });
 }
 
-async function getOrderItems(storeId: string, filters: OrdersPageFilters) {
-  const response = await fetchApi<{ items: OrderListItem[] }>({
+async function getOrderItems(storeId: string, filters: OrdersPageFilters, page: number) {
+  return fetchRecordPage<OrderListItem>({
     label: "Order items",
-    path: withQuery("/order-items", {
+    path: "/order-items",
+    query: {
       storeId,
       dateFrom: filters.dateFrom,
       dateTo: filters.dateTo,
@@ -534,13 +543,11 @@ async function getOrderItems(storeId: string, filters: OrdersPageFilters) {
       orderStatus: filters.orderStatus || undefined,
       saleStatus: filters.saleStatus === "ALL" ? undefined : filters.saleStatus,
       paymentDateStatus: filters.paymentDateStatus,
-      page: 1,
-      pageSize: 50,
-    }),
-    fallback: { items: mockOrderItems },
+    },
+    page,
+    pageSize: 50,
+    fallback: mockOrderItems,
   });
-
-  return { ...response, data: response.data.items };
 }
 
 async function getOrderSourceSignatures(
@@ -630,95 +637,6 @@ async function getAdUploads(storeId: string, useFallback = true) {
   return { ...response, data: response.data.items };
 }
 
-async function getPreviewRows(
-  uploadId: string,
-  salesUnits: SalesUnitListItem[],
-  useFallback = true,
-) {
-  const response = useFallback
-    ? await fetchAllRecordPages<Record<string, unknown>>({
-        label: "Ad preview rows",
-        path: `/ad-uploads/${uploadId}/preview-rows`,
-        query: {},
-        fallback: mockPreviewRows as unknown as Array<Record<string, unknown>>,
-      })
-    : await fetchAllRecordPages<Record<string, unknown>>({
-        label: "Ad preview rows",
-        path: `/ad-uploads/${uploadId}/preview-rows`,
-        query: {},
-      });
-
-  const items = response.data.map((item, index) => {
-    const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
-    const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
-    const mappingStatus = toAdMappingStatus(canonicalSalesUnitId, mappingReason);
-    return {
-      rowNo: Number(item.rowNo ?? index + 1),
-      campaignId: String(item.campaignId),
-      campaignName: String(item.campaignName),
-      adType: item.adType ? String(item.adType) : null,
-      adStatus: item.status ? String(item.status) : item.adStatus ? String(item.adStatus) : null,
-      weekdayLabel:
-        item.weekday ? String(item.weekday) : item.weekdayLabel ? String(item.weekdayLabel) : null,
-      totalCost: Number(item.totalCost ?? 0),
-      mappingStatus,
-      mappingReason,
-      displayMappingState:
-        mappingReason === "INTENTIONALLY_UNMAPPED"
-          ? "INTENTIONALLY_UNMAPPED"
-          : mappingStatus,
-      matchedRuleCount: Number(item.matchedRuleCount ?? 0),
-      canonicalSalesUnitId,
-      canonicalDisplayName:
-        salesUnits.find((salesUnit) => salesUnit.id === canonicalSalesUnitId)?.displayName ?? null,
-      reasonNote: item.reasonNote ? String(item.reasonNote) : null,
-      reasonNoteInherited: Boolean(item.reasonNoteInherited),
-    } satisfies AdPreviewRowItem;
-  });
-
-  return { ...response, data: items };
-}
-
-async function getAdCosts(
-  storeId: string,
-  salesUnits: SalesUnitListItem[],
-  dateFrom?: string,
-  dateTo?: string,
-) {
-  const response = await fetchAllRecordPages({
-    label: "Ad costs",
-    path: "/ad-campaign-costs",
-    query: {
-      storeId,
-      dateFrom,
-      dateTo,
-    },
-    fallback: mockAdCosts as unknown as Array<Record<string, unknown>>,
-  });
-
-  const items = response.data.map((item) => {
-    const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
-    const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
-    const mappingStatus = toAdMappingStatus(canonicalSalesUnitId, mappingReason);
-    return {
-      id: String(item.id),
-      uploadId: String(item.sourceUploadId ?? item.uploadId ?? ""),
-      reportDate: String(item.reportDate),
-      campaignName: String(item.campaignName),
-      totalCost: Number(item.totalCost ?? 0),
-      canonicalSalesUnitId,
-      canonicalDisplayName:
-        salesUnits.find((salesUnit) => salesUnit.id === canonicalSalesUnitId)?.displayName ?? null,
-      mappingStatus,
-      mappingReason,
-      matchedRuleCount: Number(item.matchedRuleCount ?? 0),
-      reasonNote: item.reasonNote ? String(item.reasonNote) : null,
-    } satisfies CampaignCostListItem;
-  });
-
-  return { ...response, data: items };
-}
-
 async function getAdCampaignSignatures(
   storeId: string,
   salesUnits: SalesUnitListItem[],
@@ -746,6 +664,7 @@ async function getAdCampaignSignatures(
     fallback: mockAdCosts as unknown as Array<Record<string, unknown>>,
   });
 
+  const salesUnitNames = new Map(salesUnits.map((unit) => [unit.id, unit.displayName]));
   const items = response.data.map((item) => {
     const canonicalSalesUnitId = item.canonicalSalesUnitId ? String(item.canonicalSalesUnitId) : null;
     const mappingReason = toMappingReason(item.mappingReason ? String(item.mappingReason) : null);
@@ -759,7 +678,7 @@ async function getAdCampaignSignatures(
       totalCost: Number(item.totalCost ?? 0),
       canonicalSalesUnitId,
       canonicalDisplayName:
-        salesUnits.find((salesUnit) => salesUnit.id === canonicalSalesUnitId)?.displayName ?? null,
+        salesUnitNames.get(canonicalSalesUnitId ?? "") ?? null,
       mappingStatus,
       mappingReason,
       matchedRuleCount: Number(item.matchedRuleCount ?? 0),
@@ -784,6 +703,7 @@ async function getCampaignMappings(storeId: string, salesUnits: SalesUnitListIte
     fallback: mockCampaignMappings as unknown as Array<Record<string, unknown>>,
   });
 
+  const salesUnitNames = new Map(salesUnits.map((unit) => [unit.id, unit.displayName]));
   const items = response.data.map((item) => ({
     id: String(item.id),
     storeId: String(item.storeId),
@@ -793,7 +713,7 @@ async function getCampaignMappings(storeId: string, salesUnits: SalesUnitListIte
     normalizedCampaignPattern: String(item.normalizedCampaignPattern),
     canonicalSalesUnitId: String(item.canonicalSalesUnitId),
     canonicalDisplayName:
-      salesUnits.find((salesUnit) => salesUnit.id === item.canonicalSalesUnitId)?.displayName ?? "-",
+      salesUnitNames.get(String(item.canonicalSalesUnitId)) ?? "-",
     isEnabled: Boolean(item.isActive),
     disabledAt: item.deactivatedAt ? String(item.deactivatedAt) : null,
   })) satisfies CampaignMappingRuleListItem[];
@@ -808,12 +728,13 @@ async function getCostSettings(storeId: string, salesUnits: SalesUnitListItem[])
     fallback: mockCostSettings as unknown as Array<Record<string, unknown>>,
   });
 
+  const salesUnitNames = new Map(salesUnits.map((unit) => [unit.id, unit.displayName]));
   const items = response.data.map((item) => ({
     id: String(item.id),
     storeId: String(item.storeId),
     canonicalSalesUnitId: String(item.canonicalSalesUnitId),
     canonicalDisplayName:
-      salesUnits.find((salesUnit) => salesUnit.id === item.canonicalSalesUnitId)?.displayName ?? "-",
+      salesUnitNames.get(String(item.canonicalSalesUnitId)) ?? "-",
     unitCost: Number(item.unitCost ?? 0),
     feeRate: item.feeRate == null ? null : Number(item.feeRate),
     otherCost: Number(item.otherCost ?? 0),
@@ -927,29 +848,37 @@ export async function getStoreSettingsPageData(params?: {
 }
 
 export async function getOrdersPageData(
-  filtersInput?: Partial<OrdersPageFilters> & { storeId?: string },
+  filtersInput?: Partial<OrdersPageFilters> & { storeId?: string; orderPage?: number; signaturePage?: number },
 ): Promise<OrdersPageData> {
   const storeResponse = await getStores();
   const primaryStore = resolveSelectedStore(storeResponse.data, filtersInput?.storeId);
   const filters = normalizeOrdersPageFilters(filtersInput);
+  const orderPage = normalizeMappingListState({ page: filtersInput?.orderPage, pageSize: 50 }).page;
+  const signaturePage = normalizeMappingListState({ page: filtersInput?.signaturePage, pageSize: 50 }).page;
+  const emptyPage: PageMeta = { page: 1, pageSize: 50, totalCount: 0, totalPages: 1, hasNext: false };
 
   if (!primaryStore) {
     return {
       primaryStore: null,
       filters,
       orderItems: [],
+      orderPage: emptyPage,
       signatures: [],
+      signaturePage: emptyPage,
       latestOperation: null,
       sources: collectSources(storeResponse),
     };
   }
 
   const [orderResponse, signatureResponse] = await Promise.all([
-    getOrderItems(primaryStore.id, filters),
+    getOrderItems(primaryStore.id, filters, orderPage),
     getOrderSourceSignatures(primaryStore.id, {
       mappingStatus: filters.mappingStatus,
       productName: filters.productName,
       optionInfo: filters.optionInfo,
+      fetchAll: false,
+      page: signaturePage,
+      pageSize: 50,
     }),
   ]);
 
@@ -957,7 +886,9 @@ export async function getOrdersPageData(
     primaryStore,
     filters,
     orderItems: orderResponse.data,
+    orderPage: orderResponse.page,
     signatures: signatureResponse.data,
+    signaturePage: signatureResponse.page,
     latestOperation: null,
     sources: collectSources(
       storeResponse,
@@ -1120,8 +1051,10 @@ export async function getCostsPageData(params?: {
     };
   }
 
-  const salesUnitResponse = await getSalesUnits(primaryStore.id);
-  const snapshotResponse = await getCostSnapshots(primaryStore.id);
+  const [salesUnitResponse, snapshotResponse] = await Promise.all([
+    getSalesUnits(primaryStore.id),
+    getCostSnapshots(primaryStore.id),
+  ]);
   return {
     primaryStore,
     salesUnits: salesUnitResponse.data,

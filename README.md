@@ -20,6 +20,16 @@ npm run dev:frontend
 
 Development output is stored in `apps/frontend/.next-dev`, separately from the production build in `.next`, so running `npm run build` does not overwrite the running development server. `NEXT_DIST_DIR` overrides this default when needed.
 
+API failures show an error and retry action instead of silently substituting sample records. For isolated demos only, `API_ALLOW_MOCK_FALLBACK=true` opts into the existing sample fallbacks on supported management screens; financial and ad-upload screens continue to require live data.
+
+The orders screen pages order items and source combinations independently (50 rows per page), with counts and previous/next controls. Applying filters resets both lists to the first page. Identical server reads within one render share their result; later navigations still fetch fresh data.
+
+Ad uploads send up to 10 files per request. Each file is validated separately; valid files are committed together and the report date's profit summary is refreshed once per batch. Failed files remain selected for retry. A campaign already included in an active upload for the same store/date is rejected, including duplicates in the same batch or concurrent requests. The single-file upload endpoint remains supported.
+
+In PostgreSQL mode, uploading ads locks the store and reads the relevant date/campaigns, then writes only uploads, campaign signatures, ad costs, and audit logs. It does not clone or reserialize the entire order database. Mapping uses an indexed campaign lookup and applies results only to the new rows. File storage retains its atomic snapshot write, shared by all valid files in the batch.
+
+`npx tsx scripts/benchmark-ad-mapping.ts` runs an isolated synthetic benchmark of campaign lookup and mapping preparation. It checks equivalent results and excludes Excel parsing, persistence, and profit aggregation; it does not access operational data.
+
 ## Environment
 
 The backend now supports three layers for Naver Commerce integration:

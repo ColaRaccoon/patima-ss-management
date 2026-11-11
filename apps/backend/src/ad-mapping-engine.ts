@@ -4,88 +4,16 @@ import {
   AdUploadPreviewRow,
   CampaignMappingReason,
   CampaignSalesUnitMapping,
+  CanonicalSalesUnit,
   DatabaseShape,
   normalizeText,
 } from "@patima/shared";
 import { hashJson, createId, nowIso } from "./helpers";
-import { getActiveSalesUnitsForAutoMapping, resolveCampaignAutoMapping } from "./sales-unit-auto-mapper";
+import { getActiveSalesUnitsForCampaignMapping, resolveCampaignAutoMapping } from "./sales-unit-auto-mapper";
 
 export type AdMappingOverride =
   | { type: "MANUAL_MAPPED"; canonicalSalesUnitId: string }
   | { type: "INTENTIONALLY_UNMAPPED"; reasonNote: string | null };
-
-/**
- * 캠페인명 기반 자동매핑 규칙
- * 세부 키워드를 먼저 검사한 후 포괄 키워드를 검사하여 우선순위 적용
- */
-interface KeywordMappingRule {
-  keywords: string[];
-  displayNamePattern: string;
-  isStoreLevel?: boolean;
-}
-
-const KEYWORD_MAPPING_RULES: KeywordMappingRule[] = [
-  // 세부 키워드 (specifics)
-  { keywords: ["한줄무릎보호대"], displayNamePattern: "한줄 무릎보호대" },
-  { keywords: ["두줄무릎보호대", "인피니티가드_두줄"], displayNamePattern: "두줄 무릎보호대" },
-  { keywords: ["런닝양말"], displayNamePattern: "러닝양말" },
-  { keywords: ["다이어트양말", "인피니티가드_다이어트양말"], displayNamePattern: "다이어트양말" },
-  { keywords: ["유쉴드", "유쉴드마스크"], displayNamePattern: "자외선차단 마스크" },
-  { keywords: ["카프슬리브"], displayNamePattern: "쿨토시" },
-  // 포괄 키워드 (broad - 세부 키워드 미포함 시에만 매핑)
-  { keywords: ["카탈로그", "키워드타겟"], displayNamePattern: "STORE_LEVEL", isStoreLevel: true },
-];
-
-/**
- * 캠페인명에서 키워드 기반 매핑 대상을 찾음
- * 세부 키워드를 먼저 검사한 후 포괄 키워드를 검사
- */
-function findKeywordMappingRule(campaignName: string): KeywordMappingRule | null {
-  // 1단계: 세부 키워드 검사
-  for (const rule of KEYWORD_MAPPING_RULES) {
-    if (rule.isStoreLevel) continue; // 포괄 키워드는 후반부에서만 검사
-    for (const keyword of rule.keywords) {
-      if (campaignName.includes(keyword)) {
-        return rule;
-      }
-    }
-  }
-
-  // 2단계: 포괄 키워드 검사
-  // "무릎보호대" 또는 "인피니티가드"가 포함되었을 때만 검사 (세부 키워드 미포함)
-  const hasBroadKeywordNeedsCheck = campaignName.includes("무릎보호대") || campaignName.includes("인피니티가드");
-  if (hasBroadKeywordNeedsCheck) {
-    // "무릎보호대" 단독 (한줄/두줄 미포함) → 스토어 전체
-    if (
-      campaignName.includes("무릎보호대") &&
-      !campaignName.includes("한줄") &&
-      !campaignName.includes("두줄")
-    ) {
-      return { keywords: ["무릎보호대"], displayNamePattern: "STORE_LEVEL", isStoreLevel: true };
-    }
-    // "인피니티가드" 단독 (두줄/다이어트양말 등 미포함) → 스토어 전체
-    if (
-      campaignName.includes("인피니티가드") &&
-      !campaignName.includes("두줄") &&
-      !campaignName.includes("다이어트양말")
-    ) {
-      return { keywords: ["인피니티가드"], displayNamePattern: "STORE_LEVEL", isStoreLevel: true };
-    }
-  }
-
-  // 3단계: 카탈로그, 키워드타겟 포괄 키워드
-  for (const rule of KEYWORD_MAPPING_RULES) {
-    if (!rule.isStoreLevel) continue;
-    if (rule.isStoreLevel !== true) continue;
-    for (const keyword of rule.keywords) {
-      if (campaignName.includes(keyword)) {
-        return rule;
-      }
-    }
-  }
-
-  return null;
-}
 
 export interface AdMappingEvaluation {
   canonicalSalesUnitId: string | null;
@@ -93,30 +21,61 @@ export interface AdMappingEvaluation {
   mappingReason: CampaignMappingReason;
   reasonNote: string | null;
   reasonNoteInherited: boolean;
-  needsStoreLevelUnit?: boolean;
 }
 
-export const getActiveCampaignMappings = (database: DatabaseShape, storeId: string): CampaignSalesUnitMapping[] =>
-  database.campaignMappings.filter((item) => {
-    const salesUnit = database.canonicalSalesUnits.find((entry) => entry.id === item.canonicalSalesUnitId);
-    return item.storeId === storeId && item.isActive && salesUnit?.isActive;
-  });
+const indexSalesUnits = (database: DatabaseShape) => {
+  const index = new Map<string, CanonicalSalesUnit>();
+  for (const unit of database.canonicalSalesUnits) {
+    if (!index.has(unit.id)) index.set(unit.id, unit);
+  }
+  return index;
+};
+
+export const getActiveCampaignMappings = (database: DatabaseShape, storeId: string): CampaignSalesUnitMapping[] => {
+  const unitsById = indexSalesUnits(database);
+  return database.campaignMappings.filter((item) =>
+    item.storeId === storeId && item.isActive && unitsById.get(item.canonicalSalesUnitId)?.isActive,
+  );
+};
 
 export const getAutoMatchSalesUnitsSnapshot = (database: DatabaseShape, storeId: string) =>
-  getActiveSalesUnitsForAutoMapping(database, storeId).map((item) => ({
+  getActiveSalesUnitsForCampaignMapping(database, storeId).map((item) => ({
     id: item.id,
     normalizedMatchAliases: item.normalizedMatchAliases,
   }));
 
-export const getRuleSnapshotHash = (database: DatabaseShape, storeId: string): string =>
+interface AdMappingContext {
+  unitsById: Map<string, CanonicalSalesUnit>;
+  explicitRules: CampaignSalesUnitMapping[];
+  autoMatchSalesUnits: CanonicalSalesUnit[];
+}
+
+const createAdMappingContext = (database: DatabaseShape, storeId: string): AdMappingContext => {
+  const unitsById = indexSalesUnits(database);
+  return {
+    unitsById,
+    explicitRules: database.campaignMappings.filter((item) =>
+      item.storeId === storeId && item.isActive && unitsById.get(item.canonicalSalesUnitId)?.isActive,
+    ),
+    autoMatchSalesUnits: getActiveSalesUnitsForCampaignMapping(database, storeId),
+  };
+};
+
+const hashMappingContext = (context: AdMappingContext): string =>
   hashJson({
-    explicitRules: getActiveCampaignMappings(database, storeId).map((item) => ({
+    explicitRules: context.explicitRules.map((item) => ({
       id: item.id,
       normalizedCampaignPattern: item.normalizedCampaignPattern,
       canonicalSalesUnitId: item.canonicalSalesUnitId,
     })),
-    autoMatchSalesUnits: getAutoMatchSalesUnitsSnapshot(database, storeId),
+    autoMatchSalesUnits: context.autoMatchSalesUnits.map((item) => ({
+      id: item.id,
+      normalizedMatchAliases: item.normalizedMatchAliases,
+    })),
   });
+
+export const getRuleSnapshotHash = (database: DatabaseShape, storeId: string): string =>
+  hashMappingContext(createAdMappingContext(database, storeId));
 
 export const getOverrideSnapshotHash = (database: DatabaseShape, storeId: string): string =>
   hashJson([
@@ -174,11 +133,11 @@ export const getAdMappingOverride = (
  * 자식 판매단위를 부모 판매단위로 승격시키는 헬퍼 함수.
  * 자식이면 부모로 승격, 아니면 그대로 반환.
  */
-function resolveTargetSalesUnitId(database: DatabaseShape, candidateId: string | null): string | null {
+function resolveTargetSalesUnitId(context: AdMappingContext, candidateId: string | null): string | null {
   if (!candidateId) {
     return null;
   }
-  const candidate = database.canonicalSalesUnits.find((u) => u.id === candidateId);
+  const candidate = context.unitsById.get(candidateId);
   if (!candidate) {
     return candidateId;
   }
@@ -186,14 +145,13 @@ function resolveTargetSalesUnitId(database: DatabaseShape, candidateId: string |
   return candidate.parentSalesUnitId ?? candidate.id;
 }
 
-export const evaluateAdMapping = (
-  database: DatabaseShape,
-  storeId: string,
+const evaluateAdMappingWithContext = (
+  context: AdMappingContext,
   normalizedCampaignName: string,
   override?: AdMappingOverride | null,
 ): AdMappingEvaluation => {
   if (override?.type === "MANUAL_MAPPED") {
-    const resolvedId = resolveTargetSalesUnitId(database, override.canonicalSalesUnitId);
+    const resolvedId = resolveTargetSalesUnitId(context, override.canonicalSalesUnitId);
     return {
       canonicalSalesUnitId: resolvedId,
       matchedRuleCount: 0,
@@ -214,11 +172,11 @@ export const evaluateAdMapping = (
   }
 
   // 1단계: 명시적 캠페인 매핑 규칙 검사
-  const matches = getActiveCampaignMappings(database, storeId).filter((rule) =>
+  const matches = context.explicitRules.filter((rule) =>
     normalizedCampaignName.includes(rule.normalizedCampaignPattern),
   );
   if (matches.length === 1) {
-    const resolvedId = resolveTargetSalesUnitId(database, matches[0].canonicalSalesUnitId);
+    const resolvedId = resolveTargetSalesUnitId(context, matches[0].canonicalSalesUnitId);
     return {
       canonicalSalesUnitId: resolvedId,
       matchedRuleCount: 1,
@@ -237,60 +195,13 @@ export const evaluateAdMapping = (
     };
   }
 
-  // 2단계: 키워드 기반 자동매핑 규칙 검사
-  const keywordRule = findKeywordMappingRule(normalizedCampaignName);
-  if (keywordRule) {
-    if (keywordRule.isStoreLevel) {
-      // 스토어 전체 광고비로 매핑
-      const storeLevelUnit = database.canonicalSalesUnits.find(
-        (u) => u.storeId === storeId && u.isStoreLevel === true,
-      );
-      if (storeLevelUnit) {
-        return {
-          canonicalSalesUnitId: storeLevelUnit.id,
-          matchedRuleCount: 1,
-          mappingReason: "RULE_MATCHED",
-          reasonNote: `키워드 규칙: ${keywordRule.keywords.join(", ")} → 스토어 전체`,
-          reasonNoteInherited: false,
-        };
-      }
-      // 스토어 레벨 판매단위가 없으면 생성 필요 표시
-      return {
-        canonicalSalesUnitId: null,
-        matchedRuleCount: 1,
-        mappingReason: "NO_RULE",
-        reasonNote: `키워드 규칙: ${keywordRule.keywords.join(", ")} → 스토어 전체 (판매단위 생성 필요)`,
-        reasonNoteInherited: false,
-        needsStoreLevelUnit: true,
-      };
-    } else {
-      // 특정 판매단위로 매핑
-      const targetUnit = database.canonicalSalesUnits.find(
-        (u) =>
-          u.storeId === storeId &&
-          u.isActive &&
-          normalizeText(u.displayName) === normalizeText(keywordRule.displayNamePattern),
-      );
-      if (targetUnit) {
-        const resolvedId = resolveTargetSalesUnitId(database, targetUnit.id);
-        return {
-          canonicalSalesUnitId: resolvedId,
-          matchedRuleCount: 1,
-          mappingReason: "RULE_MATCHED",
-          reasonNote: `키워드 규칙: ${keywordRule.keywords.join(", ")} → ${keywordRule.displayNamePattern}`,
-          reasonNoteInherited: false,
-        };
-      }
-    }
-  }
-
-  // 3단계: 텍스트 기반 자동매핑 폴백
+  // 2단계: 사용자가 설정한 판매단위/그룹 키워드로 매핑
   const fallback = resolveCampaignAutoMapping(
-    getActiveSalesUnitsForAutoMapping(database, storeId),
+    context.autoMatchSalesUnits,
     normalizedCampaignName,
   );
   if (fallback.canonicalSalesUnitId) {
-    const resolvedId = resolveTargetSalesUnitId(database, fallback.canonicalSalesUnitId);
+    const resolvedId = resolveTargetSalesUnitId(context, fallback.canonicalSalesUnitId);
     return {
       canonicalSalesUnitId: resolvedId,
       matchedRuleCount: fallback.candidateCount,
@@ -318,6 +229,14 @@ export const evaluateAdMapping = (
   };
 };
 
+export const evaluateAdMapping = (
+  database: DatabaseShape,
+  storeId: string,
+  normalizedCampaignName: string,
+  override?: AdMappingOverride | null,
+): AdMappingEvaluation =>
+  evaluateAdMappingWithContext(createAdMappingContext(database, storeId), normalizedCampaignName, override);
+
 export const normalizeCampaignPattern = (pattern: string): string => normalizeText(pattern);
 
 const getSignatureCampaignId = (campaignId: string | null | undefined): string | null => {
@@ -331,8 +250,18 @@ export const getAdCampaignSignatureKey = (
   [
     value.storeId,
     value.channel,
-    value.campaignId ? `id:${value.campaignId}` : `name:${value.normalizedCampaignName}`,
+    value.campaignId?.trim() ? `id:${value.campaignId.trim()}` : `name:${value.normalizedCampaignName}`,
   ].join("|");
+
+/** Build once inside a write and pass to upserts made against that same draft. */
+export const createAdCampaignSignatureIndex = (database: DatabaseShape): Map<string, AdCampaignSignature> => {
+  const index = new Map<string, AdCampaignSignature>();
+  for (const signature of database.adCampaignSignatures) {
+    const key = getAdCampaignSignatureKey(signature);
+    if (!index.has(key)) index.set(key, signature);
+  }
+  return index;
+};
 
 export const findAdCampaignSignature = (
   database: DatabaseShape,
@@ -364,17 +293,22 @@ export const upsertAdCampaignSignature = (
     reportDate?: string | null;
     countUsage?: boolean;
   },
+  signatureIndex?: Map<string, AdCampaignSignature>,
 ): AdCampaignSignature => {
   const timestamp = nowIso();
   const channel = params.channel ?? "NAVER_DA";
   const normalizedCampaignName = params.normalizedCampaignName ?? normalizeText(params.campaignName);
   const campaignId = getSignatureCampaignId(params.campaignId);
-  const existing = findAdCampaignSignature(database, {
+  const lookup = {
     storeId: params.storeId,
     channel,
     campaignId,
     normalizedCampaignName,
-  });
+  };
+  const key = getAdCampaignSignatureKey(lookup);
+  const existing = signatureIndex
+    ? signatureIndex.get(key)
+    : findAdCampaignSignature(database, lookup);
 
   if (existing) {
     existing.campaignNameSnapshot = params.campaignName;
@@ -417,6 +351,7 @@ export const upsertAdCampaignSignature = (
     updatedAt: timestamp,
   };
   database.adCampaignSignatures.push(created);
+  signatureIndex?.set(key, created);
   return created;
 };
 
@@ -424,11 +359,13 @@ export const ensureAdCampaignSignaturesForStore = (
   database: DatabaseShape,
   storeId: string,
   rowIds?: Set<string> | string[] | null,
+  rows: readonly AdCampaignDailyCost[] = database.adCampaignDailyCosts,
 ): Set<string> => {
   const targetRowIds = rowIds ? new Set(Array.from(rowIds).filter(Boolean)) : null;
   const touchedSignatureIds = new Set<string>();
+  let signatureIndex: Map<string, AdCampaignSignature> | undefined;
 
-  database.adCampaignDailyCosts
+  rows
     .filter((row) => row.storeId === storeId && (!targetRowIds || targetRowIds.has(row.id)))
     .forEach((row) => {
       if (row.adCampaignSignatureId) {
@@ -436,13 +373,14 @@ export const ensureAdCampaignSignaturesForStore = (
         return;
       }
 
+      signatureIndex ??= createAdCampaignSignatureIndex(database);
       const signature = upsertAdCampaignSignature(database, {
         storeId,
         campaignId: row.campaignId,
         campaignName: row.campaignName,
         normalizedCampaignName: row.normalizedCampaignName,
         reportDate: row.reportDate,
-      });
+      }, signatureIndex);
       row.adCampaignSignatureId = signature.id;
       touchedSignatureIds.add(signature.id);
     });
@@ -457,13 +395,14 @@ export const applyAdCampaignSignatureToRows = (
     signatureIds?: Set<string> | string[] | null;
     dateFrom?: string | null;
     dateTo?: string | null;
+    rows?: readonly AdCampaignDailyCost[];
   },
 ): void => {
   const timestamp = nowIso();
   const signatureIds = params.signatureIds ? new Set(Array.from(params.signatureIds).filter(Boolean)) : null;
   const signaturesById = new Map(database.adCampaignSignatures.map((signature) => [signature.id, signature]));
 
-  database.adCampaignDailyCosts
+  (params.rows ?? database.adCampaignDailyCosts)
     .filter(
       (row) =>
         row.storeId === params.storeId &&
@@ -567,38 +506,6 @@ export const refreshAdCampaignSignatureSummaries = (
     });
 };
 
-const ensureStoreLevelSalesUnitIfNeeded = (database: DatabaseShape, storeId: string, needsStoreLevelUnit: boolean) => {
-  if (!needsStoreLevelUnit) {
-    return;
-  }
-
-  const store = database.stores.find((s) => s.id === storeId);
-  const existing = database.canonicalSalesUnits.find(
-    (u) => u.storeId === storeId && u.isStoreLevel === true,
-  );
-
-  if (store && !existing) {
-    database.canonicalSalesUnits.push({
-      id: createId(),
-      storeId,
-      displayName: "스토어 전체 광고비",
-      matchAliases: [],
-      normalizedMatchAliases: [],
-      linkedProductIds: [],
-      linkedOptionCodes: [],
-      linkedManageCodes: [],
-      memo: "자동 생성된 스토어 전체 광고비 판매단위",
-      isActive: true,
-      deactivatedAt: null,
-      isStoreLevel: true,
-      parentSalesUnitId: null,
-      isGroup: false,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-    });
-  }
-};
-
 export const recalculateAdCampaignSignaturesForStore = (
   database: DatabaseShape,
   storeId: string,
@@ -608,6 +515,8 @@ export const recalculateAdCampaignSignaturesForStore = (
     applyToRows?: boolean;
     applyToRowsFrom?: string | null;
     applyToRowsTo?: string | null;
+    /** Rows belonging to this draft; limits both signature repair and mapping writes. */
+    rows?: readonly AdCampaignDailyCost[];
   },
 ): void => {
   const shouldApplyToRows =
@@ -615,7 +524,7 @@ export const recalculateAdCampaignSignaturesForStore = (
     options?.applyToRowsFrom != null ||
     options?.applyToRowsTo != null;
   if (shouldApplyToRows) {
-    ensureAdCampaignSignaturesForStore(database, storeId);
+    ensureAdCampaignSignaturesForStore(database, storeId, null, options?.rows);
   }
   const targetSignatureIds = options?.signatureIds
     ? new Set(Array.from(options.signatureIds).filter(Boolean))
@@ -624,22 +533,12 @@ export const recalculateAdCampaignSignaturesForStore = (
     (signature) => signature.storeId === storeId && (!targetSignatureIds || targetSignatureIds.has(signature.id)),
   );
   const autoCandidates = candidates.filter((signature) => !signature.confirmedAt);
-  const needsStoreLevelUnit = autoCandidates.some(
-    (signature) => evaluateAdMapping(database, storeId, signature.normalizedCampaignName).needsStoreLevelUnit === true,
-  );
-  ensureStoreLevelSalesUnitIfNeeded(database, storeId, needsStoreLevelUnit);
-
   const timestamp = nowIso();
-  const ruleHash = getRuleSnapshotHash(database, storeId);
+  const context = createAdMappingContext(database, storeId);
+  const ruleHash = hashMappingContext(context);
   autoCandidates.forEach((signature) => {
-    const mapping = evaluateAdMapping(database, storeId, signature.normalizedCampaignName);
-    const storeLevelUnit =
-      mapping.needsStoreLevelUnit === true
-        ? database.canonicalSalesUnits.find((u) => u.storeId === storeId && u.isStoreLevel === true)
-        : null;
-
-    const nextCanonicalSalesUnitId =
-      mapping.needsStoreLevelUnit === true ? storeLevelUnit?.id ?? null : mapping.canonicalSalesUnitId;
+    const mapping = evaluateAdMappingWithContext(context, signature.normalizedCampaignName);
+    const nextCanonicalSalesUnitId = mapping.canonicalSalesUnitId;
 
     if (
       signature.canonicalSalesUnitId === nextCanonicalSalesUnitId &&
@@ -668,67 +567,23 @@ export const recalculateAdCampaignSignaturesForStore = (
       signatureIds: targetSignatureIds ?? new Set(candidates.map((signature) => signature.id)),
       dateFrom: options?.applyToRowsFrom,
       dateTo: options?.applyToRowsTo,
+      rows: options?.rows,
     });
   }
 };
 
 export const recalculateAdMappingsForStore = (database: DatabaseShape, storeId: string): void => {
-  recalculateAdCampaignSignaturesForStore(database, storeId);
+  recalculateAdCampaignSignaturesForStore(database, storeId, { applyToRows: true });
 };
 
 export const recalculateAdMappingsForStoreLegacyRows = (database: DatabaseShape, storeId: string): void => {
-  // 먼저 필요한 스토어 레벨 판매단위가 있는지 확인
-  const needsStoreLevelUnit = database.adCampaignDailyCosts
-    .filter((item) => item.storeId === storeId)
-    .some((item) => {
-      const mapping = evaluateAdMapping(database, storeId, item.normalizedCampaignName, getAdMappingOverride(item));
-      return mapping.needsStoreLevelUnit === true;
-    });
-
-  // 스토어 레벨 판매단위가 필요하면 자동 생성
-  if (needsStoreLevelUnit) {
-    const store = database.stores.find((s) => s.id === storeId);
-    const existing = database.canonicalSalesUnits.find(
-      (u) => u.storeId === storeId && u.isStoreLevel === true,
-    );
-
-    if (store && !existing) {
-      database.canonicalSalesUnits.push({
-        id: createId(),
-        storeId,
-        displayName: "스토어 전체 광고비",
-        matchAliases: [],
-        normalizedMatchAliases: [],
-        linkedProductIds: [],
-        linkedOptionCodes: [],
-        linkedManageCodes: [],
-        memo: "자동 생성된 스토어 전체 광고비 판매단위",
-        isActive: true,
-        deactivatedAt: null,
-        isStoreLevel: true,
-        parentSalesUnitId: null,
-        isGroup: false,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-      });
-    }
-  }
-
-  // 매핑 재계산 (필요시 새로 생성된 스토어 레벨 판매단위를 사용)
+  const context = createAdMappingContext(database, storeId);
   database.adCampaignDailyCosts
     .filter((item) => item.storeId === storeId)
     .forEach((item) => {
-      const mapping = evaluateAdMapping(database, storeId, item.normalizedCampaignName, getAdMappingOverride(item));
+      const mapping = evaluateAdMappingWithContext(context, item.normalizedCampaignName, getAdMappingOverride(item));
 
-      // needsStoreLevelUnit이 true인 경우, 스토어 레벨 판매단위 ID를 찾아 매핑
-      if (mapping.needsStoreLevelUnit === true) {
-        const storeLevelUnit = database.canonicalSalesUnits.find(
-          (u) => u.storeId === storeId && u.isStoreLevel === true,
-        );
-        item.canonicalSalesUnitId = storeLevelUnit?.id ?? null;
-      } else {
-        item.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
-      }
+      item.canonicalSalesUnitId = mapping.canonicalSalesUnitId;
 
       item.matchedRuleCount = mapping.matchedRuleCount;
       item.mappingReason = mapping.mappingReason;
