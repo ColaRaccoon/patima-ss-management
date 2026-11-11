@@ -33,7 +33,7 @@ const buildUpload = (working: DatabaseShape) => {
   };
 };
 
-const postgresHarness = (options?: { failAt?: string; inactive?: boolean }) => {
+const postgresHarness = (options?: { failAt?: string; inactive?: boolean; multiScope?: boolean }) => {
   const service = Object.create(DatabaseService.prototype) as any;
   service.database = fixture();
   service.storageMode = "postgres";
@@ -63,18 +63,23 @@ const postgresHarness = (options?: { failAt?: string; inactive?: boolean }) => {
       if (sql === "BEGIN") staged = structuredClone(tables);
       if (options?.failAt && sql.includes(options.failAt)) throw new Error("INJECTED_UPLOAD_FAILURE");
       if (sql.includes("FROM stores")) {
-        assert.deepEqual(values, [storeId]);
-        return { rows: [{ payload: { id: storeId, isActive: !options?.inactive } }] };
+        if (!options?.multiScope) assert.deepEqual(values, [storeId]);
+        return { rows: [{ payload: { id: values[0], isActive: !options?.inactive } }] };
       }
       if (sql.startsWith("SELECT")) {
         const table = /FROM ([a-z_]+)/.exec(sql)![1];
         assert.match(sql, /FOR UPDATE$/);
         if (table === "ad_campaign_signatures") {
-          assert.deepEqual(values, [storeId, [campaignId]]);
+          if (!options?.multiScope) assert.deepEqual(values, [storeId, [campaignId]]);
           assert.match(sql, /BTRIM\(payload->>'campaignId'\)/);
         }
-        else assert.deepEqual(values, [storeId, reportDate]);
-        return { rows: structuredClone(tables[table]).map((payload) => ({ payload })) };
+        else if (!options?.multiScope) assert.deepEqual(values, [storeId, reportDate]);
+        const selected = tables[table].filter((row) => row.storeId === values[0] && (
+          table === "ad_campaign_signatures"
+            ? (values[1] as string[]).includes(String(row.campaignId ?? "").trim())
+            : row.reportDate === values[1]
+        ));
+        return { rows: structuredClone(selected).map((payload) => ({ payload })) };
       }
       if (sql.startsWith("INSERT")) {
         const table = /INSERT INTO ([a-z_]+)/.exec(sql)![1];
@@ -236,4 +241,90 @@ export async function runAdUploadPersistenceTests() {
   assert.equal(file.database.adCampaignSignatures.length, 1);
   assert.equal(file.database.adCampaignSignatures[0].usageCount, 3);
   console.log("PASS ad upload persistence: file mode retains atomic snapshot publication");
+
+  const batchScopes = [
+    { storeId: "z-store", reportDate, campaignIds: ["z-campaign"] },
+    { storeId: "a-store", reportDate: "2026-11-11", campaignIds: ["a-campaign"] },
+    { storeId: "a-store", reportDate, campaignIds: ["a-campaign"] },
+    { storeId: "a-store", reportDate, campaignIds: [" a-campaign "] },
+  ];
+  const buildBatch = (working: DatabaseShape) => {
+    const rows: DatabaseShape["adCampaignDailyCosts"] = [];
+    const uploads: DatabaseShape["adExcelUploads"] = [];
+    const auditLogs: DatabaseShape["auditLogs"] = [];
+    for (const [index, scope] of batchScopes.slice(0, 3).entries()) {
+      const campaignId = scope.campaignIds[0];
+      const signature = working.adCampaignSignatures.find((row) => row.storeId === scope.storeId && row.campaignId === campaignId)!;
+      signature.usageCount += 1;
+      const uploadId = `batch-upload-${index}`;
+      uploads.push({ id: uploadId, storeId: scope.storeId, reportDate: scope.reportDate } as never);
+      rows.push({ id: `batch-row-${index}`, storeId: scope.storeId, reportDate: scope.reportDate,
+        campaignId, adCampaignSignatureId: signature.id, sourceUploadId: uploadId } as never);
+      auditLogs.push({ id: `batch-audit-${index}`, storeId: scope.storeId } as never);
+    }
+    return { uploads, rows, auditLogs, signatures: working.adCampaignSignatures,
+      result: uploads.map((upload) => upload.id) };
+  };
+  for (const failAt of [undefined, "INSERT INTO audit_logs", "COMMIT"]) {
+    const batch = postgresHarness({ multiScope: true, failAt });
+    for (const prefix of ["a", "z"]) {
+      batch.raw.database.stores.push({ id: `${prefix}-store`, isActive: true });
+      batch.tables.ad_campaign_signatures.push({ id: `${prefix}-signature`, storeId: `${prefix}-store`,
+        campaignId: `${prefix}-campaign`, usageCount: 10 });
+    }
+    const before = structuredClone(batch.service.getSnapshot());
+    batch.beforeCommit(() => assert.deepEqual(batch.service.getSnapshot(), before));
+    const execute = () => batch.service.commitAdUploadBatchCommitted({ scopes: batchScopes, build: buildBatch });
+    if (failAt) {
+      await assert.rejects(execute, /INJECTED_UPLOAD_FAILURE/);
+      assert.deepEqual(batch.service.getSnapshot(), before);
+      assert.equal(batch.tables.ad_excel_uploads.length, 0, "no store/date may persist after failed batch");
+      assert.equal(batch.tables.ad_campaign_daily_costs.length, 0);
+      assert.ok(batch.queries.some(({ sql }) => sql === "ROLLBACK"));
+    } else {
+      assert.deepEqual(await execute(), ["batch-upload-0", "batch-upload-1", "batch-upload-2"]);
+      assert.equal(batch.tables.ad_excel_uploads.length, 3);
+      assert.equal(batch.tables.ad_campaign_daily_costs.length, 3);
+      assert.equal(batch.service.getSnapshot().adCampaignSignatures.find((row) => row.id === "a-signature")!.usageCount, 12);
+      assert.equal(batch.service.getSnapshot().adCampaignSignatures.find((row) => row.id === "z-signature")!.usageCount, 11);
+      assert.equal(batch.service.getSnapshot().adCampaignDailyCosts.some((row) => row.id === "historical-row"), true);
+      assert.equal(batch.queries.filter(({ sql }) => sql === "COMMIT").length, 1);
+      assert.equal(batch.queries.filter(({ sql }) => sql.startsWith("INSERT")).length, 4);
+    }
+    assert.deepEqual(batch.queries.filter(({ sql }) => sql.includes("FROM stores")).map(({ values }) => values[0]),
+      ["a-store", "z-store"], "all store locks use a stable global order");
+    const firstCollectionRead = batch.queries.findIndex(({ sql }) => sql.includes("FROM ad_"));
+    const lastStoreLock = batch.queries.map(({ sql }, index) => sql.includes("FROM stores") ? index : -1).reduce((a, b) => Math.max(a, b));
+    assert.ok(firstCollectionRead > lastStoreLock);
+    assert.deepEqual(batch.queries.filter(({ sql }) => sql.includes("FROM ad_excel_uploads")).map(({ values }) => values), [
+      ["a-store", reportDate], ["a-store", "2026-11-11"], ["z-store", reportDate],
+    ]);
+    assert.equal(batch.queries.filter(({ sql }) => sql.includes("FROM ad_campaign_signatures")).length, 2);
+    assert.equal(batch.releases(), 1);
+  }
+  console.log("PASS ad upload persistence: multi-store/date batch locks deterministically and commits or rolls back together");
+
+  const fileBatch = Object.create(DatabaseService.prototype) as any;
+  fileBatch.database = fixture();
+  fileBatch.storageMode = "file";
+  fileBatch.persistenceQueue = Promise.resolve();
+  fileBatch.pendingWriteCount = 0;
+  for (const prefix of ["a", "z"]) {
+    fileBatch.database.stores.push({ id: `${prefix}-store`, isActive: true });
+    fileBatch.database.adCampaignSignatures.push({ id: `${prefix}-signature`, storeId: `${prefix}-store`,
+      campaignId: `${prefix}-campaign`, usageCount: 10 });
+  }
+  let fileWrites = 0;
+  fileBatch.persistSnapshotWithStatus = async () => { fileWrites += 1; };
+  await (fileBatch as DatabaseService).commitAdUploadBatchCommitted({
+    scopes: batchScopes,
+    build: (working) => {
+      const replacement = buildBatch(working);
+      replacement.signatures = replacement.signatures.filter((row) => row.storeId === "a-store" || row.storeId === "z-store");
+      return replacement;
+    },
+  });
+  assert.equal(fileWrites, 1, "all stores and dates share one atomic file write");
+  assert.equal(fileBatch.database.adCampaignDailyCosts.length, 4);
+  console.log("PASS ad upload persistence: multi-store/date file batch persists once");
 }

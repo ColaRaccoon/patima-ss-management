@@ -1395,7 +1395,12 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     return result;
   }
 
-  async writeCommitted<T>(mutator: (draft: DatabaseShape) => T): Promise<T> {
+  async writeCommitted<T>(
+    mutator: (draft: DatabaseShape) => T,
+    // Scoped PostgreSQL callers must include every collection changed by the mutator.
+    // File storage still commits the complete snapshot atomically.
+    tableKeys?: ReadonlyArray<keyof DatabaseShape>,
+  ): Promise<T> {
     this.pendingWriteCount += 1;
 
     const operation = this.persistenceQueue
@@ -1403,7 +1408,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       .then(async () => {
         const draft = this.cloneSnapshot(this.database);
         const result = mutator(draft);
-        await this.persistSnapshotWithStatus(draft);
+        await this.persistSnapshotWithStatus(draft, tableKeys);
         this.database = draft;
         return result;
       });
@@ -1423,8 +1428,39 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     campaignIds: string[];
     build: (working: DatabaseShape) => AdUploadsCommitReplacement<T>;
   }): Promise<T> {
-    const campaignIds = Array.from(new Set(params.campaignIds.map((id) => id.trim()).filter(Boolean)));
-    const campaignIdSet = new Set(campaignIds);
+    return this.commitAdUploadBatchCommitted({
+      scopes: [{ storeId: params.storeId, reportDate: params.reportDate, campaignIds: params.campaignIds }],
+      build: params.build,
+    });
+  }
+
+  /** Commit an entire multi-store/date admission atomically without cloning unrelated data. */
+  async commitAdUploadBatchCommitted<T>(params: {
+    scopes: Array<{ storeId: string; reportDate: string; campaignIds: string[] }>;
+    build: (working: DatabaseShape) => AdUploadsCommitReplacement<T>;
+  }): Promise<T> {
+    const campaignsByStoreDate = new Map<string, Map<string, Set<string>>>();
+    const campaignsByStore = new Map<string, Set<string>>();
+    for (const scope of params.scopes) {
+      const dates = campaignsByStoreDate.get(scope.storeId) ?? new Map<string, Set<string>>();
+      const dateCampaigns = dates.get(scope.reportDate) ?? new Set<string>();
+      const storeCampaigns = campaignsByStore.get(scope.storeId) ?? new Set<string>();
+      for (const id of scope.campaignIds) {
+        const normalized = id.trim();
+        if (normalized) {
+          dateCampaigns.add(normalized);
+          storeCampaigns.add(normalized);
+        }
+      }
+      dates.set(scope.reportDate, dateCampaigns);
+      campaignsByStoreDate.set(scope.storeId, dates);
+      campaignsByStore.set(scope.storeId, storeCampaigns);
+    }
+    if (campaignsByStoreDate.size === 0) throw new Error("AD_UPLOAD_COMMIT_EMPTY_SCOPE");
+    // Every batch takes store locks in the same order, including overlapping batches.
+    const storeIds = [...campaignsByStoreDate.keys()].sort();
+    const scopes = storeIds.flatMap((storeId) =>
+      [...campaignsByStoreDate.get(storeId)!.keys()].sort().map((reportDate) => ({ storeId, reportDate })));
     const assertWritableStore = (store: DatabaseShape["stores"][number] | undefined) => {
       if (!store) {
         throw new NotFoundException({
@@ -1444,12 +1480,10 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     const build = (working: DatabaseShape) => {
       const replacement = params.build(working);
       if (
-        replacement.uploads.some((row) => row.storeId !== params.storeId || row.reportDate !== params.reportDate) ||
-        replacement.rows.some((row) => row.storeId !== params.storeId || row.reportDate !== params.reportDate ||
-          !campaignIdSet.has(row.campaignId.trim())) ||
-        replacement.signatures.some((row) => row.storeId !== params.storeId ||
-          !campaignIdSet.has(row.campaignId?.trim() ?? "")) ||
-        replacement.auditLogs.some((row) => row.storeId !== params.storeId)
+        replacement.uploads.some((row) => !campaignsByStoreDate.get(row.storeId)?.has(row.reportDate)) ||
+        replacement.rows.some((row) => !campaignsByStoreDate.get(row.storeId)?.get(row.reportDate)?.has(row.campaignId.trim())) ||
+        replacement.signatures.some((row) => !campaignsByStore.get(row.storeId)?.has(row.campaignId?.trim() ?? "")) ||
+        replacement.auditLogs.some((row) => !row.storeId || !campaignsByStore.has(row.storeId))
       ) {
         throw new Error("AD_UPLOAD_COMMIT_SCOPE_MISMATCH");
       }
@@ -1481,7 +1515,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
     if (this.storageMode !== "postgres") {
       return this.writeCommitted((draft) => {
-        assertWritableStore(draft.stores.find((store) => store.id === params.storeId));
+        for (const storeId of storeIds) assertWritableStore(draft.stores.find((store) => store.id === storeId));
         const replacement = build(draft);
         publish(draft, replacement);
         return replacement.result;
@@ -1492,28 +1526,40 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       const client = await this.acquirePostgresClient();
       try {
         await client.query("BEGIN");
-        const storeResult = await client.query<{ payload: DatabaseShape["stores"][number] }>(
-          "SELECT payload FROM stores WHERE id = $1 FOR UPDATE", [params.storeId],
-        );
-        assertWritableStore(storeResult.rows[0]?.payload);
-        const uploads = await client.query<{ payload: DatabaseShape["adExcelUploads"][number] }>(
-          "SELECT payload FROM ad_excel_uploads WHERE payload->>'storeId' = $1 AND payload->>'reportDate' = $2 FOR UPDATE",
-          [params.storeId, params.reportDate],
-        );
-        const rows = await client.query<{ payload: DatabaseShape["adCampaignDailyCosts"][number] }>(
-          "SELECT payload FROM ad_campaign_daily_costs WHERE payload->>'storeId' = $1 AND payload->>'reportDate' = $2 FOR UPDATE",
-          [params.storeId, params.reportDate],
-        );
-        const signatures = await client.query<{ payload: DatabaseShape["adCampaignSignatures"][number] }>(
-          "SELECT payload FROM ad_campaign_signatures WHERE payload->>'storeId' = $1 AND BTRIM(payload->>'campaignId') = ANY($2::text[]) FOR UPDATE",
-          [params.storeId, campaignIds],
-        );
+        for (const storeId of storeIds) {
+          const storeResult = await client.query<{ payload: DatabaseShape["stores"][number] }>(
+            "SELECT payload FROM stores WHERE id = $1 FOR UPDATE", [storeId],
+          );
+          assertWritableStore(storeResult.rows[0]?.payload);
+        }
+        const uploads: DatabaseShape["adExcelUploads"] = [];
+        const rows: DatabaseShape["adCampaignDailyCosts"] = [];
+        const signatures: DatabaseShape["adCampaignSignatures"] = [];
+        for (const scope of scopes) {
+          const uploadResult = await client.query<{ payload: DatabaseShape["adExcelUploads"][number] }>(
+            "SELECT payload FROM ad_excel_uploads WHERE payload->>'storeId' = $1 AND payload->>'reportDate' = $2 FOR UPDATE",
+            [scope.storeId, scope.reportDate],
+          );
+          uploads.push(...uploadResult.rows.map((row) => row.payload));
+          const rowResult = await client.query<{ payload: DatabaseShape["adCampaignDailyCosts"][number] }>(
+            "SELECT payload FROM ad_campaign_daily_costs WHERE payload->>'storeId' = $1 AND payload->>'reportDate' = $2 FOR UPDATE",
+            [scope.storeId, scope.reportDate],
+          );
+          rows.push(...rowResult.rows.map((row) => row.payload));
+        }
+        for (const storeId of storeIds) {
+          const signatureResult = await client.query<{ payload: DatabaseShape["adCampaignSignatures"][number] }>(
+            "SELECT payload FROM ad_campaign_signatures WHERE payload->>'storeId' = $1 AND BTRIM(payload->>'campaignId') = ANY($2::text[]) FOR UPDATE",
+            [storeId, [...campaignsByStore.get(storeId)!].sort()],
+          );
+          signatures.push(...signatureResult.rows.map((row) => row.payload));
+        }
         // Only these four collections are writable. Other collections are read-only inputs to mapping.
         const working: DatabaseShape = {
           ...this.database,
-          adExcelUploads: uploads.rows.map((row) => this.cloneSnapshot(row.payload)),
-          adCampaignDailyCosts: rows.rows.map((row) => this.cloneSnapshot(row.payload)),
-          adCampaignSignatures: signatures.rows.map((row) => this.cloneSnapshot(row.payload)),
+          adExcelUploads: uploads.map((row) => this.cloneSnapshot(row)),
+          adCampaignDailyCosts: rows.map((row) => this.cloneSnapshot(row)),
+          adCampaignSignatures: signatures.map((row) => this.cloneSnapshot(row)),
           auditLogs: [],
         };
         const replacement = build(working);
@@ -1525,19 +1571,19 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         // Refresh the locked scope as well as our changes: another process may have added,
         // edited or deleted same-day rows since this process loaded its memory snapshot.
         const isSameDate = (row: { storeId: string; reportDate: string }) =>
-          row.storeId === params.storeId && row.reportDate === params.reportDate;
+          campaignsByStoreDate.get(row.storeId)?.has(row.reportDate) ?? false;
         this.database.adExcelUploads = mergeRows(
           this.database.adExcelUploads.filter((row) => !isSameDate(row)),
-          mergeRows(uploads.rows.map((row) => row.payload), replacement.uploads),
+          mergeRows(uploads, replacement.uploads),
         );
         this.database.adCampaignDailyCosts = mergeRows(
           this.database.adCampaignDailyCosts.filter((row) => !isSameDate(row)),
-          mergeRows(rows.rows.map((row) => row.payload), replacement.rows),
+          mergeRows(rows, replacement.rows),
         );
         this.database.adCampaignSignatures = mergeRows(
-          this.database.adCampaignSignatures.filter((row) => row.storeId !== params.storeId ||
-            !campaignIdSet.has(row.campaignId?.trim() ?? "")),
-          mergeRows(signatures.rows.map((row) => row.payload), replacement.signatures),
+          this.database.adCampaignSignatures.filter((row) =>
+            !campaignsByStore.get(row.storeId)?.has(row.campaignId?.trim() ?? "")),
+          mergeRows(signatures, replacement.signatures),
         );
         this.database.auditLogs = mergeRows(this.database.auditLogs, replacement.auditLogs);
         return replacement.result;
@@ -3227,10 +3273,13 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       });
   }
 
-  private async persistSnapshotWithStatus(snapshot: DatabaseShape): Promise<void> {
+  private async persistSnapshotWithStatus(
+    snapshot: DatabaseShape,
+    tableKeys?: ReadonlyArray<keyof DatabaseShape>,
+  ): Promise<void> {
     try {
       if (this.storageMode === "postgres") {
-        await this.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false });
+        await this.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false, tableKeys });
       } else {
         this.persistSnapshotToFile(snapshot);
       }
@@ -3308,7 +3357,10 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
   private async persistSnapshotToPostgres(
     snapshot: DatabaseShape,
-    options: { includeQueueOwnedTables?: boolean } = {},
+    options: {
+      includeQueueOwnedTables?: boolean;
+      tableKeys?: ReadonlyArray<keyof DatabaseShape>;
+    } = {},
   ) {
     const client = await this.acquirePostgresClient();
 
@@ -3323,6 +3375,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       );
 
       for (const table of STORAGE_TABLES) {
+        if (options.tableKeys && !options.tableKeys.includes(table.key)) continue;
         if (table.queueOwned && !options.includeQueueOwnedTables) {
           continue;
         }

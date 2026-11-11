@@ -10,6 +10,7 @@ import {
   AdUploadPreviewRow,
   DatabaseShape,
   normalizeText,
+  parseAdUploadFileName,
 } from "@patima/shared";
 import * as XLSX from "xlsx";
 import { AuditLogService } from "./audit-log.service";
@@ -75,6 +76,12 @@ interface PreparedAdUpload {
   fileHash: string;
   detectedWeekday: string | null;
   campaigns: AdUploadCampaign[];
+}
+interface PreparedAdUploadTarget {
+  index: number;
+  storeId: string;
+  reportDate: string;
+  prepared: PreparedAdUpload;
 }
 interface AdUploadFileResult {
   index: number;
@@ -175,6 +182,99 @@ export class AdsService implements OnModuleInit {
     });
   }
 
+  async uploadBatch(files: Express.Multer.File[]) {
+    if (!files?.length || files.length > 100) {
+      throw new BadRequestException("1~100개의 엑셀 파일을 선택하세요.");
+    }
+    const snapshot = this.databaseService.getSnapshot();
+    const prepared: PreparedAdUploadTarget[] = files.map((file, index) => {
+      const fileName = repairMojibakeText(file?.originalname);
+      const target = parseAdUploadFileName(fileName);
+      if (!target) {
+        throw new BadRequestException({
+          success: false,
+          message:
+            "파일명은 YYMMDD_인피니티[메인/서브].xlsx 또는 YYMMDD_파티마[메인/서브].xlsx 형식이어야 합니다. 날짜도 확인하세요.",
+          fileName,
+          errors: [{ field: "file", reason: "AD_UPLOAD_INVALID_FILENAME" }],
+        });
+      }
+      const stores = snapshot.stores.filter(
+        (store) => store.name.normalize("NFC").trim() === target.storeName,
+      );
+      if (stores.length !== 1) {
+        throw new BadRequestException({
+          success: false,
+          message: `${target.storeName}를 하나로 식별할 수 없습니다. 스토어 설정을 확인하세요.`,
+          fileName,
+          errors: [
+            {
+              field: "storeId",
+              reason: "AD_UPLOAD_STORE_AMBIGUOUS_OR_MISSING",
+            },
+          ],
+        });
+      }
+      this.storeService.ensureWritable(stores[0].id);
+      return {
+        index,
+        storeId: stores[0].id,
+        reportDate: target.reportDate,
+        prepared: this.parseUpload(target.reportDate, file),
+      };
+    });
+    const results = await this.databaseService.commitAdUploadBatchCommitted({
+      scopes: prepared.map(({ storeId, reportDate, prepared: upload }) => ({
+        storeId,
+        reportDate,
+        campaignIds: upload.campaigns.map((campaign) => campaign.campaignId),
+      })),
+      build: (draft) => this.buildPreparedUploads(draft, prepared, false),
+    });
+    const datesByStore = new Map<string, Set<string>>();
+    for (const target of prepared) {
+      const dates = datesByStore.get(target.storeId) ?? new Set<string>();
+      dates.add(target.reportDate);
+      datesByStore.set(target.storeId, dates);
+    }
+    const summaries = new Map<string, boolean>();
+    for (const [storeId, dates] of datesByStore) {
+      const summary = await this.profitSummaryService
+        ?.refreshStoreDateListBestEffort({
+          storeId,
+          dates: [...dates],
+          reason: "AD_UPLOAD",
+        })
+        .catch(() => null);
+      summaries.set(storeId, !!summary);
+    }
+    const items = results.map((result) => {
+      const { storeId, reportDate, prepared: upload } = prepared[result.index];
+      return {
+        uploadId: result.uploadId!,
+        originalFileName: upload.originalFileName,
+        storeId,
+        storeName: snapshot.stores.find((store) => store.id === storeId)!.name,
+        reportDate,
+        detectedWeekday: upload.detectedWeekday,
+        weekdayValidationStatus: "PASSED" as const,
+        status: "CONFIRMED" as const,
+        confirmedRowCount: upload.campaigns.length,
+        summaryStatus: summaries.get(storeId)
+          ? ("SUCCEEDED" as const)
+          : ("WARNING" as const),
+      };
+    });
+    return formatApiSuccess({
+      items,
+      fileCount: items.length,
+      confirmedRowCount: items.reduce(
+        (sum, item) => sum + item.confirmedRowCount,
+        0,
+      ),
+    });
+  }
+
   private parseUpload(
     reportDate: string,
     file: Express.Multer.File,
@@ -192,6 +292,13 @@ export class AdsService implements OnModuleInit {
       throw new BadRequestException({
         success: false,
         message: "빈 엑셀 파일은 업로드할 수 없습니다.",
+        fileName: originalFileName,
+      });
+    }
+    if (file.buffer.length > 10 * 1024 * 1024) {
+      throw new BadRequestException({
+        success: false,
+        message: "파일당 최대 10MB까지 업로드할 수 있습니다.",
         fileName: originalFileName,
       });
     }
@@ -236,6 +343,7 @@ export class AdsService implements OnModuleInit {
     this.assertNoDuplicateCampaignIds(
       campaigns.map((campaign) => campaign.campaignId),
       "AD_UPLOAD_DUPLICATE_IN_FILE",
+      originalFileName,
     );
     const detectedWeekdays = Array.from(
       new Set(campaigns.map((item) => item.weekday).filter(Boolean)),
@@ -284,137 +392,158 @@ export class AdsService implements OnModuleInit {
       campaignIds: files.flatMap(({ prepared }) =>
         prepared.campaigns.map((campaign) => campaign.campaignId),
       ),
-      build: (draft) => {
-        // Recheck overlap inside the serialized commit, including preceding files in this batch.
-        const activeCampaignIds = new Set(
-          this.getActiveConfirmedRows(draft, storeId, reportDate).map((row) =>
-            row.campaignId.trim(),
-          ),
-        );
-        const signatureIndex = createAdCampaignSignatureIndex(draft);
-        const touchedSignatureIds = new Set<string>();
-        const uploads: AdExcelUpload[] = [];
-        const confirmedRows: AdCampaignDailyCost[] = [];
-        const auditLogs: DatabaseShape["auditLogs"] = [];
-        const fileResults: AdUploadFileResult[] = [];
-        const timestamp = nowIso();
-        for (const { index, prepared } of files) {
-          try {
-            this.assertNoCampaignIdOverlap(
-              prepared.campaigns.map((campaign) => campaign.campaignId),
-              activeCampaignIds,
-              "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
-            );
-          } catch (error) {
-            if (!allowPartial) throw error;
-            fileResults.push({
-              index,
-              fileName: prepared.originalFileName,
-              success: false,
-              message:
-                error instanceof Error
-                  ? error.message
-                  : "중복 캠페인이 있습니다.",
-            });
-            continue;
-          }
-          const upload: AdExcelUpload = {
-            id: createId(),
-            storeId,
-            sourceType: "NAVER_DA_XLSX",
-            originalFileName: prepared.originalFileName,
-            fileHash: prepared.fileHash,
-            reportDate,
-            detectedWeekday: prepared.detectedWeekday,
-            weekdayValidationStatus: "PASSED",
-            replacedUploadId: null,
-            // These files are confirmed immediately; preview-staleness hashes are only needed by legacy previews.
-            previewRuleSnapshotHash: null,
-            previewOverrideSnapshotHash: null,
-            previewCreatedAt: null,
-            previewExpiresAt: null,
-            state: "CONFIRMED",
-            isActive: true,
-            createdAt: timestamp,
-            updatedAt: timestamp,
-          };
-          uploads.push(upload);
-          for (const campaign of prepared.campaigns) {
-            activeCampaignIds.add(campaign.campaignId);
-            const normalizedCampaignName = normalizeText(campaign.campaignName);
-            const signature = upsertAdCampaignSignature(
-              draft,
-              {
-                storeId,
-                campaignId: campaign.campaignId,
-                campaignName: campaign.campaignName,
-                normalizedCampaignName,
-                reportDate,
-              },
-              signatureIndex,
-            );
-            touchedSignatureIds.add(signature.id);
-            confirmedRows.push({
-              ...campaign,
-              id: createId(),
-              uploadId: upload.id,
-              sourceUploadId: upload.id,
-              adCampaignSignatureId: signature.id,
-              storeId,
-              reportDate,
-              normalizedCampaignName,
-              matchedRuleCount: signature.matchedRuleCount,
-              canonicalSalesUnitId: signature.canonicalSalesUnitId,
-              mappingReason: signature.mappingReason,
-              reasonNote: signature.reasonNote,
-              reasonNoteInherited: signature.reasonNoteInherited,
-              createdAt: timestamp,
-              updatedAt: timestamp,
-            });
-          }
-          auditLogs.push(
-            this.auditLogService.createAuditLog({
-              storeId,
-              domain: "AD_UPLOAD",
-              action: "CREATE",
-              targetId: upload.id,
-              actorIdentifier: "LOCALHOST_ADMIN",
-              beforeJson: null,
-              afterJson: {
-                reportDate,
-                originalFileName: prepared.originalFileName,
-                confirmedRowCount: prepared.campaigns.length,
-              },
-            }),
-          );
-          fileResults.push({
-            index,
-            fileName: prepared.originalFileName,
-            success: true,
-            uploadId: upload.id,
-          });
-        }
-        if (confirmedRows.length) {
-          recalculateAdCampaignSignaturesForStore(draft, storeId, {
-            signatureIds: touchedSignatureIds,
-            applyToRows: true,
-            rows: confirmedRows,
-          });
-        }
-        return {
-          uploads,
-          rows: confirmedRows,
-          auditLogs,
-          signatures: draft.adCampaignSignatures.filter((signature) =>
-            touchedSignatureIds.has(signature.id),
-          ),
-          result: fileResults,
-        };
-      },
+      build: (draft) =>
+        this.buildPreparedUploads(
+          draft,
+          files.map((file) => ({ ...file, storeId, reportDate })),
+          allowPartial,
+        ),
     });
     if (results.some((result) => result.success))
       await this.recalculateProfitSummaryForAdDate(storeId, reportDate);
     return results;
+  }
+
+  private buildPreparedUploads(
+    draft: DatabaseShape,
+    files: PreparedAdUploadTarget[],
+    allowPartial: boolean,
+  ) {
+    const signatureIndex = createAdCampaignSignatureIndex(draft);
+    const touchedSignatureIds = new Set<string>();
+    const uploads: AdExcelUpload[] = [];
+    const confirmedRows: AdCampaignDailyCost[] = [];
+    const auditLogs: DatabaseShape["auditLogs"] = [];
+    const fileResults: AdUploadFileResult[] = [];
+    const timestamp = nowIso();
+    const activeCampaignsByScope = new Map<string, Set<string>>();
+    for (const { index, storeId, reportDate, prepared } of files) {
+      const scopeKey = JSON.stringify([storeId, reportDate]);
+      let activeCampaignIds = activeCampaignsByScope.get(scopeKey);
+      if (!activeCampaignIds) {
+        activeCampaignIds = new Set(
+          this.getActiveConfirmedRows(draft, storeId, reportDate).map((row) =>
+            row.campaignId.trim(),
+          ),
+        );
+        activeCampaignsByScope.set(scopeKey, activeCampaignIds);
+      }
+      try {
+        this.assertNoCampaignIdOverlap(
+          prepared.campaigns.map((campaign) => campaign.campaignId),
+          activeCampaignIds,
+          "AD_UPLOAD_DUPLICATE_WITH_ACTIVE_UPLOAD",
+          prepared.originalFileName,
+        );
+      } catch (error) {
+        if (!allowPartial) throw error;
+        fileResults.push({
+          index,
+          fileName: prepared.originalFileName,
+          success: false,
+          message:
+            error instanceof Error ? error.message : "중복 캠페인이 있습니다.",
+        });
+        continue;
+      }
+      const upload: AdExcelUpload = {
+        id: createId(),
+        storeId,
+        sourceType: "NAVER_DA_XLSX",
+        originalFileName: prepared.originalFileName,
+        fileHash: prepared.fileHash,
+        reportDate,
+        detectedWeekday: prepared.detectedWeekday,
+        weekdayValidationStatus: "PASSED",
+        replacedUploadId: null,
+        // These files are confirmed immediately; preview-staleness hashes are only needed by legacy previews.
+        previewRuleSnapshotHash: null,
+        previewOverrideSnapshotHash: null,
+        previewCreatedAt: null,
+        previewExpiresAt: null,
+        state: "CONFIRMED",
+        isActive: true,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      uploads.push(upload);
+      for (const campaign of prepared.campaigns) {
+        activeCampaignIds.add(campaign.campaignId);
+        const normalizedCampaignName = normalizeText(campaign.campaignName);
+        const signature = upsertAdCampaignSignature(
+          draft,
+          {
+            storeId,
+            campaignId: campaign.campaignId,
+            campaignName: campaign.campaignName,
+            normalizedCampaignName,
+            reportDate,
+          },
+          signatureIndex,
+        );
+        touchedSignatureIds.add(signature.id);
+        confirmedRows.push({
+          ...campaign,
+          id: createId(),
+          uploadId: upload.id,
+          sourceUploadId: upload.id,
+          adCampaignSignatureId: signature.id,
+          storeId,
+          reportDate,
+          normalizedCampaignName,
+          matchedRuleCount: signature.matchedRuleCount,
+          canonicalSalesUnitId: signature.canonicalSalesUnitId,
+          mappingReason: signature.mappingReason,
+          reasonNote: signature.reasonNote,
+          reasonNoteInherited: signature.reasonNoteInherited,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }
+      auditLogs.push(
+        this.auditLogService.createAuditLog({
+          storeId,
+          domain: "AD_UPLOAD",
+          action: "CREATE",
+          targetId: upload.id,
+          actorIdentifier: "LOCALHOST_ADMIN",
+          beforeJson: null,
+          afterJson: {
+            reportDate,
+            originalFileName: prepared.originalFileName,
+            confirmedRowCount: prepared.campaigns.length,
+          },
+        }),
+      );
+      fileResults.push({
+        index,
+        fileName: prepared.originalFileName,
+        success: true,
+        uploadId: upload.id,
+      });
+    }
+    const rowsByStore = new Map<string, AdCampaignDailyCost[]>();
+    for (const row of confirmedRows) {
+      const rows = rowsByStore.get(row.storeId) ?? [];
+      rows.push(row);
+      rowsByStore.set(row.storeId, rows);
+    }
+    for (const [storeId, rows] of rowsByStore) {
+      recalculateAdCampaignSignaturesForStore(draft, storeId, {
+        signatureIds: new Set(rows.map((row) => row.adCampaignSignatureId!)),
+        applyToRows: true,
+        rows,
+      });
+    }
+    return {
+      uploads,
+      rows: confirmedRows,
+      auditLogs,
+      signatures: draft.adCampaignSignatures.filter((signature) =>
+        touchedSignatureIds.has(signature.id),
+      ),
+      result: fileResults,
+    };
   }
 
   listPreviewRows(uploadId: string, page?: number, pageSize?: number) {
@@ -1185,7 +1314,11 @@ export class AdsService implements OnModuleInit {
     );
   }
 
-  private assertNoDuplicateCampaignIds(campaignIds: string[], reason: string) {
+  private assertNoDuplicateCampaignIds(
+    campaignIds: string[],
+    reason: string,
+    fileName?: string,
+  ) {
     const duplicateCampaignIds = this.findDuplicateCampaignIds(campaignIds);
     if (duplicateCampaignIds.length === 0) {
       return;
@@ -1194,6 +1327,7 @@ export class AdsService implements OnModuleInit {
     throw new BadRequestException({
       success: false,
       message: `파일 안에 같은 캠페인 ID가 중복되어 있습니다. (${this.summarizeCampaignIds(duplicateCampaignIds)})`,
+      fileName,
       errors: [{ field: "campaignId", reason }],
     });
   }
@@ -1202,6 +1336,7 @@ export class AdsService implements OnModuleInit {
     candidateCampaignIds: string[],
     activeConfirmedRows: AdCampaignDailyCost[] | Set<string>,
     reason: string,
+    fileName?: string,
   ) {
     const activeConfirmedCampaignIds =
       activeConfirmedRows instanceof Set
@@ -1221,6 +1356,7 @@ export class AdsService implements OnModuleInit {
     throw new BadRequestException({
       success: false,
       message: `같은 보고일에 이미 업로드된 캠페인 ID가 있습니다. (${this.summarizeCampaignIds(duplicateCampaignIds)})`,
+      fileName,
       errors: [{ field: "campaignId", reason }],
     });
   }

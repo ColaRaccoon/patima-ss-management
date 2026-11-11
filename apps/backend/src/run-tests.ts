@@ -65,6 +65,7 @@ import { runProfitRegressionTests } from "./profit-regression-tests";
 import { runStartupRegressionTests } from "./startup-regression-tests";
 import { runAdUploadPersistenceTests } from "./ad-upload-persistence-tests";
 import { runAdMappingPerformanceTests } from "./ad-mapping-performance-tests";
+import { runAdUploadRegressionTests } from "./ad-upload-regression-tests";
 import {
   DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS,
   getKstRetentionCutoffDate,
@@ -152,6 +153,7 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
   saveOrderManualMappingsCommittedCalls: 0,
   saveAdCampaignMappingsCommittedCalls: 0,
   commitAdUploadsCommittedCalls: 0,
+  commitAdUploadBatchCommittedCalls: 0,
   replaceDailyProfitSummariesCommittedCalls: 0,
   removeDailyProfitSummariesCommittedCalls: 0,
   getStorageMode() {
@@ -186,10 +188,28 @@ const createMemoryDatabaseService = (database = createEmptyDatabase()) => ({
     };
   }): Promise<T> {
     this.commitAdUploadsCommittedCalls += 1;
+    return this.commitAdUploadBatchCommitted({
+      scopes: [{ storeId: params.storeId, reportDate: params.reportDate, campaignIds: params.campaignIds }],
+      build: params.build,
+    });
+  },
+  async commitAdUploadBatchCommitted<T>(params: {
+    scopes: Array<{ storeId: string; reportDate: string; campaignIds: string[] }>;
+    build: (draft: typeof database) => {
+      uploads: typeof database.adExcelUploads;
+      signatures: typeof database.adCampaignSignatures;
+      rows: typeof database.adCampaignDailyCosts;
+      auditLogs: typeof database.auditLogs;
+      result: T;
+    };
+  }): Promise<T> {
+    this.commitAdUploadBatchCommittedCalls += 1;
     const apply = (draft: typeof database): T => {
-      const store = draft.stores.find((item) => item.id === params.storeId);
-      if (!store) throw new Error("STORE_NOT_FOUND");
-      if (!store.isActive) throw new Error("STORE_INACTIVE");
+      for (const scope of params.scopes) {
+        const store = draft.stores.find((item) => item.id === scope.storeId);
+        if (!store) throw new Error("STORE_NOT_FOUND");
+        if (!store.isActive) throw new Error("STORE_INACTIVE");
+      }
       const replacement = params.build(draft);
       const merge = <R extends { id: string }>(existing: R[], changed: R[]) => {
         const positions = new Map(existing.map((item, index) => [item.id, index]));
@@ -4111,6 +4131,40 @@ runAsync("DatabaseService writeCommitted propagates PostgreSQL failures without 
   assert.equal(service.getPersistenceStatus().lastPersistenceError?.message, "POSTGRES_COMMIT_FAILED");
 });
 
+runAsync("DatabaseService credential commits skip order tables and preserve memory on rollback", async () => {
+  const service = Object.create(DatabaseService.prototype) as any;
+  service.database = createEmptyDatabase();
+  service.database.commerceCredentials.push({ id: "credential", updatedAt: "before" } as never);
+  service.database.orders.push({ id: "existing-order" } as never);
+  service.storageMode = "postgres";
+  service.persistenceQueue = Promise.resolve();
+  service.pendingWriteCount = 0;
+  service.lastPersistenceError = null;
+  let failCommit = false;
+  const queries: string[] = [];
+  service.pool = { connect: async () => ({
+    query: async (sql: string) => {
+      queries.push(sql);
+      if (sql === "COMMIT" && failCommit) throw new Error("COMMIT_FAILED");
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  }) };
+  await service.writeCommitted((draft: ReturnType<typeof createEmptyDatabase>) => {
+    draft.commerceCredentials[0].updatedAt = "committed";
+  }, ["commerceCredentials"]);
+  assert.equal(service.getSnapshot().commerceCredentials[0].updatedAt, "committed");
+  assert.ok(queries.some((sql) => sql.includes("INSERT INTO commerce_api_credentials")));
+  assert.equal(queries.some((sql) => /(?:INSERT INTO|DELETE FROM) (?:orders|order_items|operations)\b/.test(sql)), false);
+  assert.deepEqual(service.getSnapshot().orders, [{ id: "existing-order" }]);
+  failCommit = true;
+  await assert.rejects(service.writeCommitted((draft: ReturnType<typeof createEmptyDatabase>) => {
+    draft.commerceCredentials[0].updatedAt = "must-rollback";
+  }, ["commerceCredentials"]), /COMMIT_FAILED/);
+  assert.equal(service.getSnapshot().commerceCredentials[0].updatedAt, "committed");
+  assert.ok(queries.includes("ROLLBACK"));
+});
+
 runAsync("DatabaseService file mode writes committed snapshots atomically under DATA_DIR", async () => {
   const originalDatabaseUrl = process.env.DATABASE_URL;
   const originalDataDir = process.env.DATA_DIR;
@@ -7256,6 +7310,7 @@ runAsync("Profit calculation regressions", runProfitRegressionTests);
 runAsync("Application startup regressions", runStartupRegressionTests);
 run("Ad mapping batch performance regressions", runAdMappingPerformanceTests);
 runAsync("Ad upload committed persistence regressions", runAdUploadPersistenceTests);
+runAsync("Ad batch upload regressions", runAdUploadRegressionTests);
 
 void Promise.all(pendingAsyncTests).then(() => {
   console.log("All backend checks passed.");

@@ -121,6 +121,32 @@ export async function runStartupRegressionTests() {
   }
   console.log("PASS token cache renews after secret rotation while retaining the store account");
 
+  const tokenState = fixture();
+  let tokenTables: ReadonlyArray<string> | undefined;
+  const commitToken = tokenState.database.writeCommitted.bind(tokenState.database);
+  tokenState.database.writeCommitted = async (mutator, tables) => {
+    tokenTables = tables;
+    return commitToken(mutator, tables);
+  };
+  const persistedCommerce = new NaverCommerceService(tokenState.database, crypto, config);
+  persistedCommerce.getResolvedConfiguration = () => ({
+    store: tokenState.data.stores[0],
+    credential: { ...activeCredential, credentialId: "credential", source: "DATABASE" },
+  });
+  const tokenFetch = mock.method(globalThis, "fetch", async (url: string | URL | Request) =>
+    String(url).endsWith("/oauth2/token")
+      ? Response.json({ access_token: "persisted-token", expires_in: 3600 })
+      : Response.json([{ channelNo: "channel" }]),
+  );
+  try {
+    await persistedCommerce.testConnection("store");
+    assert.deepEqual(tokenTables, ["commerceCredentials"]);
+    assert.ok(tokenState.data.commerceCredentials[0].lastTokenIssuedAt);
+  } finally {
+    tokenFetch.mock.restore();
+  }
+  console.log("PASS database token renewal persists credentials without uploading order history");
+
   const directory = mkdtempSync(join(tmpdir(), "patima-startup-test-"));
   const overrides: Record<string, string | undefined> = {
     DATABASE_URL: undefined,

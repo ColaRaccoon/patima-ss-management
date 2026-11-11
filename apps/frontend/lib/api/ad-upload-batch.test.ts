@@ -4,6 +4,7 @@ import { test } from "node:test";
 import type { ExecutionContext } from "@nestjs/common";
 import { FilesInterceptor } from "@nestjs/platform-express";
 import { of } from "rxjs";
+import { parseAdUploadFileName } from "@patima/shared";
 import { uploadAdFiles } from "./ad-upload-batch";
 import { POST } from "../../app/api/ad-uploads/batch/route";
 import { repairMojibakeText } from "../../../backend/src/helpers";
@@ -241,4 +242,164 @@ test("Korean filenames survive helper, Next proxy and Nest multipart parsing wit
     { file: files[2], reason: "엑셀 파일만 업로드해 주세요." },
   ]);
   assert.deepEqual(progress, [0, 10, 12]);
+});
+
+function makeAutomaticFiles(count: number) {
+  return Array.from({ length: count }, (_, index) => {
+    const date = new Date(Date.UTC(2026, 0, index + 1)).toISOString().slice(2, 10).replaceAll("-", "");
+    return new File([`data-${index}`], `${date}_${index % 2 ? "파티마서브" : "인피니티메인"}.xlsx`);
+  });
+}
+
+function automaticPayload(files: File[]) {
+  const items = files.map((file, index) => ({
+    originalFileName: file.name,
+    ...parseAdUploadFileName(file.name)!,
+    uploadId: `auto-upload-${index}`,
+    confirmedRowCount: index + 1,
+    summaryStatus: index === 0 ? "WARNING" : "SUCCEEDED",
+  }));
+  return { items, fileCount: items.length, confirmedRowCount: items.reduce((sum, item) => sum + item.confirmedRowCount, 0) };
+}
+
+function automaticRequest(files: File[]) {
+  const body = new FormData();
+  for (const file of files) body.append("files", file);
+  return new Request("http://localhost/api/ad-uploads/batch", { method: "POST", body });
+}
+
+test("automatic uploads keep mixed stores and dates in one atomic request with result details", async (context) => {
+  const files = makeAutomaticFiles(12);
+  const progress: number[] = [];
+  const expected = automaticPayload(files);
+  const fetch = context.mock.method(globalThis, "fetch", async (_input: string, init: RequestInit) => {
+    const body = init.body as FormData;
+    assert.equal(body.has("storeId"), false);
+    assert.equal(body.has("reportDate"), false);
+    assert.deepEqual(body.getAll("files"), files);
+    return Response.json({ success: true, data: { ...expected, items: [...expected.items].reverse() } });
+  });
+  const result = await uploadAdFiles({ files, onProgress: (completed) => progress.push(completed) });
+  assert.equal(fetch.mock.callCount(), 1, "never split an atomic upload at the manual chunk boundary");
+  assert.deepEqual(result.succeeded, files);
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(result.details, expected.items);
+  assert.equal(result.details?.[0].summaryStatus, "WARNING");
+  assert.equal(new Set(result.details?.map((item) => item.storeName)).size, 2);
+  assert.deepEqual(progress, [0, 12]);
+});
+
+test("automatic upload supports 100 files and rejects 101 without splitting or sending", async (context) => {
+  const files = makeAutomaticFiles(100);
+  const fetch = context.mock.method(globalThis, "fetch", async () => Response.json({ success: true, data: automaticPayload(files) }));
+  assert.equal((await uploadAdFiles({ mode: "auto", files })).succeeded.length, 100);
+  const tooMany = makeAutomaticFiles(101);
+  const rejected = await uploadAdFiles({ mode: "auto", files: tooMany });
+  assert.deepEqual(rejected.succeeded, []);
+  assert.deepEqual(rejected.failed.map(({ file }) => file), tooMany);
+  assert.match(rejected.failed[0].reason, /최대 100개/);
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test("automatic mode retains all files when a filename, date or size is invalid", async (context) => {
+  const fetch = context.mock.method(globalThis, "fetch", async () => { throw new Error("Unexpected request"); });
+  const invalidFiles = [
+    new File(["data"], "manual-name.xlsx"),
+    new File(["data"], "260230_파티마.xlsx"),
+    new File([], "260101_파티마.xlsx"),
+    new File([new Uint8Array(10 * 1024 * 1024 + 1)], "260101_파티마.xlsx"),
+  ];
+  for (const invalid of invalidFiles) {
+    const files = [...makeAutomaticFiles(1), invalid];
+    const result = await uploadAdFiles({ mode: "auto", files });
+    assert.deepEqual(result.succeeded, []);
+    assert.deepEqual(result.failed.map(({ file }) => file), files);
+    assert.match(result.failed[0].reason, /모두 반영되지 않았습니다/);
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("automatic server rejection and lost responses retain the entire selection", async (context) => {
+  for (const scenario of ["validation", "network"] as const) {
+    await context.test(scenario, async (subcontext) => {
+      const files = makeAutomaticFiles(12);
+      const fetch = subcontext.mock.method(globalThis, "fetch", async () => {
+        if (scenario === "network") throw new TypeError("fetch failed");
+        return Response.json({ message: "중복 캠페인", fileName: files[1].name }, { status: 400 });
+      });
+      const result = await uploadAdFiles({ files, mode: "auto" });
+      assert.deepEqual(result.succeeded, []);
+      assert.deepEqual(result.failed.map(({ file }) => file), files);
+      assert.equal(fetch.mock.callCount(), 1);
+      if (scenario === "validation") {
+        assert.ok(result.failed[0].reason.includes(files[1].name));
+        assert.match(result.failed[0].reason, /모두 반영되지 않았습니다/);
+      } else assert.match(result.failed[0].reason, /업로드 이력을 확인/);
+    });
+  }
+});
+
+test("automatic success requires complete and matching filenames, targets, IDs and counts", async (context) => {
+  const files = makeAutomaticFiles(2);
+  for (const scenario of ["missing file", "duplicate ID", "wrong filename", "wrong target", "wrong count", "wrong summary"] as const) {
+    await context.test(scenario, async (subcontext) => {
+      const data = automaticPayload(files);
+      if (scenario === "missing file") data.items.pop();
+      if (scenario === "duplicate ID") data.items[1].uploadId = data.items[0].uploadId;
+      if (scenario === "wrong filename") data.items[1].originalFileName = data.items[0].originalFileName;
+      if (scenario === "wrong target") data.items[1].reportDate = data.items[0].reportDate;
+      if (scenario === "wrong count") data.confirmedRowCount += 1;
+      if (scenario === "wrong summary") data.items[0].summaryStatus = "UNKNOWN";
+      subcontext.mock.method(globalThis, "fetch", async () => Response.json({ success: true, data }));
+      const result = await uploadAdFiles({ files, mode: "auto" });
+      assert.deepEqual(result.succeeded, []);
+      assert.deepEqual(result.failed.map(({ file }) => file), files);
+      assert.match(result.failed[0].reason, /업로드 이력을 확인/);
+    });
+  }
+});
+
+test("manual mode rejects an oversized file while still uploading the other files", async (context) => {
+  const oversized = new File([new Uint8Array(10 * 1024 * 1024 + 1)], "oversized.xlsx");
+  const files = [oversized, ...makeFiles(1)];
+  context.mock.method(globalThis, "fetch", async (_input: string, init: RequestInit) => {
+    const uploaded = (init.body as FormData).getAll("files") as File[];
+    assert.deepEqual(uploaded, [files[1]]);
+    return Response.json({ success: true, data: { results: successfulResults(uploaded), confirmedFileCount: 1 } });
+  });
+  const result = await uploadAdFiles({ mode: "manual", files, storeId: "s", reportDate: "2026-01-01" });
+  assert.deepEqual(result.succeeded, [files[1]]);
+  assert.deepEqual(result.failed.map(({ file }) => file), [oversized]);
+});
+
+test("proxy accepts automatic 100-file batches and rejects partial manual targeting", async (context) => {
+  const files = makeAutomaticFiles(100);
+  const fetch = context.mock.method(globalThis, "fetch", async (_input: string, init: RequestInit) => {
+    const body = init.body as FormData;
+    assert.equal(body.has("storeId"), false);
+    assert.equal(body.has("reportDate"), false);
+    assert.equal(body.getAll("files").length, 100);
+    return Response.json({ success: true, data: automaticPayload(files) }, { status: 201 });
+  });
+  assert.equal((await POST(automaticRequest(files))).status, 201);
+  assert.equal((await POST(automaticRequest(makeAutomaticFiles(101)))).status, 400);
+  for (const field of ["storeId", "reportDate"]) {
+    const body = new FormData();
+    body.append("files", files[0]);
+    body.append(field, field === "storeId" ? "store-a" : "2026-01-01");
+    assert.equal((await POST(new Request("http://localhost/api/ad-uploads/batch", { method: "POST", body }))).status, 400);
+  }
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test("automatic proxy preserves upstream validation errors and rejects empty or oversized files", async (context) => {
+  const error = { message: "파일명 확인", fileName: "invalid.xlsx" };
+  const fetch = context.mock.method(globalThis, "fetch", async () => Response.json(error, { status: 400 }));
+  const response = await POST(automaticRequest(makeAutomaticFiles(1)));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), error);
+  assert.equal((await POST(automaticRequest([new File([], "260101_파티마.xlsx")]))).status, 400);
+  const oversized = new File([new Uint8Array(10 * 1024 * 1024 + 1)], "260101_파티마.xlsx");
+  assert.equal((await POST(automaticRequest([oversized]))).status, 400);
+  assert.equal(fetch.mock.callCount(), 1);
 });

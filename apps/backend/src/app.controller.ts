@@ -489,6 +489,22 @@ export class AppController {
     return this.salesUnitService.dissolveGroup(body.storeId, groupId);
   }
 
+  @Post("ad-uploads/batch")
+  @UseInterceptors(FilesInterceptor("files", 100, { limits: { fileSize: 10 * 1024 * 1024 } }))
+  uploadAdBatch(
+    @UploadedFiles() files: Express.Multer.File[],
+    @Body("storeId") storeId?: string,
+    @Body("reportDate") reportDate?: string,
+  ) {
+    if (storeId !== undefined || reportDate !== undefined) {
+      if (typeof storeId !== "string" || !storeId.trim() || typeof reportDate !== "string" || !reportDate) {
+        throw new BadRequestException("직접 지정할 때는 스토어와 보고일을 모두 입력하세요.");
+      }
+      return this.adsService.previewUploads(storeId.trim(), reportDate, files);
+    }
+    return this.adsService.uploadBatch(files);
+  }
+
   @Post("ad-uploads/preview")
   @UseInterceptors(FileInterceptor("file"))
   previewAdUpload(
@@ -497,16 +513,6 @@ export class AppController {
     @Body("reportDate") reportDate: string,
   ) {
     return this.adsService.previewUpload(storeId, reportDate, file);
-  }
-
-  @Post("ad-uploads/batch")
-  @UseInterceptors(FilesInterceptor("files", 10))
-  previewAdUploads(
-    @UploadedFiles() files: Express.Multer.File[],
-    @Body("storeId") storeId: string,
-    @Body("reportDate") reportDate: string,
-  ) {
-    return this.adsService.previewUploads(storeId, reportDate, files);
   }
 
   @Get("ad-uploads/:uploadId/preview-rows")

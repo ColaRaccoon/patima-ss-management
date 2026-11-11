@@ -666,7 +666,7 @@ export class OperationService {
         beforeJson: null,
         afterJson: result,
       });
-    });
+    }, ["auditLogs"]);
   }
 
   private async cleanupStaleOperations() {

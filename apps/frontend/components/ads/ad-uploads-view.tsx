@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { parseAdUploadFileName } from "@patima/shared";
 import { useRef, useState, useTransition, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { DataTable } from "@/components/shared/data-table";
@@ -30,6 +31,8 @@ export function AdUploadsView({ data }: { data: AdUploadsPageData }) {
 function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
   const router = useRouter();
   const [reportDate, setReportDate] = useState("");
+  const [uploadMode, setUploadMode] = useState<"auto" | "manual">("auto");
+  const [summaryWarning, setSummaryWarning] = useState<string | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -66,6 +69,7 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
     mutationInFlight.current = true;
     setErrorMessage(null);
     setSuccessMessage(null);
+    setSummaryWarning(null);
     setDeletingUploadId(uploadId);
     try {
       await readApiResponse(
@@ -90,7 +94,7 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
       <PageHeader
         eyebrow="Ad Uploads"
         title="DA 광고 업로드"
-        description="같은 보고일의 .xlsx 파일을 여러 개 선택할 수 있습니다. 요일 검증을 통과한 파일은 즉시 적용됩니다."
+        description="파일명에서 스토어와 날짜를 자동으로 분류합니다. 여러 스토어·날짜의 파일을 함께 선택하거나 직접 지정할 수 있습니다."
         actions={
           <>
             <Link className="button-shell button-secondary" href={mappingsHref}>
@@ -100,9 +104,9 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
               className="button-shell button-primary"
               type="submit"
               form="ad-upload-form"
-              disabled={isBusy || !reportDate || selectedFiles.length === 0}
+              disabled={isBusy || (uploadMode === "manual" && !reportDate) || selectedFiles.length === 0}
             >
-              {isUploading ? `업로드 중 ${uploadProgress.completed}/${uploadProgress.total}` : isRetry ? "실패한 파일 다시 업로드" : "업로드"}
+              {isUploading ? `업로드 중 ${uploadProgress.completed}/${uploadProgress.total}` : isRetry ? "선택한 파일 다시 업로드" : "업로드"}
             </button>
           </>
         }
@@ -113,7 +117,7 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
       <div className="grid gap-6">
         <Panel
           title="광고 파일 업로드"
-          description="보고일을 고르고 .xlsx 파일을 선택하세요. 실패한 파일은 선택을 유지하므로 바로 다시 시도할 수 있습니다."
+          description={uploadMode === "auto" ? "YYMMDD_인피니티[메인/서브].xlsx 또는 YYMMDD_파티마[메인/서브].xlsx 형식으로 최대 100개, 파일당 10MB까지 선택하세요." : "현재 선택한 스토어와 보고일에 업로드합니다. 파일명 형식과 관계없이 파일별로 검증하고 반영합니다."}
         >
           <form
             id="ad-upload-form"
@@ -123,7 +127,8 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
               setErrorMessage(null);
               setSuccessMessage(null);
 
-              if (!reportDate.trim()) {
+              setSummaryWarning(null);
+              if (uploadMode === "manual" && !reportDate.trim()) {
                 setErrorMessage("보고일을 선택해 주세요.");
                 return;
               }
@@ -136,10 +141,10 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
               mutationInFlight.current = true;
               setIsUploading(true);
               try {
-                const { succeeded, failed } = await uploadAdFiles({
+                const { succeeded, failed, details } = await uploadAdFiles({
                   files: selectedFiles,
-                  storeId: primaryStore.id,
-                  reportDate,
+                  mode: uploadMode,
+                  ...(uploadMode === "manual" ? { storeId: primaryStore.id, reportDate } : {}),
                   onProgress: (completed, total) => setUploadProgress({ completed, total }),
                 });
                 setSelectedFiles(failed.map(({ file }) => file));
@@ -147,7 +152,13 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
                 setFileInputSeed((value) => value + 1);
 
                 if (succeeded.length > 0) {
-                  setSuccessMessage(`${succeeded.length}개 파일이 업로드되었습니다: ${succeeded.map((file) => file.name).join(", ")}`);
+                  const lines = details
+                    ? details.map((item) => `${item.originalFileName} → ${item.storeName} / ${item.reportDate} / ${item.confirmedRowCount}건`)
+                    : succeeded.map((file) => `${file.name} → ${primaryStore.name} / ${reportDate}`);
+                  setSuccessMessage(`${succeeded.length}개 파일을 업로드했습니다.\n${lines.join("\n")}`);
+                  if (details?.some((item) => item.summaryStatus !== "SUCCEEDED")) {
+                    setSummaryWarning("광고 파일은 저장됐지만 일부 손익 집계를 갱신하지 못했습니다. 손익 집계를 다시 실행해 주세요.");
+                  }
                 }
                 // A lost response may still have committed; refresh history for every completed batch.
                 startRefresh(() => router.refresh());
@@ -156,7 +167,9 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
                   const failureLines = failed
                     .map((item) => `${item.file.name}: ${item.reason}`)
                     .join("\n");
-                  setErrorMessage(`업로드를 확인하지 못한 파일 ${failed.length}개:\n${failureLines}`);
+                  setErrorMessage(uploadMode === "auto"
+                    ? failed[0].reason
+                    : `업로드를 확인하지 못한 파일 ${failed.length}개:\n${failureLines}`);
                 }
               } catch (error) {
                 setErrorMessage(error instanceof Error ? error.message : "광고 파일 업로드에 실패했습니다.");
@@ -166,8 +179,30 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
               }
             }}
           >
-            <div className="grid gap-4 xl:grid-cols-[200px_1fr]">
-              <label className="block">
+            <fieldset disabled={isBusy} className="mb-5">
+              <legend className="mb-2 text-sm font-medium text-ink">업로드 방식</legend>
+              <div className="flex flex-wrap gap-4">
+                {([{ value: "auto", label: "파일명으로 자동 분류" }, { value: "manual", label: "스토어·보고일 직접 지정" }] as const).map(({ value, label }) => (
+                  <label key={value} className="flex cursor-pointer items-center gap-2 rounded-xl border border-ink/15 bg-white/70 px-4 py-3 text-sm">
+                    <input type="radio" name="ad-upload-mode" value={value} checked={uploadMode === value} onChange={() => {
+                      setUploadMode(value);
+                      setIsRetry(false);
+                      setErrorMessage(null);
+                      setSuccessMessage(null);
+                      setSummaryWarning(null);
+                    }} />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-2 text-sm leading-6 text-ink/65">
+                {uploadMode === "auto"
+                  ? "모든 파일이 검증을 통과하면 함께 반영합니다. 오류가 있으면 선택한 파일 전체를 유지합니다."
+                  : `대상 스토어: ${primaryStore.name}. 검증을 통과한 파일은 먼저 반영하고, 실패한 파일만 다시 시도합니다.`}
+              </p>
+            </fieldset>
+            <div className={uploadMode === "manual" ? "grid gap-4 xl:grid-cols-[200px_1fr]" : "grid gap-4"}>
+              {uploadMode === "manual" ? <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">보고일</span>
                 <input
                   className="input-shell"
@@ -177,7 +212,7 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
                   value={reportDate}
                   onChange={(event) => setReportDate(event.target.value)}
                 />
-              </label>
+              </label> : null}
               <label className="block">
                 <span className="mb-2 block text-sm font-medium text-ink">.xlsx 파일 선택 (여러 개 가능)</span>
                 <input
@@ -193,6 +228,7 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
                     setIsRetry(false);
                     setErrorMessage(null);
                     setSuccessMessage(null);
+                    setSummaryWarning(null);
                   }}
                 />
                 <span className="mt-2 block text-xs text-ink/55">
@@ -204,9 +240,15 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
             </div>
 
             {selectedFiles.length > 0 ? (
-              <p className="mt-3 text-sm text-ink/65">
-                선택된 파일: {selectedFiles.map((file) => file.name).join(", ")}
-              </p>
+              <ul className="mt-3 max-h-64 space-y-1 overflow-auto text-sm text-ink/65" aria-label="선택한 파일과 업로드 대상">
+                {selectedFiles.map((file, index) => {
+                  const target = uploadMode === "auto" ? parseAdUploadFileName(file.name) : { storeName: primaryStore.name, reportDate };
+                  const invalidSize = file.size > 10 * 1024 * 1024 || file.size === 0;
+                  return <li key={`${file.name}-${index}`} className={!target || invalidSize ? "text-red-700" : undefined}>
+                    {file.name} → {invalidSize ? "파일 크기를 확인하세요 (1바이트~10MB)" : target ? `${target.storeName} / ${target.reportDate || "보고일을 선택하세요"}` : "파일명 또는 날짜를 확인하세요"}
+                  </li>;
+                })}
+              </ul>
             ) : null}
 
             {isUploading ? (
@@ -223,22 +265,23 @@ function StoreAdUploadsView({ data }: { data: AdUploadsPageData }) {
             ) : null}
 
             {successMessage ? (
-              <div role="status" className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+              <div role="status" className="mt-4 whitespace-pre-line rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
                 {successMessage}
               </div>
             ) : null}
+            {summaryWarning ? <p role="alert" className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">{summaryWarning}</p> : null}
           </form>
 
           <div className="mt-4 rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-            같은 보고일에 여러 파일을 누적할 수 있습니다.
-            이미 반영된 캠페인이 포함된 파일은 중복으로 반영되지 않습니다. 파일을 교체하려면 아래 이력에서 기존 파일을 삭제한 후 다시 업로드하세요.
+            같은 스토어·날짜에 이미 반영된 캠페인은 중복 반영하지 않습니다. 파일을 교체하려면 아래 이력에서 기존 파일을 삭제한 후 다시 업로드하세요.
+            업로드 이력은 현재 선택한 스토어 기준입니다.
           </div>
         </Panel>
       </div>
 
       <Panel
         title="업로드 이력"
-        description="같은 보고일의 확정 파일은 함께 합산됩니다. 삭제하면 해당 파일의 광고비가 손익에서 제외됩니다."
+        description={`현재 선택한 스토어(${primaryStore.name})의 업로드 이력입니다. 삭제하면 해당 파일의 광고비가 손익에서 제외됩니다.`}
       >
         <DataTable
           caption="광고 업로드 이력"
