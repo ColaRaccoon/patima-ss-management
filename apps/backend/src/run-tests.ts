@@ -1805,6 +1805,11 @@ runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and r
   assert.equal(result.items[0].totalCost, 120);
   assert.match(queries[0].text, /EXISTS \(/);
   assert.match(queries[1].text, /LEFT JOIN LATERAL/);
+  assert.match(queries[1].text, /WITH signature_page AS MATERIALIZED/);
+  assert.ok(
+    queries[1].text.indexOf("LIMIT $") < queries[1].text.indexOf("LEFT JOIN LATERAL"),
+    "campaign pagination must run before aggregating historical costs",
+  );
   assert.equal(queries[0].text.includes("Needle_%' OR true"), false);
   assert.equal(queries[0].params.some((param) => param === "%needle\\_\\%' or true%"), true);
   assert.equal(queries[1].params.at(-2), 20);
@@ -3911,27 +3916,41 @@ run("store ad recalculation repairs all historical rows and preserves confirmed 
   assert.ok(database.adCampaignDailyCosts.filter(row => row.campaignId === "auto" || row.campaignId === "legacy").every(row => row.mappingReason === "NO_RULE" && row.canonicalSalesUnitId === null));
 });
 
-runAsync("campaign mapping startup repairs history and profit summaries without seeding product rules", async () => {
+runAsync("campaign mapping startup repairs all stores in one ad-only commit and refreshes profit summaries", async () => {
   const database = createEmptyDatabase();
   database.canonicalSalesUnits.push(createSalesUnit("calf", "쿨토시", []));
   database.adCampaignDailyCosts.push(createConfirmedUploadRow({ uploadId: "history", reportDate: "2026-04-01", campaignId: "history", campaignName: "카프슬리브", canonicalSalesUnitId: "calf", totalCost: 100 }));
+  database.adCampaignDailyCosts.push({
+    ...database.adCampaignDailyCosts[0], id: "other-history", storeId: "store-2", campaignId: "other-history",
+  });
+  database.orders.push({ id: "unrelated-order", storeId: "store-1" } as never);
+  const ordersBefore = structuredClone(database.orders);
   const refreshes: unknown[] = [];
+  const savedTables: unknown[] = [];
+  const ensuredStores: string[] = [];
   const service = new CampaignMappingService(
-    { getSnapshot: () => database, writeCommitted: async (fn: (draft: typeof database) => void) => fn(database) } as never,
+    { getSnapshot: () => database, writeCommitted: async (fn: (draft: typeof database) => void, tables: unknown) => { savedTables.push(tables); return fn(database); } } as never,
     {} as never,
     { registerRetryExecutor: () => {} } as never,
     {} as never,
-    { ensureStoreLevelSalesUnit: async () => {} } as never,
+    { ensureStoreLevelSalesUnit: async (storeId: string) => { ensuredStores.push(storeId); } } as never,
     { refreshStoreDateListBestEffort: async (params: unknown) => { refreshes.push(params); } } as never,
   );
   await service.onModuleInit();
   assert.equal(refreshes.length, 0);
   // PostgreSQL finishes loading after the concurrent module initialization hooks.
-  database.stores.push({ id: "store-1" } as never);
+  database.stores.push({ id: "store-1" } as never, { id: "store-2" } as never);
   await service.onApplicationBootstrap();
   assert.equal(database.campaignMappings.length, 0);
   assert.equal(database.adCampaignDailyCosts[0].canonicalSalesUnitId, null);
-  assert.deepEqual(refreshes, [{ storeId: "store-1", dates: ["2026-04-01"], reason: "MAPPING_CHANGE" }]);
+  assert.equal(database.adCampaignDailyCosts[1].canonicalSalesUnitId, null);
+  assert.deepEqual(ensuredStores, ["store-1", "store-2"]);
+  assert.deepEqual(refreshes, ["store-1", "store-2"].map((storeId) => ({
+    storeId, dates: ["2026-04-01"], reason: "MAPPING_CHANGE",
+  })));
+  assert.deepEqual(database.orders, ordersBefore);
+  assert.deepEqual(savedTables, [["adCampaignSignatures", "adCampaignDailyCosts"]],
+    "ad startup repair must not upload unrelated order history");
 });
 
 run("evaluateAdMapping returns conflict when multiple aliases match", () => {

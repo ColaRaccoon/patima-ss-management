@@ -31,7 +31,7 @@ export class OrderMappingService implements OnModuleInit {
     for (const storeId of storeIds) {
       await this.databaseService.writeCommitted((draft) => {
         recalculateOrderMappingsForStore(draft, storeId);
-      });
+      }, ["orderSourceSignatures", "orderItems"]);
     }
   }
 

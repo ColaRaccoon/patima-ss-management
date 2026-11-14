@@ -12,9 +12,10 @@ function positiveMilliseconds(value: string | undefined, fallback: number) {
     ? Math.floor(parsed) || fallback
     : fallback;
 }
+// Campaign queries aggregate uploaded history and can legitimately exceed 2.5s.
 const API_FETCH_ATTEMPT_TIMEOUT_MS = positiveMilliseconds(
   process.env.API_FETCH_ATTEMPT_TIMEOUT_MS,
-  2500,
+  15000,
 );
 const API_FETCH_RETRY_WINDOW_MS = positiveMilliseconds(
   process.env.API_FETCH_RETRY_WINDOW_MS,
@@ -55,7 +56,11 @@ function isRetryableNetworkError(error: unknown) {
     return false;
   }
 
-  return error.name === "TypeError" || error.message === "fetch failed";
+  return (
+    error.name === "TimeoutError" ||
+    error.name === "TypeError" ||
+    error.message === "fetch failed"
+  );
 }
 
 // React cache lasts for one server render, including layout + page. An explicit
@@ -69,7 +74,9 @@ const fetchEndpoint = cache(async (endpoint: string): Promise<unknown> => {
         headers: {
           Accept: "application/json",
         },
-        signal: AbortSignal.timeout(API_FETCH_ATTEMPT_TIMEOUT_MS),
+        signal: AbortSignal.timeout(
+          Math.max(1, Math.min(API_FETCH_ATTEMPT_TIMEOUT_MS, retryUntil - Date.now())),
+        ),
       });
 
       if (!response.ok) {
@@ -93,6 +100,9 @@ const fetchEndpoint = cache(async (endpoint: string): Promise<unknown> => {
           Math.max(0, retryUntil - Date.now()),
         ),
       );
+      if (Date.now() >= retryUntil) {
+        throw error;
+      }
     }
   }
 });

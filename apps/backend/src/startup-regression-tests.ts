@@ -6,15 +6,98 @@ import { join } from "node:path";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
 import { CryptoService } from "./crypto.service";
-import { DatabaseService } from "./database.service";
+import { DatabaseService, POSTGRES_SCHEMA_VERSION } from "./database.service";
 import { EnvironmentBootstrapService } from "./environment-bootstrap.service";
 import { createEmptyDatabase } from "./helpers";
 import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { CredentialService } from "./credential.service";
 import { NaverCommerceService, ResolvedCommerceCredential } from "./naver-commerce.service";
 import { mock } from "node:test";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+
+async function runPostgresStartupTests() {
+  const schemaFixture = (version?: number, indexesReady = true) => {
+    const service = Object.create(DatabaseService.prototype) as any;
+    const queries: string[] = [];
+    const migrations: string[] = [];
+    service.pool = { query: async (sql: string) => {
+      queries.push(sql);
+      return { rows: sql.startsWith("SELECT value") && version !== undefined
+        ? [{ value: { version } }] : [] };
+    } };
+    service.backfillPostgresPayloadHashes = async () => { migrations.push("hashes"); };
+    service.warnAboutDuplicateBusinessKeys = async () => { migrations.push("duplicates"); return []; };
+    service.ensurePostgresIndexes = async () => { migrations.push("indexes"); return indexesReady; };
+    return { service, queries, migrations };
+  };
+  const ready = schemaFixture(POSTGRES_SCHEMA_VERSION);
+  await ready.service.ensurePostgresSchema();
+  assert.equal(ready.queries.length, 2, "ready schema needs only metadata setup and a version read");
+  assert.deepEqual(ready.migrations, [], "ordinary restarts must skip full-table migration scans");
+  for (const version of [undefined, POSTGRES_SCHEMA_VERSION - 1]) {
+    const upgrade = schemaFixture(version);
+    await upgrade.service.ensurePostgresSchema();
+    assert.deepEqual(upgrade.migrations, ["hashes", "duplicates", "indexes"]);
+    assert.match(upgrade.queries.at(-1)!, /VALUES \('schema_ready'/);
+  }
+  for (const phase of ["backfillPostgresPayloadHashes", "ensurePostgresIndexes"]) {
+    const failed = schemaFixture();
+    failed.service[phase] = async () => { throw new Error("migration failed"); };
+    await assert.rejects(() => failed.service.ensurePostgresSchema(), /migration failed/);
+    assert.ok(!failed.queries.some((sql) => sql.includes("VALUES ('schema_ready'")),
+      "a failed migration must run again on the next restart");
+  }
+  const duplicates = schemaFixture(undefined, false);
+  await duplicates.service.ensurePostgresSchema();
+  assert.ok(!duplicates.queries.some((sql) => sql.includes("VALUES ('schema_ready'")),
+    "unique-index fallback must be retried after duplicate repair");
+  console.log("PASS startup schema migrations run once per version and retry failures or duplicate fallbacks");
+
+  for (const fail of [false, true]) {
+    const service = Object.create(DatabaseService.prototype) as any;
+    let active = 0;
+    let peak = 0;
+    let normalized = false;
+    const tables: string[] = [];
+    const published = createEmptyDatabase();
+    service.database = published;
+    service.pool = { query: async (sql: string) => {
+      const table = /FROM (\w+)/.exec(sql)![1];
+      tables.push(table);
+      active++;
+      peak = Math.max(peak, active);
+      try {
+        await yieldToEventLoop();
+        if (fail && table === "order_items") throw new Error("table read failed");
+        return { rows: [{ payload: { id: table } }] };
+      } finally { active--; }
+    } };
+    service.normalizeSnapshot = (snapshot: ReturnType<typeof createEmptyDatabase>) => {
+      assert.equal(active, 0, "normalization must wait for every table");
+      normalized = true;
+      return snapshot;
+    };
+    if (fail) {
+      await assert.rejects(() => service.loadSnapshotFromPostgres(), /table read failed/);
+      assert.equal(normalized, false, "failed loading must not normalize a partial snapshot");
+    } else {
+      const snapshot = await service.loadSnapshotFromPostgres();
+      assert.equal(normalized, true);
+      assert.equal(snapshot.stores[0].id, "stores");
+      assert.equal(snapshot.orderItems[0].id, "order_items");
+      assert.equal(snapshot.adCampaignDailyCosts[0].id, "ad_campaign_daily_costs");
+      assert.equal(Object.values(snapshot).every((rows) => (rows as unknown[]).length === 1), true);
+    }
+    assert.equal(peak, 4, "startup must use bounded parallel reads");
+    assert.equal(active, 0, "failed loading must also drain all workers");
+    assert.equal(tables.length, new Set(tables).size, "tables must not load twice");
+    assert.equal(service.database, published, "loading alone must not publish partial state");
+  }
+  console.log("PASS startup loads all tables with four workers and drains failed reads before rejecting");
+}
 
 export async function runStartupRegressionTests() {
+  await runPostgresStartupTests();
   const crypto = new CryptoService();
   const config = {
     getBootstrapStorePayload: () => ({ name: "Test", sellerAccountId: "seller", channelNo: "channel", memo: "" }),

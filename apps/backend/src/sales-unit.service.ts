@@ -94,7 +94,7 @@ export class SalesUnitService {
         beforeJson: null,
         afterJson: newUnit,
       });
-    });
+    }, ["canonicalSalesUnits", "auditLogs"]);
 
     return newUnit.id;
   }

@@ -38,14 +38,18 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
   // Nest runs provider onModuleInit hooks concurrently. The database snapshot
   // is only guaranteed to be loaded once all module initialization has finished.
   async onApplicationBootstrap(): Promise<void> {
+    const startedAt = Date.now();
     const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
+    if (storeIds.length === 0) return;
     for (const storeId of storeIds) {
       // 먼저 스토어 레벨 판매단위 확인/생성 (write 외부에서 호출)
       await this.salesUnitService.ensureStoreLevelSalesUnit(storeId);
-
-      // 저장된 규칙만 적용하고 과거 광고비와 손익 집계도 함께 복구한다.
-      await this.recalculate(storeId);
     }
+    // Restore all stores in one ad-only commit rather than resending the same
+    // history separately for every store. Profit summaries still follow commit.
+    await this.recalculateMappings(storeIds);
+    for (const storeId of storeIds) await this.recalculateProfitSummariesForAdDates(storeId);
+    console.log(`[Startup] Ad mapping and profit summaries restored for ${storeIds.length} stores (${Date.now() - startedAt} ms)`);
   }
 
   list(storeId: string, page?: number, pageSize?: number) {
@@ -268,12 +272,7 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
   }
 
   async recalculate(storeId: string) {
-    await this.databaseService.writeCommitted((draft) => {
-      recalculateAdCampaignSignaturesForStore(draft, storeId, {
-        onlyUnconfirmed: true,
-        applyToRows: true,
-      });
-    });
+    await this.recalculateMappings([storeId]);
     await this.recalculateProfitSummariesForAdDates(storeId);
 
     return {
@@ -284,6 +283,17 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
         .getSnapshot()
         .adCampaignSignatures.filter((item) => item.storeId === storeId && !item.confirmedAt).length,
     };
+  }
+
+  private async recalculateMappings(storeIds: readonly string[]) {
+    await this.databaseService.writeCommitted((draft) => {
+      for (const storeId of storeIds) {
+        recalculateAdCampaignSignaturesForStore(draft, storeId, {
+          onlyUnconfirmed: true,
+          applyToRows: true,
+        });
+      }
+    }, ["adCampaignSignatures", "adCampaignDailyCosts"]);
   }
 
   private async recalculateProfitSummariesForAdDates(storeId: string) {

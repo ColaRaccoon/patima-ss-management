@@ -245,7 +245,8 @@ const STORAGE_TABLES: StorageTable[] = [
   { key: "auditLogs", tableName: "audit_logs" },
 ];
 
-export const POSTGRES_SCHEMA_VERSION = 3;
+// Bump when table/index definitions or startup data migrations change.
+export const POSTGRES_SCHEMA_VERSION = 4;
 export const POSTGRES_UPSERT_BATCH_SIZE = 500;
 
 const POSTGRES_JSONB_INDEXES: PostgresJsonbIndex[] = [
@@ -1179,12 +1180,23 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     const totalCount = parsePgCount(countResult.rows[0]?.total_count);
 
     const summaryPredicate = this.buildActiveAdCostPredicate(builder, "summary_costs", "summary_uploads", query);
-    const itemsQuery = builder.buildPaginated(
-      `SELECT signatures.payload AS signature_payload,
+    // Limit before the lateral aggregate: otherwise PostgreSQL may summarize
+    // every matching campaign before sorting and discarding the other pages.
+    const pageQuery = builder.buildPaginated(
+      `SELECT signatures.id, signatures.payload
+       ${fromClause}
+       ${whereClause}
+       ORDER BY COALESCE(NULLIF(signatures.payload->>'lastSeenDate', ''), signatures.payload->>'updatedAt') DESC,
+                signatures.id ASC`,
+      pagination,
+    );
+    const itemsQuery = {
+      text: `WITH signature_page AS MATERIALIZED (${pageQuery.text})
+       SELECT signatures.payload AS signature_payload,
               summary.latest_row_payload,
               COALESCE(summary.total_cost, 0)::float8 AS total_cost,
               COALESCE(summary.row_count, 0)::int AS row_count
-       ${fromClause}
+       FROM signature_page signatures
        LEFT JOIN LATERAL (
          SELECT SUM(COALESCE((summary_costs.payload->>'totalCost')::numeric, 0)) AS total_cost,
                 COUNT(*)::int AS row_count,
@@ -1194,11 +1206,10 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
            ON summary_uploads.id = summary_costs.payload->>'sourceUploadId'
          WHERE ${summaryPredicate}
        ) summary ON TRUE
-       ${whereClause}
        ORDER BY COALESCE(NULLIF(signatures.payload->>'lastSeenDate', ''), signatures.payload->>'updatedAt') DESC,
                 signatures.id ASC`,
-      pagination,
-    );
+      params: pageQuery.params,
+    };
     const rows = await this.getPool().query<{
       signature_payload: AdCampaignSignature;
       latest_row_payload: AdCampaignDailyCost | null;
@@ -2806,6 +2817,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   }
 
   private async initializePostgresStorage() {
+    const startedAt = Date.now();
     this.ensureFileStorageReady();
 
     this.pool = new Pool({
@@ -2821,8 +2833,11 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
     await this.pool.query("SELECT 1");
     await this.ensurePostgresSchema();
+    console.log(`[Startup] Database schema ready (${Date.now() - startedAt} ms)`);
 
+    const loadStartedAt = Date.now();
     const loaded = await this.loadSnapshotFromPostgres();
+    console.log(`[Startup] Database snapshot loaded (${Date.now() - loadStartedAt} ms)`);
     if (this.isEmptySnapshot(loaded)) {
       const legacy = this.loadSnapshotFromFile();
       if (!this.isEmptySnapshot(legacy)) {
@@ -2846,6 +2861,13 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       )
     `);
 
+    // Runtime snapshot commits use a separate key and cannot hide a failed
+    // migration. Publish this version only after all schema work succeeds.
+    const ready = await pool.query<{ value: { version?: number } }>(
+      "SELECT value FROM storage_metadata WHERE key = 'schema_ready'",
+    );
+    if (ready.rows[0]?.value?.version === POSTGRES_SCHEMA_VERSION) return;
+
     for (const table of STORAGE_TABLES) {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS ${table.tableName} (
@@ -2861,7 +2883,15 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS order_sync_batches_idempotency_key ON order_sync_batches ((payload->>'idempotencyKey'))");
     await this.backfillPostgresPayloadHashes(pool);
     const duplicateWarnings = await this.warnAboutDuplicateBusinessKeys(pool);
-    await this.ensurePostgresIndexes(pool, duplicateWarnings);
+    const indexesReady = await this.ensurePostgresIndexes(pool, duplicateWarnings);
+    // A duplicate-key fallback must be retried on the next startup after the
+    // conflicting records have been repaired.
+    if (duplicateWarnings.length === 0 && indexesReady) await pool.query(
+      `INSERT INTO storage_metadata (key, value, updated_at)
+       VALUES ('schema_ready', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify({ version: POSTGRES_SCHEMA_VERSION })],
+    );
   }
 
   private async backfillPostgresPayloadHashes(pool: Pool) {
@@ -2929,9 +2959,11 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
   private async ensurePostgresIndexes(client: Pool | PoolClient, duplicateWarnings: DuplicateKeyWarning[]) {
     const duplicateCheckIds = new Set(duplicateWarnings.map((warning) => warning.checkId));
+    let indexesReady = true;
 
     for (const index of POSTGRES_JSONB_INDEXES) {
       if (index.requiresDuplicateCheckId && duplicateCheckIds.has(index.requiresDuplicateCheckId)) {
+        indexesReady = false;
         if (index.duplicateFallbackSql) {
           await client.query(index.duplicateFallbackSql);
         }
@@ -2945,6 +2977,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         await client.query(index.sql);
       } catch (error) {
         if (index.duplicateFallbackSql && this.isUniqueViolation(error)) {
+          indexesReady = false;
           await client.query(index.duplicateFallbackSql);
           console.warn(
             `[DatabaseService] Skipped ${index.name} because PostgreSQL reported duplicate data.`,
@@ -2954,6 +2987,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         throw error;
       }
     }
+    return indexesReady;
   }
 
   private isUniqueViolation(error: unknown): boolean {
@@ -2964,12 +2998,22 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     const snapshot = createEmptyDatabase();
     const pool = this.getPool();
 
-    for (const table of STORAGE_TABLES) {
-      const result = await pool.query<{ payload: unknown }>(
-        `SELECT payload FROM ${table.tableName} ORDER BY id`,
-      );
-      (snapshot[table.key] as unknown[]) = result.rows.map((row) => row.payload);
-    }
+    // Bound reads to the existing four-connection pool. Wait for every worker
+    // before normalizing or propagating an error from a failed read.
+    let nextTable = 0;
+    const workers = await Promise.allSettled(Array.from({ length: 4 }, async () => {
+      while (nextTable < STORAGE_TABLES.length) {
+        const table = STORAGE_TABLES[nextTable++];
+        const startedAt = Date.now();
+        const result = await pool.query<{ payload: unknown }>(
+          `SELECT payload FROM ${table.tableName} ORDER BY id`,
+        );
+        (snapshot[table.key] as unknown[]) = result.rows.map((row) => row.payload);
+        console.log(`[Startup] Loaded ${table.tableName}: ${result.rows.length} rows (${Date.now() - startedAt} ms)`);
+      }
+    }));
+    const failed = workers.find((worker) => worker.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
 
     return this.normalizeSnapshot(snapshot);
   }
