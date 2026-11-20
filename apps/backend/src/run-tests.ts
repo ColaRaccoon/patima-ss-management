@@ -1783,17 +1783,7 @@ runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and r
     { adCampaignSignatureId: "ad-signature-1" },
   );
   const { service, queries } = createPostgresQueryHarness([
-    { rows: [{ total_count: 1 }] },
-    {
-      rows: [
-        {
-          signature_payload: signature,
-          latest_row_payload: latestRow,
-          total_cost: "120",
-          row_count: 1,
-        },
-      ],
-    },
+    { rows: [{ total_count: 1, signature_payload: signature, latest_row_payload: latestRow, total_cost: "120", row_count: 1 }] },
   ]);
 
   const result = await service.queryAdCampaignSignatures({
@@ -1811,22 +1801,24 @@ runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and r
   assert.equal(result.items[0].signature.id, "ad-signature-1");
   assert.equal(result.items[0].latestRow?.sourceUploadId, "upload-1");
   assert.equal(result.items[0].totalCost, 120);
-  assert.match(queries[0].text, /EXISTS \(/);
-  for (const query of queries) {
-    assert.match(query.text, /= ANY\(\$\d+::text\[\]\)/);
-    assert.match(query.text, /HAVING SUM\(COALESCE\(\(costs\.payload->>'totalCost'\)::numeric, 0\)\) <> 0/);
-    assert.ok(query.params.some((param) => JSON.stringify(param) === '["UNMAPPED","CONFLICT"]'));
-  }
-  assert.match(queries[1].text, /LEFT JOIN LATERAL/);
-  assert.match(queries[1].text, /WITH signature_page AS MATERIALIZED/);
-  assert.ok(
-    queries[1].text.indexOf("LIMIT $") < queries[1].text.indexOf("LEFT JOIN LATERAL"),
-    "campaign pagination must run before aggregating historical costs",
-  );
+  assert.equal(queries.length, 1, "count and items share a single query and snapshot");
+  assert.match(queries[0].text, /matches AS MATERIALIZED/);
+  assert.match(queries[0].text, /GROUP BY costs\.signature_id/);
+  assert.match(queries[0].text, /HAVING SUM\(costs\.amount\) <> 0/);
+  assert.match(queries[0].text, /= ANY\(\$\d+::text\[\]\)/);
+  assert.ok(queries[0].params.some((param) => JSON.stringify(param) === '["UNMAPPED","CONFLICT"]'));
   assert.equal(queries[0].text.includes("Needle_%' OR true"), false);
   assert.equal(queries[0].params.some((param) => param === "%needle\\_\\%' or true%"), true);
-  assert.equal(queries[1].params.at(-2), 20);
-  assert.equal(queries[1].params.at(-1), 0);
+  assert.equal(queries[0].params.at(-2), 20);
+  assert.equal(queries[0].params.at(-1), 0);
+});
+
+runAsync("DatabaseService preserves count for an empty ad campaign page", async () => {
+  const { service } = createPostgresQueryHarness([
+    { rows: [{ total_count: 3, signature_payload: null, latest_row_payload: null, total_cost: null, row_count: null }] },
+  ]);
+  const page = await service.queryAdCampaignSignatures({ storeId: "store-1", page: 4, pageSize: 1 });
+  assert.deepEqual(page, { items: [], totalCount: 3, totalPages: 3, page: 4, pageSize: 1, hasNext: false });
 });
 
 runAsync("DatabaseService filters unresolved nonzero ad campaign signatures before pagination", async () => {

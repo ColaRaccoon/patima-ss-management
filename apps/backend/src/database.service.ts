@@ -1129,30 +1129,8 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
     const pagination = normalizePagination(query.page, query.pageSize);
     const builder = createSqlBuilder();
-    const fromClause = `
-      FROM ad_campaign_signatures signatures
-      LEFT JOIN canonical_sales_units sales_units
-        ON sales_units.id = signatures.payload->>'canonicalSalesUnitId'
-    `;
-    builder.addCondition("signatures.payload->>'storeId' = {param}", query.storeId);
-    const activeCostPredicate = this.buildActiveAdCostPredicate(builder, "costs", "uploads", query);
-    const costAmount = "COALESCE((costs.payload->>'totalCost')::numeric, 0)";
-    // A campaign can have both positive and negative costs. Filter by the net cost
-    // across its active reports before counting or selecting a page.
-    const nonzeroNetCost = query.excludeZeroCost
-      ? `AND ${costAmount} <> 0 HAVING SUM(${costAmount}) <> 0`
-      : "";
-    builder.addCondition(
-      `EXISTS (
-        SELECT 1
-        FROM ad_campaign_daily_costs costs
-        JOIN ad_excel_uploads uploads
-          ON uploads.id = costs.payload->>'sourceUploadId'
-        WHERE ${activeCostPredicate}
-        ${nonzeroNetCost}
-      )`,
-    );
-
+    const store = builder.addParam(query.storeId);
+    builder.addCondition(`signatures.payload->>'storeId' = ${store}`);
     if (query.mappingStatus === "UNRESOLVED") {
       builder.addCondition(`${adCampaignMappingStatusSql("signatures")} = ANY({param}::text[])`, ["UNMAPPED", "CONFLICT"]);
     } else if (query.mappingStatus && query.mappingStatus !== "ALL") {
@@ -1160,85 +1138,85 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     }
 
     const keyword = query.q ? normalizeText(query.q) : null;
-    if (keyword) {
-      const pattern = likePattern(keyword);
-      const searchCostPredicate = this.buildActiveAdCostPredicate(builder, "search_costs", "search_uploads", query);
-      const searchConditions = [
-        `LOWER(COALESCE(signatures.payload->>'campaignNameSnapshot', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(COALESCE(signatures.payload->>'normalizedCampaignName', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(COALESCE(signatures.payload->>'campaignId', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(COALESCE(sales_units.payload->>'displayName', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(COALESCE(signatures.payload->>'mappingReason', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(${adCampaignMappingReasonAliasSql("signatures")}) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(COALESCE(signatures.payload->>'reasonNote', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(COALESCE(signatures.payload->>'firstSeenDate', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `LOWER(COALESCE(signatures.payload->>'lastSeenDate', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'`,
-        `EXISTS (
-          SELECT 1
-          FROM ad_campaign_daily_costs search_costs
-          JOIN ad_excel_uploads search_uploads
-            ON search_uploads.id = search_costs.payload->>'sourceUploadId'
-          WHERE ${searchCostPredicate}
-            AND LOWER(COALESCE(search_costs.payload->>'reportDate', '')) LIKE ${builder.addParam(pattern)} ESCAPE '\\'
-        )`,
-      ];
-      builder.addCondition(`(${searchConditions.join(" OR ")})`);
-    }
-
-    const whereClause = builder.whereClause();
-    const countQuery = builder.build(`SELECT COUNT(*)::int AS total_count ${fromClause} ${whereClause}`);
-    const countResult = await this.getPool().query<{ total_count: number | string }>(
-      countQuery.text,
-      countQuery.params,
+    const pattern = keyword ? builder.addParam(likePattern(keyword)) : null;
+    const matchesKeyword = pattern
+      ? [
+          "signatures.payload->>'campaignNameSnapshot'",
+          "signatures.payload->>'normalizedCampaignName'",
+          "signatures.payload->>'campaignId'",
+          "sales_units.payload->>'displayName'",
+          "signatures.payload->>'mappingReason'",
+          adCampaignMappingReasonAliasSql("signatures"),
+          "signatures.payload->>'reasonNote'",
+          "signatures.payload->>'firstSeenDate'",
+          "signatures.payload->>'lastSeenDate'",
+        ].map((field) => `LOWER(COALESCE(${field}, '')) LIKE ${pattern} ESCAPE '\\'`)
+      : [];
+    const dateFilters = [];
+    if (query.dateFrom) dateFilters.push(`AND costs.payload->>'reportDate' >= ${builder.addParam(query.dateFrom)}`);
+    if (query.dateTo) dateFilters.push(`AND costs.payload->>'reportDate' <= ${builder.addParam(query.dateTo)}`);
+    const page = builder.buildPaginated(
+      "SELECT * FROM matches ORDER BY sort_date DESC, id ASC", pagination,
     );
-    const totalCount = parsePgCount(countResult.rows[0]?.total_count);
 
-    const summaryPredicate = this.buildActiveAdCostPredicate(builder, "summary_costs", "summary_uploads", query);
-    // Limit before the lateral aggregate: otherwise PostgreSQL may summarize
-    // every matching campaign before sorting and discarding the other pages.
-    const pageQuery = builder.buildPaginated(
-      `SELECT signatures.id, signatures.payload
-       ${fromClause}
-       ${whereClause}
-       ORDER BY COALESCE(NULLIF(signatures.payload->>'lastSeenDate', ''), signatures.payload->>'updatedAt') DESC,
-                signatures.id ASC`,
-      pagination,
-    );
-    const itemsQuery = {
-      text: `WITH signature_page AS MATERIALIZED (${pageQuery.text})
-       SELECT signatures.payload AS signature_payload,
-              summary.latest_row_payload,
-              COALESCE(summary.total_cost, 0)::float8 AS total_cost,
-              COALESCE(summary.row_count, 0)::int AS row_count
-       FROM signature_page signatures
-       LEFT JOIN LATERAL (
-         SELECT SUM(COALESCE((summary_costs.payload->>'totalCost')::numeric, 0)) AS total_cost,
-                COUNT(*)::int AS row_count,
-                (ARRAY_AGG(summary_costs.payload ORDER BY summary_costs.payload->>'reportDate' DESC, summary_costs.payload->>'updatedAt' DESC))[1] AS latest_row_payload
-         FROM ad_campaign_daily_costs summary_costs
-         JOIN ad_excel_uploads summary_uploads
-           ON summary_uploads.id = summary_costs.payload->>'sourceUploadId'
-         WHERE ${summaryPredicate}
-       ) summary ON TRUE
-       ORDER BY COALESCE(NULLIF(signatures.payload->>'lastSeenDate', ''), signatures.payload->>'updatedAt') DESC,
-                signatures.id ASC`,
-      params: pageQuery.params,
-    };
-    const rows = await this.getPool().query<{
-      signature_payload: AdCampaignSignature;
+    // Materialize candidate costs before joining uploads so the planner doesn't
+    // probe the cost index once per (candidate, upload) pair. Include zero rows
+    // in usage, latest upload and date searches before filtering the net sum.
+    const sql = `
+      WITH candidates AS MATERIALIZED (
+        SELECT signatures.id, signatures.payload FROM ad_campaign_signatures signatures
+        ${builder.whereClause()}
+      ), active_uploads AS MATERIALIZED (
+        SELECT id FROM ad_excel_uploads
+        WHERE payload->>'storeId' = ${store}
+          AND (payload->>'isActive')::boolean IS TRUE
+          AND payload->>'weekdayValidationStatus' = 'PASSED'
+          AND payload->>'state' = 'CONFIRMED'
+      ), candidate_costs AS MATERIALIZED (
+        SELECT signatures.id AS signature_id, costs.id, costs.payload->>'sourceUploadId' AS upload_id,
+               costs.payload->>'reportDate' AS report_date, costs.payload->>'updatedAt' AS updated_at,
+               COALESCE((costs.payload->>'totalCost')::numeric, 0) AS amount
+        FROM candidates signatures
+        JOIN ad_campaign_daily_costs costs ON costs.payload->>'adCampaignSignatureId' = signatures.id
+        WHERE costs.payload->>'storeId' = ${store}
+          ${dateFilters.join(" ")}
+      ), summaries AS (
+        SELECT costs.signature_id AS id, SUM(costs.amount) AS total_cost, COUNT(*)::int AS row_count,
+               (ARRAY_AGG(costs.id ORDER BY costs.report_date DESC, costs.updated_at DESC))[1] AS latest_id
+               ${pattern ? `, BOOL_OR(LOWER(COALESCE(costs.report_date, '')) LIKE ${pattern} ESCAPE '\\') AS date_matches` : ""}
+        FROM candidate_costs costs
+        JOIN active_uploads ON active_uploads.id = costs.upload_id
+        GROUP BY costs.signature_id
+        ${query.excludeZeroCost ? "HAVING SUM(costs.amount) <> 0" : ""}
+      ), matches AS MATERIALIZED (
+        SELECT summaries.*, COALESCE(NULLIF(signatures.payload->>'lastSeenDate', ''), signatures.payload->>'updatedAt') AS sort_date
+        FROM summaries JOIN candidates signatures ON signatures.id = summaries.id
+        ${pattern ? `LEFT JOIN canonical_sales_units sales_units ON sales_units.id = signatures.payload->>'canonicalSalesUnitId'
+        WHERE summaries.date_matches OR ${matchesKeyword.join(" OR ")}` : ""}
+      ), page AS (${page.text})
+      SELECT counts.total_count, signatures.payload AS signature_payload, latest.payload AS latest_row_payload,
+             page.total_cost, page.row_count
+      FROM (SELECT COUNT(*)::int AS total_count FROM matches) counts
+      LEFT JOIN page ON TRUE
+      LEFT JOIN ad_campaign_signatures signatures ON signatures.id = page.id
+      LEFT JOIN ad_campaign_daily_costs latest ON latest.id = page.latest_id
+      ORDER BY page.sort_date DESC, page.id ASC`;
+    const result = await this.getPool().query<{
+      total_count: number;
+      signature_payload: AdCampaignSignature | null;
       latest_row_payload: AdCampaignDailyCost | null;
       total_cost: number | string | null;
-      row_count: number | string | null;
-    }>(itemsQuery.text, itemsQuery.params);
+      row_count: number | null;
+    }>(sql, page.params);
 
     return buildPaginationResult(
-      rows.rows.map((row) => ({
+      result.rows.flatMap((row) => row.signature_payload ? [{
         signature: row.signature_payload,
-        latestRow: row.latest_row_payload ?? null,
-        totalCost: Number(row.total_cost ?? 0),
+        latestRow: row.latest_row_payload,
+        totalCost: Number(row.total_cost),
         rowCount: parsePgCount(row.row_count),
-      })),
-      totalCount,
+      }] : []),
+      parsePgCount(result.rows[0]?.total_count),
       pagination,
     );
   }
@@ -1370,31 +1348,6 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         };
       }),
     };
-  }
-
-  private buildActiveAdCostPredicate(
-    builder: ReturnType<typeof createSqlBuilder>,
-    costAlias: string,
-    uploadAlias: string,
-    query: Pick<AdCampaignSignatureListQuery, "dateFrom" | "dateTo">,
-  ): string {
-    const conditions = [
-      `${costAlias}.payload->>'adCampaignSignatureId' = signatures.id`,
-      `${costAlias}.payload->>'storeId' = signatures.payload->>'storeId'`,
-      `${uploadAlias}.payload->>'storeId' = signatures.payload->>'storeId'`,
-      `(${uploadAlias}.payload->>'isActive')::boolean IS TRUE`,
-      `${uploadAlias}.payload->>'weekdayValidationStatus' = 'PASSED'`,
-      `${uploadAlias}.payload->>'state' = 'CONFIRMED'`,
-    ];
-
-    if (query.dateFrom) {
-      conditions.push(`${costAlias}.payload->>'reportDate' >= ${builder.addParam(query.dateFrom)}`);
-    }
-    if (query.dateTo) {
-      conditions.push(`${costAlias}.payload->>'reportDate' <= ${builder.addParam(query.dateTo)}`);
-    }
-
-    return conditions.join(" AND ");
   }
 
   /**
