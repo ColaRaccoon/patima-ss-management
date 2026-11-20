@@ -17,6 +17,10 @@ import { OperationWorkerService } from "./operation-worker.service";
 import { OrderMappingService } from "./order-mapping.service";
 import { OrderSyncBatchService } from "./order-sync-batch.service";
 import { OrderSyncService } from "./order-sync.service";
+import { ProductRegistrationController } from "./product-registration.controller";
+import { ProductRegistrationService } from "./product-registration.service";
+import { ProductStatusController } from "./product-status.controller";
+import { ProductStatusService } from "./product-status.service";
 import { ProfitService } from "./profit.service";
 import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
@@ -24,7 +28,7 @@ import { StoreService } from "./store.service";
 
 @Module({
   imports: [],
-  controllers: [AppController],
+  controllers: [AppController, ProductRegistrationController, ProductStatusController],
   providers: [
     DatabaseService,
     AuditLogService,
@@ -43,6 +47,8 @@ import { StoreService } from "./store.service";
     CampaignMappingService,
     CostService,
     FakePurchaseService,
+    ProductRegistrationService,
+    ProductStatusService,
     ProfitSummaryService,
     ProfitService,
     MappingSeedService,

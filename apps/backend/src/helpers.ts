@@ -9,6 +9,7 @@ import {
   DatabaseShape,
   DEFAULT_DELIVERY_UNIT_COST,
   MappingStatus,
+  MappingStatusFilter,
   OrderItem,
   OrderSourceSignature,
   PaginationResult,
@@ -469,6 +470,8 @@ export const migrateCanonicalSalesUnit = (
     isStoreLevel: raw.isStoreLevel ?? false,
     parentSalesUnitId: raw.parentSalesUnitId ?? null,
     isGroup: raw.isGroup ?? false,
+    ...(raw.advertisingNotPlanned === true ? { advertisingNotPlanned: true } : {}),
+    ...(raw.productForm ? { productForm: raw.productForm } : {}),
     createdAt: raw.createdAt,
     updatedAt: raw.updatedAt,
   };
@@ -547,6 +550,9 @@ export const resolveOrderItemSignatureDisplay = (
   };
 };
 
+export const matchesMappingStatus = (status: MappingStatus, filter?: MappingStatusFilter): boolean =>
+  !filter || filter === "ALL" || (filter === "UNRESOLVED" ? status !== "MAPPED" : status === filter);
+
 export const getAdMappingStatus = (
   item: Pick<AdCampaignDailyCost | AdCampaignSignature, "canonicalSalesUnitId" | "mappingReason">,
 ): MappingStatus => {
@@ -568,11 +574,11 @@ const costValuesUpdatedAt = (setting: SalesUnitCostSetting) => setting.costValue
  * On the same effective date, the most recently saved source wins.
  * An expired manual setting stays incomplete until a newer cost source takes effect.
  */
-export const getCostSettingForDate = (
+export const resolveCostSettingForDate = (
   snapshotsForUnit: Array<{ snapshot: SalesUnitCostSnapshot; entry: SalesUnitCostSnapshotEntry | null }>,
   targetDate: string | null,
   manualSettings: SalesUnitCostSetting[] = [],
-): CostValues | null => {
+) => {
   if (!targetDate) {
     return null;
   }
@@ -589,10 +595,27 @@ export const getCostSettingForDate = (
     .sort((left, right) => right.effectiveFrom.localeCompare(left.effectiveFrom) || right.updatedAt.localeCompare(left.updatedAt))[0];
   if (manual && (!selected || manual.effectiveFrom > selected.snapshot.effectiveFrom ||
     (manual.effectiveFrom === selected.snapshot.effectiveFrom && costValuesUpdatedAt(manual) >= selected.snapshot.updatedAt))) {
-    return manual.effectiveTo && targetDate > manual.effectiveTo ? null : validCostValues(manual);
+    const expired = Boolean(manual.effectiveTo && targetDate > manual.effectiveTo);
+    return {
+      source: "INDIVIDUAL" as const,
+      settingId: manual.id,
+      effectiveFrom: manual.effectiveFrom,
+      sourceFileName: null,
+      values: expired ? null : validCostValues(manual),
+    };
   }
-  return validCostValues(selected?.entry ?? null);
+  return selected ? {
+    source: "EXCEL" as const,
+    settingId: null,
+    effectiveFrom: selected.snapshot.effectiveFrom,
+    sourceFileName: selected.snapshot.sourceFileName,
+    values: validCostValues(selected.entry),
+  } : null;
 };
+
+export const getCostSettingForDate = (
+  ...args: Parameters<typeof resolveCostSettingForDate>
+): CostValues | null => resolveCostSettingForDate(...args)?.values ?? null;
 
 export const calculateFee = (
   orderItem: OrderItem,

@@ -1,6 +1,5 @@
 import { MappingsView } from "@/components/mappings/mappings-view";
-import { getMappingsPageData } from "@/lib/api/services";
-import type { MappingListStatus } from "@/lib/api/types";
+import { getMappingsPageData, normalizeMappingStatus } from "@/lib/api/services";
 import { readSearchParam } from "@/lib/store-selection";
 
 type SearchParams = Record<string, string | string[] | undefined>;
@@ -18,10 +17,6 @@ function parsePageSize(value: string | undefined) {
   return PAGE_SIZE_OPTIONS.some((option) => option === parsed) ? parsed : DEFAULT_PAGE_SIZE;
 }
 
-function parseMappingStatus(value: string | undefined): MappingListStatus {
-  return value === "MAPPED" || value === "UNMAPPED" || value === "CONFLICT" ? value : "ALL";
-}
-
 export default async function MappingsPage({
   searchParams,
 }: {
@@ -33,15 +28,16 @@ export default async function MappingsPage({
     order: {
       page: parsePositiveInt(readSearchParam(resolvedSearchParams.orderPage), 1),
       pageSize: parsePageSize(readSearchParam(resolvedSearchParams.orderPageSize)),
-      mappingStatus: parseMappingStatus(readSearchParam(resolvedSearchParams.orderStatus)),
+      mappingStatus: normalizeMappingStatus(readSearchParam(resolvedSearchParams.orderStatus)),
       q: readSearchParam(resolvedSearchParams.orderQ) ?? "",
     },
     ad: {
       page: parsePositiveInt(readSearchParam(resolvedSearchParams.adPage), 1),
       pageSize: parsePageSize(readSearchParam(resolvedSearchParams.adPageSize)),
-      mappingStatus: parseMappingStatus(readSearchParam(resolvedSearchParams.adStatus)),
+      mappingStatus: normalizeMappingStatus(readSearchParam(resolvedSearchParams.adStatus)),
+      excludeZeroCost: readSearchParam(resolvedSearchParams.adShowZero) !== "1",
       q: readSearchParam(resolvedSearchParams.adQ) ?? "",
     },
   });
-  return <MappingsView data={data} />;
+  return <MappingsView key={data.primaryStore?.id} data={data} />;
 }

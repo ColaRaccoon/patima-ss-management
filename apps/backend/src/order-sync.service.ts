@@ -1,4 +1,5 @@
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import type { MappingStatusFilter } from "@patima/shared";
 import { BadRequestException, Injectable, OnModuleInit } from "@nestjs/common";
 import {
   OrderItem,
@@ -14,6 +15,7 @@ import {
   ensureStoreExists,
   formatApiSuccess,
   getSignatureMappingStatus,
+  matchesMappingStatus,
   mapOrderItemResponse,
   nowIso,
   paginate,
@@ -45,6 +47,48 @@ import {
   enrichSignatureDisplayName,
   type EnrichmentContext,
 } from "./signature-enrichment";
+
+const hasMissingProductName = (value: string | null | undefined) =>
+  !value?.trim() || /^NAVER_PRODUCT_/i.test(value.trim());
+
+const hasUsableProductName = (value: string | null | undefined) =>
+  !hasMissingProductName(value) &&
+  !/^(xs|s|m|l|xl|xxl|free|one|원사이즈|\d+|색상|컬러|사이즈|옵션|옵션선택|상품|상품명|상품선택|선택|수량|타입|모델|color|colour|size|option)$/i.test(
+    value?.trim() ?? "",
+  );
+
+const isBundledOption = (option: string | null | undefined) =>
+  option?.includes("[함께배송") ?? false;
+
+const hasConfirmedTarget = (
+  signature: OrderSourceSignature | undefined,
+): signature is OrderSourceSignature & {
+  confirmedAt: string;
+  canonicalSalesUnitId: string;
+} => Boolean(signature?.confirmedAt && signature.canonicalSalesUnitId);
+
+const getBundledProductName = (option: string | null) => {
+  // Only a product label explicitly following the bundle tag is reliable enough to restore a name.
+  const candidate = option
+    ?.match(/\[함께배송[^\]]*\]\s*([^:/|]+?)\s*:/)?.[1]
+    ?.trim();
+  if (!hasUsableProductName(candidate)) {
+    return null;
+  }
+  return candidate!;
+};
+
+type ProductNameRecoveryInput = Pick<
+  SyncedOrderItemInput,
+  | "externalProductOrderId"
+  | "externalProductId"
+  | "rawProductName"
+  | "rawOptionInfo"
+  | "paymentDate"
+  | "orderDate"
+  | "optionCode"
+  | "optionManageCode"
+>;
 
 @Injectable()
 export class OrderSyncService implements OnModuleInit {
@@ -83,7 +127,10 @@ export class OrderSyncService implements OnModuleInit {
           operation.storeId,
           request.dateFrom,
           request.dateTo,
-          request.rangeMode as "MANUAL" | "AUTO_YESTERDAY" | "AUTO_LAST_30_DAYS",
+          request.rangeMode as
+            | "MANUAL"
+            | "AUTO_YESTERDAY"
+            | "AUTO_LAST_30_DAYS",
           {
             mode: request.mode,
             requestedCutoffAt: request.requestedCutoffAt ?? operation.cutoffAt,
@@ -219,6 +266,46 @@ export class OrderSyncService implements OnModuleInit {
     let paymentDateMissingCount = 0;
     let rawPayloadPrunedOrderCount = 0;
     let rawPayloadPrunedOrderItemCount = 0;
+    const pendingNameRecovery = new Map<
+      string,
+      Map<string, ProductNameRecoveryInput>
+    >();
+    const initialSignatures = new Map(
+      snapshot.orderSourceSignatures
+        .filter((signature) => signature.storeId === storeId)
+        .map((signature) => [signature.id, signature]),
+    );
+    for (const item of snapshot.orderItems) {
+      if (
+        item.storeId !== storeId ||
+        !item.externalProductId ||
+        item.canonicalSalesUnitId
+      )
+        continue;
+      const signature = item.orderSourceSignatureId
+        ? initialSignatures.get(item.orderSourceSignatureId)
+        : undefined;
+      if (
+        !signature ||
+        hasConfirmedTarget(signature) ||
+        !hasMissingProductName(signature.rawProductNameSnapshot) ||
+        isBundledOption(signature.rawOptionInfoSnapshot)
+      )
+        continue;
+      const pending =
+        pendingNameRecovery.get(item.externalProductId) ?? new Map();
+      pending.set(item.externalProductOrderId, {
+        externalProductOrderId: item.externalProductOrderId,
+        externalProductId: item.externalProductId,
+        rawProductName: signature.rawProductNameSnapshot,
+        rawOptionInfo: signature.rawOptionInfoSnapshot,
+        paymentDate: item.paymentDate,
+        orderDate: item.orderDate,
+        optionCode: item.optionCode,
+        optionManageCode: item.optionManageCode,
+      });
+      pendingNameRecovery.set(item.externalProductId, pending);
+    }
 
     for await (const chunk of this.naverCommerceService.streamOrderItems(
       storeId,
@@ -242,6 +329,32 @@ export class OrderSyncService implements OnModuleInit {
     )) {
       context?.signal.throwIfAborted();
       const entries = chunk.items;
+      const currentProductIds = new Set<string>();
+      for (const entry of entries) {
+        if (!entry.externalProductId) continue;
+        const pending =
+          pendingNameRecovery.get(entry.externalProductId) ?? new Map();
+        pending.delete(entry.externalProductOrderId);
+        if (isBundledOption(entry.rawOptionInfo)) continue;
+        currentProductIds.add(entry.externalProductId);
+        if (hasMissingProductName(entry.rawProductName)) {
+          pending.set(entry.externalProductOrderId, {
+            externalProductOrderId: entry.externalProductOrderId,
+            externalProductId: entry.externalProductId,
+            rawProductName: entry.rawProductName,
+            rawOptionInfo: entry.rawOptionInfo,
+            paymentDate: entry.paymentDate,
+            orderDate: entry.orderDate,
+            optionCode: entry.optionCode,
+            optionManageCode: entry.optionManageCode,
+          });
+          pendingNameRecovery.set(entry.externalProductId, pending);
+        }
+      }
+      // Earlier chunks may have arrived before another order supplied this product's name.
+      const recoveryEntries = [...currentProductIds].flatMap((productId) => [
+        ...(pendingNameRecovery.get(productId)?.values() ?? []),
+      ]);
       syncedItemCount += entries.length;
       await context?.progress({
         stage: "SAVING",
@@ -267,21 +380,51 @@ export class OrderSyncService implements OnModuleInit {
           );
           const signatureKey = (name: string, option: string | null) =>
             JSON.stringify([normalizeText(name), normalizeText(option ?? "")]);
+          const storeSignatures = draft.orderSourceSignatures.filter(
+            (item) => item.storeId === storeId,
+          );
+          const signaturesById = new Map(
+            storeSignatures.map((item) => [item.id, item]),
+          );
           const signaturesByKey = new Map(
-            draft.orderSourceSignatures
-              .filter((item) => item.storeId === storeId)
-              .map((item) => [
-                signatureKey(
-                  item.rawProductNameSnapshot,
-                  item.rawOptionInfoSnapshot,
-                ),
-                item,
-              ]),
+            storeSignatures.map((item) => [
+              signatureKey(
+                item.rawProductNameSnapshot,
+                item.rawOptionInfoSnapshot,
+              ),
+              item,
+            ]),
           );
           const touchedSignatureIds = new Set<string>();
           const touchedOrderItemIds = new Set<string>();
 
-          entries.forEach((entry) => {
+          entries.forEach((sourceEntry) => {
+            const existingItem = itemsById.get(
+              sourceEntry.externalProductOrderId,
+            );
+            const exactSignature = signaturesByKey.get(
+              signatureKey(
+                sourceEntry.rawProductName,
+                sourceEntry.rawOptionInfo,
+              ),
+            );
+            const previousSignature = existingItem?.orderSourceSignatureId
+              ? signaturesById.get(existingItem.orderSourceSignatureId)
+              : undefined;
+            const preserveConfirmedName =
+              hasMissingProductName(sourceEntry.rawProductName) &&
+              hasConfirmedTarget(previousSignature) &&
+              normalizeText(previousSignature.rawOptionInfoSnapshot ?? "") ===
+                normalizeText(sourceEntry.rawOptionInfo ?? "");
+            // Do not move an already confirmed raw combination to a newly inferred signature.
+            const entry = hasConfirmedTarget(exactSignature)
+              ? sourceEntry
+              : preserveConfirmedName
+                ? {
+                    ...sourceEntry,
+                    rawProductName: previousSignature!.rawProductNameSnapshot,
+                  }
+                : this.restoreMissingProductName(sourceEntry, productsById);
             const rawPayloadReferenceDate =
               getSyncedOrderItemRetentionDate(entry);
             const retainedRawPayload =
@@ -296,7 +439,7 @@ export class OrderSyncService implements OnModuleInit {
             const product = this.upsertProduct(
               draft,
               storeId,
-              entry,
+              sourceEntry,
               productsById,
             );
             const key = signatureKey(entry.rawProductName, entry.rawOptionInfo);
@@ -311,6 +454,7 @@ export class OrderSyncService implements OnModuleInit {
             if (!existingSignature) {
               draft.orderSourceSignatures.push(signature);
               signaturesByKey.set(key, signature);
+              signaturesById.set(signature.id, signature);
               orderSourceSignaturesCreated += 1;
             }
             const existingOrder = ordersById.get(entry.externalOrderId);
@@ -342,7 +486,6 @@ export class OrderSyncService implements OnModuleInit {
               ordersUpserted += 1;
             }
 
-            const existingItem = itemsById.get(entry.externalProductOrderId);
             if (existingItem?.paymentDate)
               affectedDates.add(existingItem.paymentDate);
             if (entry.paymentDate) affectedDates.add(entry.paymentDate);
@@ -416,6 +559,67 @@ export class OrderSyncService implements OnModuleInit {
             orderItemsUpserted += 1;
           });
 
+          for (const sourceEntry of recoveryEntries) {
+            const item = itemsById.get(sourceEntry.externalProductOrderId);
+            const previousSignature = item?.orderSourceSignatureId
+              ? signaturesById.get(item.orderSourceSignatureId)
+              : undefined;
+            const pending = pendingNameRecovery.get(
+              sourceEntry.externalProductId!,
+            );
+            if (
+              !item ||
+              !previousSignature ||
+              item.externalProductId !== sourceEntry.externalProductId ||
+              hasConfirmedTarget(previousSignature) ||
+              isBundledOption(previousSignature.rawOptionInfoSnapshot) ||
+              normalizeText(previousSignature.rawOptionInfoSnapshot ?? "") !==
+                normalizeText(sourceEntry.rawOptionInfo ?? "") ||
+              !hasMissingProductName(previousSignature.rawProductNameSnapshot)
+            ) {
+              pending?.delete(sourceEntry.externalProductOrderId);
+              continue;
+            }
+            const recovered = this.restoreMissingProductName(
+              sourceEntry,
+              productsById,
+            );
+            if (hasMissingProductName(recovered.rawProductName)) continue;
+            const key = signatureKey(
+              recovered.rawProductName,
+              recovered.rawOptionInfo,
+            );
+            const existingSignature = signaturesByKey.get(key);
+            const signature = this.upsertSignature(
+              draft,
+              storeId,
+              recovered.rawProductName,
+              recovered.rawOptionInfo,
+              existingSignature,
+            );
+            if (!existingSignature) {
+              draft.orderSourceSignatures.push(signature);
+              signaturesByKey.set(key, signature);
+              signaturesById.set(signature.id, signature);
+              orderSourceSignaturesCreated += 1;
+            }
+            this.updateSignatureUsageSummary(
+              draft,
+              signature,
+              recovered,
+              previousSignature.id,
+              false,
+            );
+            item.orderSourceSignatureId = signature.id;
+            item.canonicalSalesUnitId = null;
+            item.updatedAt = nowIso();
+            if (item.paymentDate) affectedDates.add(item.paymentDate);
+            touchedSignatureIds.add(previousSignature.id);
+            touchedSignatureIds.add(signature.id);
+            touchedOrderItemIds.add(item.id);
+            pending?.delete(sourceEntry.externalProductOrderId);
+          }
+
           recalculateOrderMappingsForTouchedItems(draft, {
             storeId,
             signatureIds: touchedSignatureIds,
@@ -441,7 +645,9 @@ export class OrderSyncService implements OnModuleInit {
         {
           orderIds: new Set(entries.map((entry) => entry.externalOrderId)),
           itemIds: new Set(
-            entries.map((entry) => entry.externalProductOrderId),
+            [...entries, ...recoveryEntries].map(
+              (entry) => entry.externalProductOrderId,
+            ),
           ),
         },
       );
@@ -551,7 +757,7 @@ export class OrderSyncService implements OnModuleInit {
 
   async listOrderSourceSignatures(query: {
     storeId: string;
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+    mappingStatus?: MappingStatusFilter;
     q?: string;
     page?: number;
     pageSize?: number;
@@ -563,11 +769,7 @@ export class OrderSyncService implements OnModuleInit {
     );
     const filteredSignatures = snapshot.orderSourceSignatures
       .filter((item) => item.storeId === query.storeId)
-      .filter((item) =>
-        query.mappingStatus && query.mappingStatus !== "ALL"
-          ? getSignatureMappingStatus(item) === query.mappingStatus
-          : true,
-      )
+      .filter((item) => matchesMappingStatus(getSignatureMappingStatus(item), query.mappingStatus))
       .filter((item) => {
         if (!keyword) {
           return true;
@@ -694,7 +896,14 @@ export class OrderSyncService implements OnModuleInit {
   private updateSignatureUsageSummary(
     draft: ReturnType<DatabaseService["getSnapshot"]>,
     signature: OrderSourceSignature,
-    entry: SyncedOrderItemInput,
+    entry: Pick<
+      SyncedOrderItemInput,
+      | "paymentDate"
+      | "orderDate"
+      | "externalProductId"
+      | "optionCode"
+      | "optionManageCode"
+    >,
     previousSignatureId: string | null,
     isNewItem: boolean,
   ): void {
@@ -749,10 +958,18 @@ export class OrderSyncService implements OnModuleInit {
       entry.externalProductId ??
       `synthetic:${rawToSourceSignature(entry.rawProductName, entry.rawOptionInfo)}`;
     const existing = productsById.get(externalProductId);
+    const bundled = isBundledOption(entry.rawOptionInfo);
 
     if (existing) {
-      existing.productName = entry.rawProductName;
-      existing.normalizedProductName = normalizeText(entry.rawProductName);
+      // Bundle items can share the main product ID; their labels must not replace its catalog name.
+      if (
+        !bundled &&
+        (!hasMissingProductName(entry.rawProductName) ||
+          !hasUsableProductName(existing.productName))
+      ) {
+        existing.productName = entry.rawProductName;
+        existing.normalizedProductName = normalizeText(entry.rawProductName);
+      }
       existing.status =
         entry.saleStatus === "UNKNOWN" ? existing.status : entry.rawStatus;
       existing.lastSeenAt = nowIso();
@@ -760,12 +977,15 @@ export class OrderSyncService implements OnModuleInit {
       return existing;
     }
 
+    const productName = bundled
+      ? `NAVER_PRODUCT_${externalProductId}`
+      : entry.rawProductName;
     const created: Product = {
       id: createId(),
       storeId,
       externalProductId,
-      productName: entry.rawProductName,
-      normalizedProductName: normalizeText(entry.rawProductName),
+      productName,
+      normalizedProductName: normalizeText(productName),
       status: entry.rawStatus,
       firstSeenAt: nowIso(),
       lastSeenAt: nowIso(),
@@ -776,6 +996,23 @@ export class OrderSyncService implements OnModuleInit {
     draft.products.push(created);
     productsById.set(externalProductId, created);
     return created;
+  }
+
+  private restoreMissingProductName<
+    T extends Pick<
+      SyncedOrderItemInput,
+      "rawProductName" | "rawOptionInfo" | "externalProductId"
+    >,
+  >(entry: T, productsById: Map<string, Product>): T {
+    if (!hasMissingProductName(entry.rawProductName)) return entry;
+    const recoveredName = isBundledOption(entry.rawOptionInfo)
+      ? getBundledProductName(entry.rawOptionInfo)
+      : entry.externalProductId
+        ? productsById.get(entry.externalProductId)?.productName
+        : null;
+    return hasUsableProductName(recoveredName)
+      ? { ...entry, rawProductName: recoveredName! }
+      : entry;
   }
 
   private upsertSignature(
@@ -791,6 +1028,8 @@ export class OrderSyncService implements OnModuleInit {
     if (existing) {
       existing.rawProductNameSnapshot = rawProductName;
       existing.rawOptionInfoSnapshot = rawOptionInfo;
+      existing.normalizedProductName = normalizedProductName;
+      existing.normalizedOptionInfo = normalizedOptionInfo;
       existing.sourceSignature = rawToSourceSignature(
         rawProductName,
         rawOptionInfo,

@@ -18,11 +18,13 @@ export default async function ProfitsPage({
     (dateFromParam && dateToParam && dateFromParam === dateToParam
       ? dateFromParam
       : dateToParam ?? dateFromParam);
+  const salesUnitId = readSearchParam(resolvedSearchParams.salesUnitId);
 
   const data = await getProfitsPageData({
     storeId: readSearchParam(resolvedSearchParams.storeId),
     dateFrom: selectedDate,
     dateTo: selectedDate,
+    salesUnitId,
   });
-  return <ProfitsView data={data} />;
+  return <ProfitsView data={data} salesUnitId={salesUnitId} />;
 }

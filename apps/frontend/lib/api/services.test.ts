@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { calculateNetProfitAfterFakePurchase } from "@patima/shared";
-import { getDashboardPageData, getProfitsPageData, getOrdersPageData, getSalesUnitsPageData } from "./services";
+import { getDashboardPageData, getMappingsPageData, getProfitsPageData, getOrdersPageData, getSalesUnitsPageData } from "./services";
 import { fetchApi } from "./client";
 import nextConfig from "../../next.config";
 import { PHASE_DEVELOPMENT_SERVER, PHASE_PRODUCTION_BUILD, PHASE_PRODUCTION_SERVER } from "next/constants";
@@ -54,6 +54,30 @@ test("development and production builds use separate output directories", () => 
     if (previous === undefined) delete process.env.NEXT_DIST_DIR;
     else process.env.NEXT_DIST_DIR = previous;
   }
+});
+
+test("mapping lists default to one combined status query per list and preserve explicit filters", async (context) => {
+  const filters: Record<string, string[]> = {};
+  const excludeZeroCost: Array<string | null> = [];
+  context.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    const name = url.pathname.split("/").at(-1)!;
+    if (name === "stores") return Response.json({ success: true, data: [{ id: "store", isPrimary: true }] });
+    const status = url.searchParams.get("mappingStatus");
+    if (status) (filters[name] ??= []).push(status);
+    if (name === "ad-campaign-signatures") excludeZeroCost.push(url.searchParams.get("excludeZeroCost"));
+    return Response.json({ success: true, data: { items: [], page: 1, totalCount: 0, hasNext: false } });
+  });
+  const defaultPage = await getMappingsPageData();
+  assert.equal(defaultPage.signatureQuery.mappingStatus, "UNRESOLVED");
+  assert.equal(defaultPage.adCostQuery.mappingStatus, "UNRESOLVED");
+  assert.equal(defaultPage.adCostQuery.excludeZeroCost, true);
+  await getMappingsPageData({ order: { mappingStatus: "ALL" }, ad: { mappingStatus: "CONFLICT", excludeZeroCost: false } });
+  assert.deepEqual(filters, {
+    "order-source-signatures": ["UNRESOLVED", "ALL"],
+    "ad-campaign-signatures": ["UNRESOLVED", "CONFLICT"],
+  });
+  assert.deepEqual(excludeZeroCost, ["true", "false"]);
 });
 
 test("dashboard and profits use the same live date, store and fake-purchase deduction", async (context) => {

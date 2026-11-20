@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, useTransition, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { calculateNetProfitAfterFakePurchase } from "@patima/shared";
@@ -17,18 +18,19 @@ import type {
 } from "@/lib/api/types";
 import { formatCurrency, formatCurrencyWithSign, formatDate, formatNumber } from "@/lib/format";
 import { toneForProfitStatus } from "@/lib/status-tone";
-import { STORE_ID_QUERY_KEY } from "@/lib/store-selection";
+import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 import { useProfitDetail } from "./use-profit-detail";
 
 interface ExpandedGroups {
   [groupId: string]: boolean;
 }
 
-export function ProfitsView({ data }: { data: ProfitsPageData }) {
-  return <StoreProfitsView key={`${data.primaryStore?.id ?? "no-store"}:${data.dateFrom}:${data.dateTo}`} data={data} />;
+export function ProfitsView({ data, salesUnitId }: { data: ProfitsPageData; salesUnitId?: string }) {
+  const key = [data.primaryStore?.id, data.dateFrom, data.dateTo, salesUnitId].join(":");
+  return <StoreProfitsView key={key} data={data} salesUnitId={salesUnitId} />;
 }
 
-function StoreProfitsView({ data }: { data: ProfitsPageData }) {
+function StoreProfitsView({ data, salesUnitId }: { data: ProfitsPageData; salesUnitId?: string }) {
   const router = useRouter();
   const { selectedProfitKey, selectedDetail, detailError, isLoadingDetail, selectProfit, retryDetail } = useProfitDetail(data);
   const [selectedDate, setSelectedDate] = useState(data.dateTo);
@@ -64,6 +66,7 @@ function StoreProfitsView({ data }: { data: ProfitsPageData }) {
     if (nextDate) {
       searchParams.set("date", nextDate);
     }
+    if (salesUnitId) searchParams.set("salesUnitId", salesUnitId);
 
     startRefresh(() => {
       router.replace(searchParams.size > 0 ? `/profits?${searchParams.toString()}` : "/profits");
@@ -145,6 +148,7 @@ function StoreProfitsView({ data }: { data: ProfitsPageData }) {
   }
 
   const hasConflict = data.unmappedSummary.conflictOrderItemCount > 0 || data.unmappedSummary.conflictCampaignCount > 0;
+  const filteredProductName = data.profits.find((row) => row.canonicalSalesUnitId === salesUnitId)?.displayName;
   const dateAvailabilityNotice = (() => {
     if (data.latestOrderDate && data.latestAdDate && !data.latestOverlapDate) {
       return {
@@ -247,7 +251,8 @@ function StoreProfitsView({ data }: { data: ProfitsPageData }) {
     <div className="space-y-6">
       <PageHeader
         eyebrow="손익"
-        title="판매단위 손익 분석"
+        title={filteredProductName ? filteredProductName + " 손익" : "판매단위 손익 분석"}
+        description={salesUnitId ? "손익 표는 선택한 상품만 표시합니다. 요약 합계는 스토어 전체 기준입니다." : undefined}
         actions={
           <div className="space-y-3">
             {dateFilterForm}
@@ -267,6 +272,12 @@ function StoreProfitsView({ data }: { data: ProfitsPageData }) {
       />
 
       <SourceBanner sources={data.sources} />
+      {salesUnitId && (
+        <div className="flex flex-wrap gap-2">
+          <Link className="button-shell button-secondary" href={buildHrefWithStore("/sales-units/product", new URLSearchParams({ salesUnitId, date: data.dateTo }), data.primaryStore.id)}>상품 상태로 돌아가기</Link>
+          <Link className="button-shell button-ghost" href={buildHrefWithStore("/profits", new URLSearchParams({ date: data.dateTo }), data.primaryStore.id)}>전체 상품 보기</Link>
+        </div>
+      )}
 
       <div className="rounded-2xl border border-sky-300/40 bg-sky-100/70 px-4 py-4 text-sm leading-6 text-sky-950">
         <p className="font-semibold">선택한 날짜({formatDate(data.dateTo)}) 기준 배송비 계산 내역</p>
@@ -489,7 +500,7 @@ function StoreProfitsView({ data }: { data: ProfitsPageData }) {
             return (
               <>
                 {storeLevelRows.length === 0 && groupAndRegularRows.length === 0 ? (
-                  <EmptyState title="선택한 날짜의 손익 데이터가 없습니다." description="주문 동기화와 광고 업로드 상태를 확인하거나 다른 날짜를 선택해 주세요." />
+                  <EmptyState title={salesUnitId ? "이 상품의 손익 데이터가 없습니다." : "선택한 날짜의 손익 데이터가 없습니다."} description="주문 동기화와 광고 업로드 상태를 확인하거나 다른 날짜를 선택해 주세요." />
                 ) : null}
                 {storeLevelRows.length > 0 && renderExpandableTable(storeLevelRows, "스토어 전체 광고비")}
                 {groupAndRegularRows.length > 0 && renderExpandableTable(groupAndRegularRows, "일자별 손익 행")}

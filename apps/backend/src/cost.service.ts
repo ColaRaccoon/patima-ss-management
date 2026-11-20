@@ -1,12 +1,16 @@
-import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
+import { createHash } from "node:crypto";
 import {
   CanonicalSalesUnit,
+  CostSnapshotPreview,
+  DatabaseShape,
   SalesUnitCostSetting,
   SalesUnitCostSnapshot,
   SalesUnitCostSnapshotEntry,
 } from "@patima/shared";
 import * as XLSX from "xlsx";
 import { AuditLogService } from "./audit-log.service";
+import { buildCostSettingRecord, validateCostSettingValues } from "./cost-setting-record";
 import { DatabaseService } from "./database.service";
 import {
   createId,
@@ -20,6 +24,67 @@ import {
 import { ProfitSummaryService } from "./profit-summary.service";
 import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
+
+type SnapshotCost = NonNullable<CostSnapshotPreview["created"][number]["cost"]>;
+
+interface ParsedCostRow {
+  row: number;
+  salesUnitId: string;
+  displayName: string;
+  matchAliases: string | null;
+  linkedProductIds: string | null;
+  linkedOptionCodes: string | null;
+  linkedManageCodes: string | null;
+  memo: string | null;
+  unitCost: number | null;
+  feeRate: number | null;
+  otherCost: number | null;
+}
+
+function snapshotCostValues(cost: SnapshotCost | null): SnapshotCost | null {
+  return cost && { unitCost: cost.unitCost, feeRate: cost.feeRate, otherCost: cost.otherCost };
+}
+
+function incomingSnapshotCost(row?: ParsedCostRow): SnapshotCost | null {
+  return row?.unitCost == null ? null : {
+    unitCost: row.unitCost,
+    feeRate: row.feeRate,
+    otherCost: row.otherCost ?? 0,
+  };
+}
+
+function excelMetadataPatch(row: ParsedCostRow) {
+  const { displayName, matchAliases, linkedProductIds, linkedOptionCodes, linkedManageCodes, memo } = row;
+  const split = (value: string) => value.split(",").map((item) => item.trim());
+  return {
+    ...(displayName && { displayName }),
+    ...(matchAliases && { matchAliases: split(matchAliases) }),
+    ...(linkedProductIds && { linkedProductIds: split(linkedProductIds) }),
+    ...(linkedOptionCodes && { linkedOptionCodes: split(linkedOptionCodes) }),
+    ...(linkedManageCodes && { linkedManageCodes: split(linkedManageCodes) }),
+    ...(memo !== null && { memo }),
+  };
+}
+
+function buildSnapshotPreviewContext(database: DatabaseShape, storeId: string, effectiveFrom: string, file: Express.Multer.File) {
+  const byId = (left: { id: string }, right: { id: string }) => left.id.localeCompare(right.id);
+  const units = database.canonicalSalesUnits.filter((unit) => unit.storeId === storeId).sort(byId);
+  const snapshots = database.salesUnitCostSnapshots
+    .filter((snapshot) => snapshot.storeId === storeId)
+    .sort((left, right) => left.effectiveFrom.localeCompare(right.effectiveFrom) || byId(left, right));
+  const baseline = snapshots.filter((snapshot) => snapshot.effectiveFrom <= effectiveFrom).at(-1);
+  const entries = baseline
+    ? database.salesUnitCostSnapshotEntries.filter((entry) => entry.snapshotId === baseline.id).sort(byId)
+    : [];
+  const settings = database.salesUnitCostSettings
+    .filter((setting) => setting.storeId === storeId && setting.isActive && setting.effectiveFrom <= effectiveFrom)
+    .sort(byId);
+  const token = createHash("sha256")
+    .update(JSON.stringify([storeId, effectiveFrom, file.originalname, units, snapshots, entries, settings]))
+    .update(file.buffer)
+    .digest("hex");
+  return { units, snapshots, baseline, entries, settings, token };
+}
 
 const countPaymentDatesBefore = (dates: string[], boundary: string, includeBoundary = false) => {
   let start = 0;
@@ -100,7 +165,7 @@ export class CostService {
       });
     }
     ensureNoCrossStoreReference(payload.storeId, salesUnit.storeId, "canonicalSalesUnitId");
-    this.validateValues(payload.unitCost, payload.otherCost, payload.feeRate);
+    validateCostSettingValues(payload.unitCost, payload.otherCost, payload.feeRate);
 
     const activeRows = snapshot.salesUnitCostSettings
       .filter(
@@ -143,21 +208,7 @@ export class CostService {
       });
     }
 
-    const created: SalesUnitCostSetting = {
-      id: createId(),
-      storeId: payload.storeId,
-      canonicalSalesUnitId: payload.canonicalSalesUnitId,
-      unitCost: payload.unitCost,
-      feeRate: payload.feeRate,
-      otherCost: payload.otherCost,
-      isActive: true,
-      deactivatedAt: null,
-      effectiveFrom: payload.effectiveFrom,
-      effectiveTo: nextRow ? this.minusOneDay(nextRow.effectiveFrom) : null,
-      costValuesUpdatedAt: nowIso(),
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-    };
+    const created = buildCostSettingRecord(payload, nowIso(), nextRow ? this.minusOneDay(nextRow.effectiveFrom) : null);
 
     await this.databaseService.writeCommitted((draft) => {
       const previous = draft.salesUnitCostSettings.find((item) => item.id === previousRow?.id);
@@ -206,7 +257,7 @@ export class CostService {
         errors: [{ field: "costSettingId", reason: "COST_SETTING_NOT_EDITABLE" }],
       });
     }
-    this.validateValues(payload.unitCost, payload.otherCost, payload.feeRate);
+    validateCostSettingValues(payload.unitCost, payload.otherCost, payload.feeRate);
 
     if (!existing.isActive || (existing.effectiveTo && payload.effectiveFrom > existing.effectiveTo) ||
       snapshot.salesUnitCostSettings.some((item) => item.id !== existing.id && item.isActive &&
@@ -322,49 +373,123 @@ export class CostService {
     });
   }
 
-  private validateValues(unitCost: number, otherCost: number, feeRate: number | null) {
-    if (!Number.isFinite(unitCost) || !Number.isFinite(otherCost) || unitCost < 0 || otherCost < 0) {
-      throw new BadRequestException({
-        success: false,
-        message: "원가와 기타비용은 0 이상이어야 합니다.",
-        errors: [{ field: "unitCost", reason: "INVALID_VALUE" }],
-      });
-    }
-    if (feeRate != null && (!Number.isFinite(feeRate) || feeRate < 0 || feeRate > 1)) {
-      throw new BadRequestException({
-        success: false,
-        message: "feeRate는 0 이상 1 이하여야 합니다.",
-        errors: [{ field: "feeRate", reason: "INVALID_VALUE" }],
-      });
-    }
-  }
-
   private minusOneDay(dateString: string) {
     const date = new Date(`${dateString}T00:00:00Z`);
     date.setUTCDate(date.getUTCDate() - 1);
     return date.toISOString().slice(0, 10);
   }
 
-  /**
-   * 비용 표 엑셀 업로드 + 메타 update + 스냅샷 생성
-   */
-  async importExcelSnapshot(
+  previewExcelSnapshot(
     storeId: string,
     effectiveFrom: string,
     file: Express.Multer.File,
-  ): Promise<{
-    snapshotId: string;
-    effectiveFrom: string;
-    metaUpdated: { created: number; updated: number };
-    costEntries: { count: number };
-    mismatch: { salesUnitCount: number; entryCount: number; missingSalesUnitIds: string[] };
-    replacedSnapshot: { snapshotId: string; effectiveFrom: string } | null;
-  }> {
-    // 1. 쓰기 권한 확인
+  ): CostSnapshotPreview {
     this.storeService.ensureWritable(storeId);
     ensureDateString(effectiveFrom, "effectiveFrom");
+    const rows = this.parseExcelSnapshot(file);
+    const { units, snapshots, baseline, entries, settings, token } = buildSnapshotPreviewContext(
+      this.databaseService.getSnapshot(), storeId, effectiveFrom, file,
+    );
+    const existingById = new Map(units.map((unit) => [unit.id, unit]));
+    const rowById = new Map<string, ParsedCostRow>();
+    const entryByUnit = new Map(entries.map((entry) => [entry.canonicalSalesUnitId, entry]));
+    const settingsByUnit = new Map<string, SalesUnitCostSetting[]>();
+    for (const setting of settings) {
+      const unitSettings = settingsByUnit.get(setting.canonicalSalesUnitId) ?? [];
+      unitSettings.push(setting);
+      settingsByUnit.set(setting.canonicalSalesUnitId, unitSettings);
+    }
+    const sameDate = snapshots.find((snapshot) => snapshot.effectiveFrom === effectiveFrom);
+    const preview: CostSnapshotPreview = {
+      token,
+      storeId,
+      effectiveFrom,
+      fileName: repairMojibakeText(file.originalname),
+      replaces: sameDate ? {
+        id: sameDate.id,
+        sourceFileName: repairMojibakeText(sameDate.sourceFileName) || null,
+        createdAt: sameDate.createdAt,
+      } : null,
+      nextSnapshotDate: snapshots.find((snapshot) => snapshot.effectiveFrom > effectiveFrom)?.effectiveFrom ?? null,
+      created: [],
+      changed: [],
+      missing: [],
+    };
+    for (const row of rows) {
+      if (!row.salesUnitId) {
+        preview.created.push({ row: row.row, displayName: row.displayName, cost: incomingSnapshotCost(row) });
+        continue;
+      }
+      if (!existingById.has(row.salesUnitId)) {
+        throw new BadRequestException(`${row.row}행: 판매단위 '${row.salesUnitId}'가 이 스토어에 없습니다.`);
+      }
+      rowById.set(row.salesUnitId, row);
+    }
 
-    // 2. 파일 형식 검증
+    const timestamp = nowIso();
+    const pendingSnapshot: SalesUnitCostSnapshot = {
+      id: "",
+      storeId,
+      effectiveFrom,
+      sourceFileName: file.originalname,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    for (const unit of units) {
+      if (unit.isGroup || unit.isStoreLevel) continue;
+      const row = rowById.get(unit.id);
+      const previousEntry = entryByUnit.get(unit.id) ?? null;
+      const unitSettings = settingsByUnit.get(unit.id) ?? [];
+      const previousCost = snapshotCostValues(getCostSettingForDate(
+        baseline ? [{ snapshot: baseline, entry: previousEntry }] : [],
+        effectiveFrom,
+        unitSettings,
+      ));
+      const newValues = incomingSnapshotCost(row);
+      const nextEntry: SalesUnitCostSnapshotEntry | null = newValues ? {
+        id: "",
+        snapshotId: "",
+        storeId,
+        canonicalSalesUnitId: unit.id,
+        ...newValues,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      } : null;
+      const nextCost = snapshotCostValues(getCostSettingForDate(
+        [{ snapshot: pendingSnapshot, entry: nextEntry }],
+        effectiveFrom,
+        unitSettings,
+      ));
+      const metadata = row ? excelMetadataPatch(row) : {};
+      const metadataChanged = Object.entries(metadata).some(([key, value]) =>
+        JSON.stringify(unit[key as keyof CanonicalSalesUnit]) !== JSON.stringify(value));
+      const displayName = row?.displayName || unit.displayName;
+      if (unit.isActive && !nextEntry) {
+        preview.missing.push({
+          id: unit.id,
+          displayName,
+          reason: row ? "BLANK_COST" : "OMITTED",
+          losesCurrentCost: previousCost !== null && nextCost === null,
+        });
+      }
+      if (metadataChanged || (nextEntry && JSON.stringify(previousCost) !== JSON.stringify(nextCost))) {
+        preview.changed.push({
+          id: unit.id,
+          previousName: unit.displayName,
+          displayName,
+          metadataChanged,
+          previousCost,
+          nextCost,
+        });
+      }
+    }
+    return preview;
+  }
+
+  private parseExcelSnapshot(file: Express.Multer.File): ParsedCostRow[] {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException("업로드할 .xlsx 파일을 선택해 주세요.");
+    }
     const originalFileName = file.originalname;
     if (!/\.xlsx$/i.test(originalFileName)) {
       throw new BadRequestException({
@@ -435,21 +560,7 @@ export class CostService {
       }
     }
 
-    // 4. 데이터 행 파싱
-    interface ParsedRow {
-      salesUnitId: string;
-      displayName: string;
-      matchAliases: string | null;
-      linkedProductIds: string | null;
-      linkedOptionCodes: string | null;
-      linkedManageCodes: string | null;
-      memo: string | null;
-      unitCost: number | null;
-      feeRate: number | null;
-      otherCost: number | null;
-    }
-
-    const parsedRows: ParsedRow[] = [];
+    const parsedRows: ParsedCostRow[] = [];
     const seenSalesUnitIds = new Set<string>();
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i] as (string | number)[];
@@ -500,6 +611,7 @@ export class CostService {
       if (salesUnitId) seenSalesUnitIds.add(salesUnitId);
 
       parsedRows.push({
+        row: i + 1,
         salesUnitId,
         displayName,
         matchAliases: getStringValue("matchAliases"),
@@ -512,103 +624,97 @@ export class CostService {
         otherCost: getNumberValue("otherCost"),
       });
     }
+    return parsedRows;
+  }
 
-    // 5. 메타 업데이트 (즉시, 시점 무관) 및 비용 entry 생성 준비
+  async importExcelSnapshot(
+    storeId: string,
+    effectiveFrom: string,
+    file: Express.Multer.File,
+    previewToken?: string,
+  ): Promise<{
+    snapshotId: string;
+    effectiveFrom: string;
+    metaUpdated: { created: number; updated: number };
+    costEntries: { count: number };
+    mismatch: { salesUnitCount: number; entryCount: number; missingSalesUnitIds: string[] };
+    replacedSnapshot: { snapshotId: string; effectiveFrom: string } | null;
+  }> {
+    this.storeService.ensureWritable(storeId);
+    ensureDateString(effectiveFrom, "effectiveFrom");
+    const parsedRows = this.parseExcelSnapshot(file);
+
     let metaCreated = 0;
     let metaUpdated = 0;
     const costEntryRows: SalesUnitCostSnapshotEntry[] = [];
-    const missingSalesUnitIds: string[] = [];
+    let missingSalesUnitIds: string[] = [];
+    let salesUnitCount = 0;
     let replacedSnapshotInfo: { snapshotId: string; effectiveFrom: string } | null = null;
-
-    const snapshot = this.databaseService.getSnapshot();
-    const activeSalesUnits = snapshot.canonicalSalesUnits.filter(
-      (unit) => unit.storeId === storeId && unit.isActive && !unit.isGroup && !unit.isStoreLevel,
-    );
-
     const snapshotId = createId();
 
     await this.databaseService.writeCommitted((draft) => {
+      this.storeService.ensureWritable(storeId);
+      if (previewToken !== undefined &&
+        previewToken !== buildSnapshotPreviewContext(draft, storeId, effectiveFrom, file).token) {
+        throw new ConflictException("파일 또는 스토어의 판매단위·원가가 변경됐습니다. 변경 내용을 다시 확인해 주세요.");
+      }
+      const storeUnits = new Map(draft.canonicalSalesUnits
+        .filter((unit) => unit.storeId === storeId).map((unit) => [unit.id, unit]));
+      const timestamp = nowIso();
       for (const parsedRow of parsedRows) {
-        const { salesUnitId, displayName, matchAliases, linkedProductIds, linkedOptionCodes, linkedManageCodes, memo, unitCost, feeRate, otherCost } =
-          parsedRow;
-        let effectiveUnitId = salesUnitId;
-
-        // 그룹/isStoreLevel 은 엑셀에서 읽기 전용 (무시)
-        if (salesUnitId) {
-          // 기존 판매단위 update
-          const existing = draft.canonicalSalesUnits.find((u) => u.id === salesUnitId && u.storeId === storeId);
+        let effectiveUnitId = parsedRow.salesUnitId;
+        const metadata = excelMetadataPatch(parsedRow);
+        if (effectiveUnitId) {
+          const existing = storeUnits.get(effectiveUnitId);
           if (!existing) {
-            throw new BadRequestException(`판매단위 '${salesUnitId}'가 이 스토어에 없습니다.`);
+            throw new BadRequestException(`${parsedRow.row}행: 판매단위 '${effectiveUnitId}'가 이 스토어에 없습니다.`);
           }
-          if (existing) {
-            // 그룹 또는 스토어레벨 판매단위는 메타 update 및 비용 entry 생성 전부 스킵
-            if (existing.isGroup || existing.isStoreLevel) {
-              continue;
-            }
-            // 메타만 업데이트 (그룹이 아닌 경우만)
-            if (displayName) existing.displayName = displayName;
-            if (matchAliases) existing.matchAliases = matchAliases.split(",").map((s) => s.trim());
-            if (linkedProductIds) existing.linkedProductIds = linkedProductIds.split(",").map((s) => s.trim());
-            if (linkedOptionCodes) existing.linkedOptionCodes = linkedOptionCodes.split(",").map((s) => s.trim());
-            if (linkedManageCodes) existing.linkedManageCodes = linkedManageCodes.split(",").map((s) => s.trim());
-            if (memo !== undefined && memo !== null) existing.memo = memo;
-            existing.updatedAt = nowIso();
-            metaUpdated++;
-          }
+          if (existing.isGroup || existing.isStoreLevel) continue;
+          Object.assign(existing, metadata, { updatedAt: timestamp });
+          metaUpdated++;
         } else {
-          // 신규 판매단위 생성
-          if (displayName) {
-            const newId = createId();
-            effectiveUnitId = newId;
-            draft.canonicalSalesUnits.push({
-              id: newId,
-              storeId,
-              displayName,
-              matchAliases: matchAliases ? matchAliases.split(",").map((s) => s.trim()) : [],
-              normalizedMatchAliases: [], // 정규화는 나중에 normalization 로직에서
-              linkedProductIds: linkedProductIds ? linkedProductIds.split(",").map((s) => s.trim()) : [],
-              linkedOptionCodes: linkedOptionCodes ? linkedOptionCodes.split(",").map((s) => s.trim()) : [],
-              linkedManageCodes: linkedManageCodes ? linkedManageCodes.split(",").map((s) => s.trim()) : [],
-              memo: memo || null,
-              isActive: true,
-              deactivatedAt: null,
-              isStoreLevel: false,
-              parentSalesUnitId: null,
-              isGroup: false,
-              createdAt: nowIso(),
-              updatedAt: nowIso(),
-            });
-            metaCreated++;
-          }
+          effectiveUnitId = createId();
+          draft.canonicalSalesUnits.push({
+            id: effectiveUnitId,
+            storeId,
+            displayName: parsedRow.displayName,
+            matchAliases: [],
+            normalizedMatchAliases: [],
+            linkedProductIds: [],
+            linkedOptionCodes: [],
+            linkedManageCodes: [],
+            memo: null,
+            isActive: true,
+            deactivatedAt: null,
+            isStoreLevel: false,
+            parentSalesUnitId: null,
+            isGroup: false,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            ...metadata,
+          });
+          metaCreated++;
         }
 
-        // A blank unit cost is missing, not an explicit zero-cost product.
-        if (unitCost !== null) {
-          if (effectiveUnitId) {
-            // 그룹/isStoreLevel 판매단위는 비용 entry 생성 스킵
-            const targetUnit = draft.canonicalSalesUnits.find((u) => u.id === effectiveUnitId);
-            if (targetUnit && !targetUnit.isGroup && !targetUnit.isStoreLevel) {
-              costEntryRows.push({
-                id: createId(),
-                snapshotId: "", // 스냅샷 생성 후 업데이트
-                storeId,
-                canonicalSalesUnitId: effectiveUnitId,
-                unitCost,
-                feeRate: feeRate,
-                otherCost: otherCost || 0,
-                createdAt: nowIso(),
-                updatedAt: nowIso(),
-              });
-            }
-          }
-        } else if (effectiveUnitId) {
-          // 비용 없으면 mismatch에 기록 (그룹/storeLevel은 제외)
-          const existingUnit = draft.canonicalSalesUnits.find((u) => u.id === effectiveUnitId && u.storeId === storeId);
-          if (existingUnit && !existingUnit.isGroup && !existingUnit.isStoreLevel) {
-            missingSalesUnitIds.push(effectiveUnitId);
-          }
+        const cost = incomingSnapshotCost(parsedRow);
+        if (cost) {
+          costEntryRows.push({
+            id: createId(),
+            snapshotId,
+            storeId,
+            canonicalSalesUnitId: effectiveUnitId,
+            ...cost,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          });
         }
       }
+      const activeUnits = draft.canonicalSalesUnits.filter(
+        (unit) => unit.storeId === storeId && unit.isActive && !unit.isGroup && !unit.isStoreLevel,
+      );
+      const entryUnitIds = new Set(costEntryRows.map((entry) => entry.canonicalSalesUnitId));
+      salesUnitCount = activeUnits.length;
+      missingSalesUnitIds = activeUnits.filter((unit) => !entryUnitIds.has(unit.id)).map((unit) => unit.id);
 
       // 6. 스냅샷 생성
       // 같은 effectiveFrom 스냅샷이 있으면 hard delete
@@ -631,16 +737,12 @@ export class CostService {
         id: snapshotId,
         storeId,
         effectiveFrom,
-        sourceFileName: originalFileName,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
+        sourceFileName: repairMojibakeText(file.originalname),
+        createdAt: timestamp,
+        updatedAt: timestamp,
       });
 
-      // 비용 entries 생성 (snapshotId 설정)
-      costEntryRows.forEach((entry) => {
-        entry.snapshotId = snapshotId;
-        draft.salesUnitCostSnapshotEntries.push(entry);
-      });
+      draft.salesUnitCostSnapshotEntries = draft.salesUnitCostSnapshotEntries.concat(costEntryRows);
 
       // 감사 로그 기록
       this.auditLogService.appendToDraft(draft, {
@@ -658,7 +760,6 @@ export class CostService {
     await this.recalculateProfitSummariesSince(storeId, effectiveFrom);
 
     const entryCount = costEntryRows.length;
-    const salesUnitCount = activeSalesUnits.length;
 
     return {
       snapshotId,
@@ -698,9 +799,9 @@ export class CostService {
       .filter((s) => s.storeId === storeId)
       .sort((a, b) => b.effectiveFrom.localeCompare(a.effectiveFrom));
 
-    const activeSalesUnitCount = snapshot.canonicalSalesUnits.filter(
+    const activeSalesUnitIds = new Set(snapshot.canonicalSalesUnits.filter(
       (u) => u.storeId === storeId && u.isActive && !u.isGroup && !u.isStoreLevel,
-    ).length;
+    ).map((unit) => unit.id));
 
     const pageNum = page || 1;
     const pageSz = pageSize || 50;
@@ -710,17 +811,18 @@ export class CostService {
     const endIdx = startIdx + pageSz;
 
     const items = snapshots.slice(startIdx, endIdx).map((s) => {
-      const entryCount = snapshot.salesUnitCostSnapshotEntries.filter(
+      const entries = snapshot.salesUnitCostSnapshotEntries.filter(
         (e) => e.snapshotId === s.id,
-      ).length;
-      const missingSalesUnitCount = activeSalesUnitCount - entryCount;
+      );
+      const covered = new Set(entries.filter((entry) => activeSalesUnitIds.has(entry.canonicalSalesUnitId))
+        .map((entry) => entry.canonicalSalesUnitId));
 
       return {
         id: s.id,
         effectiveFrom: s.effectiveFrom,
-        entryCount,
-        missingSalesUnitCount: Math.max(0, missingSalesUnitCount),
-        sourceFileName: s.sourceFileName,
+        entryCount: entries.length,
+        missingSalesUnitCount: activeSalesUnitIds.size - covered.size,
+        sourceFileName: repairMojibakeText(s.sourceFileName) || null,
         createdAt: s.createdAt,
       };
     });

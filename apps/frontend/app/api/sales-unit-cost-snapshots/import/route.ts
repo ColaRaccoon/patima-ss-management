@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import {
   buildUpstreamEndpoint,
-  extractUpstreamMessage,
   readUpstreamPayload,
 } from "@/lib/api/upstream";
 
@@ -10,6 +9,7 @@ export async function POST(request: Request) {
   const storeId = incoming.get("storeId");
   const effectiveFrom = incoming.get("effectiveFrom");
   const file = incoming.get("file");
+  const previewToken = incoming.get("previewToken");
 
   if (typeof storeId !== "string" || !storeId.trim()) {
     return NextResponse.json({ success: false, message: "storeId가 필요합니다." }, { status: 400 });
@@ -30,6 +30,7 @@ export async function POST(request: Request) {
   formData.append("storeId", storeId);
   formData.append("effectiveFrom", effectiveFrom);
   formData.append("file", file);
+  if (typeof previewToken === "string") formData.append("previewToken", previewToken);
 
   const response = await fetch(buildUpstreamEndpoint("/sales-unit-cost-snapshots/import"), {
     method: "POST",
@@ -52,7 +53,7 @@ export async function POST(request: Request) {
           message:
             typeof payload.message === "string"
               ? payload.message
-              : "비용 표 import에 실패했습니다.",
+              : "비용 표 적용에 실패했습니다.",
           ...(typeof payload.fileName === "string" && { fileName: payload.fileName }),
           ...(Array.isArray(payload.errors) && { errors: payload.errors }),
         },
@@ -61,7 +62,7 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json(
-      { success: false, message: "비용 표 import에 실패했습니다." },
+      { success: false, message: "비용 표 적용에 실패했습니다." },
       { status: response.status },
     );
   }

@@ -5,7 +5,6 @@ import { pickPrimaryStore, resolveSelectedStore } from "@/lib/store-selection";
 import {
   mockAdCosts,
   mockCampaignMappings,
-  mockCostSettings,
   mockCredential,
   mockDashboardSummary,
   mockOrderItems,
@@ -24,12 +23,12 @@ import type {
   CampaignCostListItem,
   CampaignMappingRuleListItem,
   CostsPageData,
-  CostSettingListItem,
   CredentialSummary,
   DailyFakePurchaseResponse,
   DailySalesUnitDetail,
   DashboardPageData,
   MappingListState,
+  AdMappingListState,
   MappingListStatus,
   MappingsPageData,
   OperationsPageData,
@@ -49,7 +48,7 @@ import type {
   StoreSettingsPageData,
 } from "@/lib/api/types";
 
-const nowInSeoul = () =>
+export const nowInSeoul = () =>
   new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Seoul",
     year: "numeric",
@@ -273,8 +272,8 @@ function normalizeMappingListState(input?: Partial<MappingListState>): MappingLi
   };
 }
 
-function normalizeMappingStatus(value?: string): MappingListStatus {
-  return value === "MAPPED" || value === "UNMAPPED" || value === "CONFLICT" ? value : "ALL";
+export function normalizeMappingStatus(value?: string): MappingListStatus {
+  return value === "ALL" || value === "MAPPED" || value === "UNMAPPED" || value === "CONFLICT" ? value : "UNRESOLVED";
 }
 
 function normalizeOrdersPageFilters(
@@ -552,7 +551,8 @@ async function getOrderItems(storeId: string, filters: OrdersPageFilters, page: 
 
 async function getOrderSourceSignatures(
   storeId: string,
-  filters?: Partial<Pick<OrdersPageFilters, "mappingStatus" | "productName" | "optionInfo">> & {
+  filters?: Partial<Pick<OrdersPageFilters, "productName" | "optionInfo">> & {
+    mappingStatus?: MappingListStatus;
     q?: string;
     fetchAll?: boolean;
     page?: number;
@@ -567,7 +567,9 @@ async function getOrderSourceSignatures(
       mappingStatus: filters?.mappingStatus ?? "ALL",
       q: (filters?.q ?? [filters?.productName, filters?.optionInfo].filter(Boolean).join(" ")) || undefined,
     },
-    fallback: mockSignatures,
+    fallback: filters?.mappingStatus === "UNRESOLVED"
+      ? mockSignatures.filter((row) => row.mappingStatus !== "MAPPED")
+      : mockSignatures,
   };
   if (filters?.fetchAll === false) {
     const response = await fetchRecordPage<OrderSourceSignatureListItem>({
@@ -643,7 +645,8 @@ async function getAdCampaignSignatures(
   options?: {
     dateFrom?: string;
     dateTo?: string;
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+    mappingStatus?: MappingListStatus;
+    excludeZeroCost?: boolean;
     q?: string;
     page?: number;
     pageSize?: number;
@@ -657,11 +660,15 @@ async function getAdCampaignSignatures(
       dateFrom: options?.dateFrom,
       dateTo: options?.dateTo,
       mappingStatus: options?.mappingStatus ?? "ALL",
+      excludeZeroCost: options?.excludeZeroCost,
       q: options?.q || undefined,
     },
     page: options?.page ?? 1,
     pageSize: options?.pageSize ?? MAX_FRONTEND_PAGE_SIZE,
-    fallback: mockAdCosts as unknown as Array<Record<string, unknown>>,
+    fallback: mockAdCosts.filter((row) =>
+      (options?.mappingStatus !== "UNRESOLVED" || row.mappingStatus !== "MAPPED") &&
+      (!options?.excludeZeroCost || row.totalCost !== 0),
+    ) as unknown as Array<Record<string, unknown>>,
   });
 
   const salesUnitNames = new Map(salesUnits.map((unit) => [unit.id, unit.displayName]));
@@ -717,36 +724,6 @@ async function getCampaignMappings(storeId: string, salesUnits: SalesUnitListIte
     isEnabled: Boolean(item.isActive),
     disabledAt: item.deactivatedAt ? String(item.deactivatedAt) : null,
   })) satisfies CampaignMappingRuleListItem[];
-
-  return { ...response, data: items };
-}
-
-async function getCostSettings(storeId: string, salesUnits: SalesUnitListItem[]) {
-  const response = await fetchApi<Array<Record<string, unknown>>>({
-    label: "Cost settings",
-    path: withQuery("/sales-unit-cost-settings", { storeId }),
-    fallback: mockCostSettings as unknown as Array<Record<string, unknown>>,
-  });
-
-  const salesUnitNames = new Map(salesUnits.map((unit) => [unit.id, unit.displayName]));
-  const items = response.data.map((item) => ({
-    id: String(item.id),
-    storeId: String(item.storeId),
-    canonicalSalesUnitId: String(item.canonicalSalesUnitId),
-    canonicalDisplayName:
-      salesUnitNames.get(String(item.canonicalSalesUnitId)) ?? "-",
-    unitCost: Number(item.unitCost ?? 0),
-    feeRate: item.feeRate == null ? null : Number(item.feeRate),
-    otherCost: Number(item.otherCost ?? 0),
-    appliedOrderItemCount: Number(item.appliedOrderItemCount ?? 0),
-    canEdit: Boolean(item.canEdit),
-    canClose: Boolean(item.canClose),
-    canDeactivate: Boolean(item.canDeactivate),
-    blockingReason: item.blockingReason ? String(item.blockingReason) : null,
-    effectiveFrom: String(item.effectiveFrom),
-    effectiveTo: item.effectiveTo ? String(item.effectiveTo) : null,
-    isActive: Boolean(item.isActive),
-  })) satisfies CostSettingListItem[];
 
   return { ...response, data: items };
 }
@@ -908,17 +885,23 @@ export async function getSalesUnitsPageData(params?: {
     return {
       primaryStore: null,
       salesUnits: [],
-      costSettings: [],
+      costCoverage: null,
       sources: collectSources(storeResponse),
     };
   }
 
-  const salesUnitResponse = await getSalesUnits(primaryStore.id);
-  const costResponse = await getCostSettings(primaryStore.id, salesUnitResponse.data);
+  const [salesUnitResponse, costResponse] = await Promise.all([
+    getSalesUnits(primaryStore.id),
+    fetchApi<SalesUnitsPageData["costCoverage"]>({
+      label: "기준일 원가 적용 현황",
+      path: withQuery("/product-registrations/cost-coverage", { storeId: primaryStore.id, date: nowInSeoul() }),
+      fallback: null,
+    }),
+  ]);
   return {
     primaryStore,
     salesUnits: salesUnitResponse.data,
-    costSettings: costResponse.data,
+    costCoverage: costResponse.data,
     sources: collectSources(storeResponse, salesUnitResponse, costResponse),
   };
 }
@@ -926,12 +909,15 @@ export async function getSalesUnitsPageData(params?: {
 export async function getMappingsPageData(params?: {
   storeId?: string;
   order?: Partial<MappingListState>;
-  ad?: Partial<MappingListState>;
+  ad?: Partial<AdMappingListState>;
 }): Promise<MappingsPageData> {
   const storeResponse = await getStores();
   const primaryStore = resolveSelectedStore(storeResponse.data, params?.storeId);
   const signatureQuery = normalizeMappingListState(params?.order);
-  const adCostQuery = normalizeMappingListState(params?.ad);
+  const adCostQuery: AdMappingListState = {
+    ...normalizeMappingListState(params?.ad),
+    excludeZeroCost: params?.ad?.excludeZeroCost ?? true,
+  };
   const emptySignaturePage: PageMeta = {
     page: signatureQuery.page,
     pageSize: signatureQuery.pageSize,
@@ -973,6 +959,7 @@ export async function getMappingsPageData(params?: {
     }),
     getAdCampaignSignatures(primaryStore.id, salesUnitResponse.data, {
       mappingStatus: adCostQuery.mappingStatus,
+      excludeZeroCost: adCostQuery.excludeZeroCost,
       q: adCostQuery.q,
       page: adCostQuery.page,
       pageSize: adCostQuery.pageSize,
@@ -1067,6 +1054,7 @@ export async function getProfitsPageData(params?: {
   storeId?: string;
   dateFrom?: string;
   dateTo?: string;
+  salesUnitId?: string;
 }): Promise<ProfitsPageData> {
   const requestedDateFrom = params?.dateFrom?.trim();
   const requestedDateTo = params?.dateTo?.trim();
@@ -1111,7 +1099,13 @@ export async function getProfitsPageData(params?: {
     getDailyFakePurchase(primaryStore.id, dateTo || MOCK_SELECTED_DATE, USE_PROFITS_MOCK_FALLBACK),
   ]);
 
-  const firstProfit = profitResponse.data[0] ?? null;
+  const requestedSalesUnitId = params?.salesUnitId;
+  const profitRows = requestedSalesUnitId
+    ? profitResponse.data.filter((row) => row.canonicalSalesUnitId === requestedSalesUnitId || row.parentSalesUnitId === requestedSalesUnitId)
+    : profitResponse.data;
+  const firstProfit = (requestedSalesUnitId
+    ? profitRows.find((row) => row.canonicalSalesUnitId === requestedSalesUnitId)
+    : profitRows[0]) ?? null;
   const detailResponse =
     firstProfit != null
       ? await getDailySalesUnitDetail(
@@ -1131,7 +1125,7 @@ export async function getProfitsPageData(params?: {
     latestAdDate: latestDateResponse?.data.latestAdDate ?? null,
     latestOverlapDate: latestDateResponse?.data.latestOverlapDate ?? null,
     summary: summaryResponse.data,
-    profits: profitResponse.data,
+    profits: profitRows,
     unmappedSummary: unmappedResponse.data,
     fakePurchase: fakePurchaseResponse.data,
     selectedDetail: detailResponse?.data ?? null,

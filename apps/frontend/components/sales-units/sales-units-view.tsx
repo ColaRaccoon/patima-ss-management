@@ -1,19 +1,17 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState, useTransition, type FormEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { DataTable } from "@/components/shared/data-table";
+import { ChevronDown, ChevronRight, Plus, Search } from "lucide-react";
 import { EmptyState } from "@/components/shared/empty-state";
-import { PageHeader } from "@/components/shared/page-header";
-import { Panel } from "@/components/shared/panel";
 import { SourceBanner } from "@/components/shared/source-banner";
-import { StatCard } from "@/components/shared/stat-card";
-import { StatusBadge } from "@/components/shared/status-badge";
+import type { ProductRegistrationResult } from "@/lib/api/product-registrations";
 import type { SalesUnitListItem, SalesUnitsPageData } from "@/lib/api/types";
-import { formatDate, formatNumber, formatPercent } from "@/lib/format";
-import { toneForActive } from "@/lib/status-tone";
+import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { buildHrefWithStore } from "@/lib/store-selection";
+import { ProductEditView } from "./product-edit-view";
+import { ProductRegistrationView } from "./product-registration-view";
 
 interface ExpandedGroupState {
   [groupId: string]: boolean;
@@ -34,35 +32,26 @@ interface ManageChildrenModalState {
   isSubmitting: boolean;
 }
 
-function emptyDraft() {
-  return {
-    displayName: "",
-    matchAliasesText: "",
-    memo: "",
-  };
-}
-
-function aliasesToText(matchAliases: string[]) {
-  return matchAliases.join("\n");
-}
-
-function parseAliases(value: string) {
-  return value
-    .split(/\r?\n|,/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
+export function SalesUnitsView({ data, today, openRegistration, signatureIds, orderContextError }: {
+  data: SalesUnitsPageData;
+  today: string;
+  openRegistration: boolean;
+  signatureIds: string[];
+  orderContextError?: string;
+}) {
   const router = useRouter();
-  const [selectedSalesUnitId, setSelectedSalesUnitId] = useState<string | null>(data.salesUnits[0]?.id ?? null);
-  const [isCreatingDraft, setIsCreatingDraft] = useState(data.salesUnits.length === 0);
-  const [pendingCreatedSalesUnitId, setPendingCreatedSalesUnitId] = useState<string | null>(null);
-  const [draft, setDraft] = useState(emptyDraft());
+  const [selectedSalesUnitId, setSelectedSalesUnitId] = useState<string | null>(null);
+  const [registrationOpen, setRegistrationOpen] = useState(openRegistration);
+  const [registrationVersion, setRegistrationVersion] = useState(0);
+  const [savedProduct, setSavedProduct] = useState<{ id: string; date: string; signatureKey: string; recalculationPending?: boolean }>();
+  const registrationToggle = useRef<HTMLButtonElement>(null);
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("all");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isToggling, setIsToggling] = useState(false);
+  const [isSavingProductEdit, setIsSavingProductEdit] = useState(false);
   const [isRefreshing, startRefresh] = useTransition();
   const [expandedGroups, setExpandedGroups] = useState<ExpandedGroupState>({});
   const [createGroupModal, setCreateGroupModal] = useState<CreateGroupModalState>({
@@ -80,41 +69,22 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   });
 
   const selectedSalesUnit = useMemo(
-    () => (isCreatingDraft ? null : data.salesUnits.find((item) => item.id === selectedSalesUnitId) ?? null),
-    [data.salesUnits, isCreatingDraft, selectedSalesUnitId],
+    () => data.salesUnits.find((item) => item.id === selectedSalesUnitId) ?? null,
+    [data.salesUnits, selectedSalesUnitId],
   );
 
+  const signatureKey = JSON.stringify(signatureIds);
+  const activeSignatureKey = savedProduct?.signatureKey === signatureKey ? "[]" : signatureKey;
+  const registrationSignatures = useMemo(() => JSON.parse(activeSignatureKey) as string[], [activeSignatureKey]);
   useEffect(() => {
-    if (selectedSalesUnit) {
-      setDraft({
-        displayName: selectedSalesUnit.displayName,
-        matchAliasesText: aliasesToText(selectedSalesUnit.matchAliases),
-        memo: selectedSalesUnit.memo ?? "",
-      });
-      return;
-    }
-
-    setDraft(emptyDraft());
-  }, [selectedSalesUnit]);
-
+    if (openRegistration) setRegistrationOpen(true);
+  }, [openRegistration, signatureKey]);
   useEffect(() => {
-    if (pendingCreatedSalesUnitId && data.salesUnits.some((item) => item.id === pendingCreatedSalesUnitId)) {
-      setSelectedSalesUnitId(pendingCreatedSalesUnitId);
-      setPendingCreatedSalesUnitId(null);
-      setIsCreatingDraft(false);
-      return;
-    }
-
-    if (isCreatingDraft) {
-      return;
-    }
-
-    if (selectedSalesUnitId && data.salesUnits.some((item) => item.id === selectedSalesUnitId)) {
-      return;
-    }
-
-    setSelectedSalesUnitId(data.salesUnits[0]?.id ?? null);
-  }, [data.salesUnits, isCreatingDraft, pendingCreatedSalesUnitId, selectedSalesUnitId]);
+    if (!openRegistration || !savedProduct || !data.salesUnits.some((unit) => unit.id === savedProduct.id)) return;
+    const query = new URLSearchParams(window.location.search);
+    if (!query.has("register") && !query.has("signatureId")) return;
+    window.history.replaceState(null, "", buildHrefWithStore("/sales-units", null, data.primaryStore?.id));
+  }, [data.primaryStore?.id, data.salesUnits, openRegistration, savedProduct]);
 
   if (!data.primaryStore) {
     return (
@@ -128,13 +98,58 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
   }
 
   const activeCount = data.salesUnits.filter((item) => item.isActive).length;
-  const incompleteCostCount = data.salesUnits.filter(
-    (item) => !data.costSettings.some((cost) => cost.canonicalSalesUnitId === item.id && cost.isActive),
-  ).length;
+  const groupIds = new Set(data.salesUnits.filter((item) => item.isGroup).map((item) => item.id));
+  const costsById = new Map(data.costCoverage?.items.map((item) => [item.id, item.unitCost]));
+  const incompleteCostCount = data.costCoverage?.items.filter((item) => item.unitCost === null).length;
   const primaryStore = data.primaryStore;
+  const canRegister = primaryStore.isActive && data.sources.every((source) => source.source === "live");
   const mappingsHref = buildHrefWithStore("/mappings", null, primaryStore.id);
-  const isBusy = isSubmitting || isToggling || isRefreshing;
-  const isEditing = Boolean(selectedSalesUnit);
+  const isBusy = isSubmitting || isToggling || isRefreshing || isSavingProductEdit;
+  const query = search.trim().toLocaleLowerCase("ko");
+  const filtering = Boolean(query) || filter !== "all";
+  const matchesSearch = (unit: SalesUnitListItem) =>
+    [unit.displayName, ...unit.matchAliases].some((value) => value.toLocaleLowerCase("ko").includes(query));
+  const matchesFilter = (unit: SalesUnitListItem) => (
+    filter === "active" ? unit.isActive : filter === "inactive" ? !unit.isActive : filter === "missing" ? costsById.get(unit.id) === null : true
+  );
+  const childrenByGroup = new Map<string, SalesUnitListItem[]>();
+  for (const unit of data.salesUnits) {
+    if (!unit.parentSalesUnitId || !groupIds.has(unit.parentSalesUnitId)) continue;
+    const children = childrenByGroup.get(unit.parentSalesUnitId) ?? [];
+    children.push(unit);
+    childrenByGroup.set(unit.parentSalesUnitId, children);
+  }
+  const roots = data.salesUnits
+    .filter((unit) => !unit.parentSalesUnitId || !groupIds.has(unit.parentSalesUnitId))
+    .sort((a, b) => Number(b.isStoreLevel) - Number(a.isStoreLevel) || Number(b.isGroup) - Number(a.isGroup));
+  const rows = roots.flatMap((unit) => {
+    const matchesName = matchesSearch(unit);
+    const children = (childrenByGroup.get(unit.id) ?? []).filter((child) => (matchesName || matchesSearch(child)) && matchesFilter(child));
+    if ((!matchesName || !matchesFilter(unit)) && children.length === 0) return [];
+    const expansionKey = (filtering ? "filtered:" : "") + unit.id;
+    const isExpanded = expandedGroups[expansionKey] ?? filtering;
+    return [
+      { unit, isChild: false, expansionKey, isExpanded, childCount: children.length },
+      ...(isExpanded ? children.map((child) => ({ unit: child, isChild: true, expansionKey, isExpanded: false, childCount: 0 })) : []),
+    ];
+  });
+
+  function productHref(id: string, date?: string, pending?: boolean) {
+    const params = new URLSearchParams({ salesUnitId: id });
+    if (date) params.set("date", date);
+    if (pending) params.set("recalculation", "pending");
+    return buildHrefWithStore("/sales-units/product", params, data.primaryStore?.id);
+  }
+
+  function handleRegistered(result: Pick<ProductRegistrationResult, "salesUnitId" | "recalculationPending">, date: string) {
+    setRegistrationOpen(false);
+    setRegistrationVersion((version) => version + 1);
+    setSearch("");
+    setFilter("all");
+    setSavedProduct({ id: result.salesUnitId, date, signatureKey, recalculationPending: result.recalculationPending });
+    router.refresh();
+    registrationToggle.current?.focus();
+  }
 
   async function refreshWithMessage(message: string) {
     setSuccessMessage(message);
@@ -168,414 +183,315 @@ export function SalesUnitsView({ data }: { data: SalesUnitsPageData }) {
     }
   }
 
-  return (
-    <div className="space-y-6">
-      <PageHeader
-        eyebrow="Sales Units"
-        title="판매단위 정의"
-        description="표시명은 UI에만 쓰이고 자동 매핑은 matchAliases 기준으로만 동작합니다."
-        actions={
-          <>
-            <Link className="button-shell button-secondary" href={mappingsHref}>
-              매핑 화면으로 이동
-            </Link>
-            <button
-              className="button-shell button-secondary"
-              type="button"
-              disabled={isBusy}
-              onClick={() => {
-                setCreateGroupModal({
-                  isOpen: true,
-                  selectedChildIds: new Set(),
-                  displayName: "",
-                  errorMessage: null,
-                  isSubmitting: false,
-                });
-              }}
-            >
-              판매단위 그룹 만들기
-            </button>
-            <button
-              className="button-shell button-primary"
-              type="button"
-              disabled={isBusy}
-              onClick={() => {
-                setIsCreatingDraft(true);
-                setPendingCreatedSalesUnitId(null);
-                setSelectedSalesUnitId(null);
-                setErrorMessage(null);
-                setSuccessMessage(null);
-                setDraft(emptyDraft());
-              }}
-            >
-              새 판매단위 추가
-            </button>
-          </>
-        }
+  const editor = selectedSalesUnit && !selectedSalesUnit.isStoreLevel && (
+    <div className="space-y-2.5">
+      <ProductEditView
+        key={selectedSalesUnit.id}
+        store={primaryStore}
+        salesUnitId={selectedSalesUnit.id}
+        today={today}
+        disabled={!canRegister || isBusy}
+        onSavingChange={setIsSavingProductEdit}
+        onSaved={(pending) => {
+          setSelectedSalesUnitId(null);
+          void refreshWithMessage(pending ? "판매단위를 수정했습니다. 손익 갱신 상태는 상품 화면에서 확인해 주세요." : "판매단위를 수정했습니다.");
+        }}
       />
-
-      <SourceBanner sources={data.sources} />
-
-      <div className="grid gap-4 md:grid-cols-3">
-        <StatCard label="전체 판매단위" value={formatNumber(data.salesUnits.length)} hint={`활성 ${formatNumber(activeCount)}개`} />
-        <StatCard label="비용 미설정" value={formatNumber(incompleteCostCount)} hint="INCOMPLETE 후보" tone="warning" />
-        <StatCard
-          label="활성 비용 row"
-          value={formatNumber(data.costSettings.filter((item) => item.isActive).length)}
-          hint="비용 화면과 연동"
-          tone="success"
-        />
-      </div>
-
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-        <Panel
-          title="판매단위 목록"
-          description="같은 스토어 안에서는 표시명과 normalize된 alias가 중복되지 않도록 관리합니다."
-        >
-          <div className="space-y-2">
-            {[...data.salesUnits]
-              .sort((a, b) => {
-                // 스토어 전체 최상단
-                if (a.isStoreLevel === b.isStoreLevel) {
-                  // 그룹은 자식보다 먼저
-                  if (a.isGroup !== b.isGroup) return a.isGroup ? -1 : 1;
-                  return 0;
-                }
-                return a.isStoreLevel ? -1 : 1;
-              })
-              .flatMap((unit) => {
-                const result: (SalesUnitListItem & { _level: number; _parentId?: string })[] = [
-                  { ...unit, _level: 0 },
-                ];
-                // 그룹인 경우 자식을 추가
-                if (unit.isGroup && expandedGroups[unit.id]) {
-                  const children = data.salesUnits.filter((u) => u.parentSalesUnitId === unit.id);
-                  result.push(...children.map((child) => ({ ...child, _level: 1, _parentId: unit.id })));
-                }
-                return result;
-              })
-              .map((row, idx) => (
-                <div
-                  key={idx}
-                  className={`rounded-lg border p-4 ${
-                    row._level === 1
-                      ? "ml-6 border-slate-200 bg-slate-50"
-                      : "border-slate-300 bg-white"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2">
-                        {row.isGroup && (
-                          <button
-                            className="button-shell button-ghost p-1"
-                            type="button"
-                            onClick={() =>
-                              setExpandedGroups((current) => ({
-                                ...current,
-                                [row.id]: !current[row.id],
-                              }))
-                            }
-                          >
-                            {expandedGroups[row.id] ? "▼" : "▸"}
-                          </button>
-                        )}
-                        {!row.isGroup && row._level === 0 && <div className="w-6" />}
-                        <p className="font-semibold text-ink">{row.displayName}</p>
-                        {row.isStoreLevel && (
-                          <span className="inline-block rounded-full bg-blue-100 px-2 py-1 text-xs font-semibold text-blue-700">
-                            스토어 전체
-                          </span>
-                        )}
-                        {row.isGroup && (
-                          <span className="inline-block rounded-full bg-purple-100 px-2 py-1 text-xs font-semibold text-purple-700">
-                            그룹
-                          </span>
-                        )}
-                        {row._level === 1 && (
-                          <span className="inline-block rounded-full bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-700">
-                            그룹 자식
-                          </span>
-                        )}
-                      </div>
-                      <p className="mt-1 text-xs text-ink/55">
-                        {row.matchAliases.length > 0 ? row.matchAliases.join(", ") : "alias 없음"}
-                      </p>
-                      {row.memo && <p className="mt-1 text-xs text-ink/65">{row.memo}</p>}
-                    </div>
-                    <div className="flex flex-col items-end gap-2 text-right text-xs text-ink/55">
-                      <StatusBadge tone={toneForActive(row.isActive)}>
-                        {row.isActive ? "ACTIVE" : "INACTIVE"}
-                      </StatusBadge>
-                      {data.costSettings.find(
-                        (cost) => cost.canonicalSalesUnitId === row.id && cost.isActive,
-                      ) && (
-                        <span className="text-emerald-600">
-                          {formatNumber(
-                            data.costSettings.find(
-                              (cost) => cost.canonicalSalesUnitId === row.id && cost.isActive,
-                            )?.unitCost ?? 0,
-                          )}
-                          원
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <button
-                      className="button-shell button-ghost text-xs"
-                      type="button"
-                      onClick={() => {
-                        setIsCreatingDraft(false);
-                        setPendingCreatedSalesUnitId(null);
-                        setSelectedSalesUnitId(row.id);
-                        setErrorMessage(null);
-                        setSuccessMessage(null);
-                      }}
-                    >
-                      {selectedSalesUnitId === row.id ? "선택됨" : "열기"}
-                    </button>
-                  </div>
-                </div>
-              ))}
+        {errorMessage ? (
+          <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {errorMessage}
           </div>
-        </Panel>
+        ) : null}
 
-        <Panel
-          title={isEditing ? "선택한 판매단위 수정" : "새 판매단위 만들기"}
-          description={
-            selectedSalesUnit?.isStoreLevel
-              ? "스토어 전체 광고비 버킷 (편집 불가)"
-              : selectedSalesUnit?.isGroup
-                ? "그룹 판매단위: 자식의 매출을 합산하고 광고비를 귀속받습니다"
-                : "matchAliases는 한 줄에 하나씩 입력하면 자동 매핑 기준으로 사용됩니다"
-          }
-        >
-          {selectedSalesUnit?.isStoreLevel ? (
-            <div className="rounded-2xl border border-blue-200 bg-blue-50 px-4 py-4 text-sm leading-6 text-blue-700">
-              이 판매단위는 스토어 전체 광고비 버킷입니다. 카탈로그, 키워드타겟, 인피니티가드(단독) 등 스토어 전체를 대상으로 하는 광고가 자동으로 매핑됩니다. 편집할 수 없습니다.
+        {selectedSalesUnit?.isGroup && (
+          <details className="rounded-md border border-ink/10 px-2.5 py-1.5">
+            <summary className="cursor-pointer text-xs font-semibold">하위 구성 관리</summary>
+            <div className="pt-2">
+              <div className="space-y-2">
+                {data.salesUnits
+                  .filter((u) => u.parentSalesUnitId === selectedSalesUnit.id)
+                  .map((child) => (
+                    <div key={child.id} className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2">
+                      <span className="text-sm text-ink">{child.displayName}</span>
+                      <button
+                        className="button-shell button-ghost text-xs"
+                        type="button"
+                        disabled={!canRegister || isBusy}
+                        onClick={async () => {
+                          setIsSubmitting(true);
+                          try {
+                            const response = await fetch(
+                              `/api/canonical-sales-units/group/${child.id}/detach-child`,
+                              {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ storeId: primaryStore.id }),
+                              },
+                            );
+                            const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+                            if (!response.ok) {
+                              throw new Error(payload?.message ?? "자식 제거에 실패했습니다.");
+                            }
+                            await refreshWithMessage("자식을 제거했습니다.");
+                          } catch (error) {
+                            setErrorMessage(error instanceof Error ? error.message : "자식 제거 중 오류가 발생했습니다.");
+                          } finally {
+                            setIsSubmitting(false);
+                          }
+                        }}
+                      >
+                        제거
+                      </button>
+                    </div>
+                  ))}
+              </div>
+              <button
+                className="button-shell button-ghost mt-3 text-xs"
+                type="button"
+                disabled={!canRegister || isBusy}
+                onClick={() => {
+                  setManageChildrenModal({
+                    isOpen: true,
+                    selectedChildIdToAdd: null,
+                    errorMessage: null,
+                    isSubmitting: false,
+                  });
+                }}
+              >
+                구성 추가
+              </button>
             </div>
-          ) : (
-            <form
-              className="space-y-4"
-              onSubmit={async (event: FormEvent<HTMLFormElement>) => {
-                event.preventDefault();
-                setErrorMessage(null);
-                setSuccessMessage(null);
+          </details>
+        )}
 
-                if (!draft.displayName.trim()) {
-                  setErrorMessage("표시 이름은 필수입니다.");
-                  return;
-                }
-
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="button-shell button-ghost"
+            type="button"
+            disabled={!canRegister || isBusy}
+            onClick={() => void handleToggle(selectedSalesUnit.isActive ? "deactivate" : "activate")}
+          >
+            {selectedSalesUnit.isActive ? "비활성화" : "활성화"}
+          </button>
+          {selectedSalesUnit?.isGroup && (
+            <button
+              className="button-shell button-ghost text-red-600"
+              type="button"
+              disabled={!canRegister || isBusy}
+              onClick={async () => {
                 setIsSubmitting(true);
                 try {
                   const response = await fetch(
-                    isEditing ? `/api/canonical-sales-units/${selectedSalesUnit!.id}` : "/api/canonical-sales-units",
+                    `/api/canonical-sales-units/group/${selectedSalesUnit.id}/dissolve`,
                     {
-                      method: isEditing ? "PATCH" : "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                      },
-                      body: JSON.stringify({
-                        ...(isEditing ? {} : { storeId: primaryStore.id }),
-                        displayName: draft.displayName.trim(),
-                        matchAliases: parseAliases(draft.matchAliasesText),
-                        memo: draft.memo.trim() || null,
-                      }),
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ storeId: primaryStore.id }),
                     },
                   );
-
-                  const payload = (await response.json().catch(() => null)) as {
-                    message?: string;
-                    data?: { id?: string };
-                  } | null;
+                  const payload = (await response.json().catch(() => null)) as { message?: string } | null;
                   if (!response.ok) {
-                    throw new Error(payload?.message ?? "판매단위 저장에 실패했습니다.");
+                    throw new Error(payload?.message ?? "그룹 해체에 실패했습니다.");
                   }
-
-                  if (!isEditing && typeof payload?.data?.id === "string") {
-                    setPendingCreatedSalesUnitId(payload.data.id);
-                  }
-
-                  await refreshWithMessage(isEditing ? "판매단위를 수정했습니다." : "판매단위를 생성했습니다.");
+                  await refreshWithMessage("그룹을 해체했습니다.");
                 } catch (error) {
-                  setErrorMessage(error instanceof Error ? error.message : "처리 중 오류가 발생했습니다.");
+                  setErrorMessage(error instanceof Error ? error.message : "그룹 해체 중 오류가 발생했습니다.");
                 } finally {
                   setIsSubmitting(false);
                 }
               }}
             >
-              <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">표시 이름</span>
-                <input
-                  className="input-shell"
-                  placeholder="예: 코벨 다이어트 양말"
-                  value={draft.displayName}
-                  onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))}
-                />
-              </label>
-
-              <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">matchAliases</span>
-                <textarea
-                  className="input-shell min-h-28"
-                  placeholder={"한 줄에 하나씩 alias를 입력하세요.\n코벨 다이어트 양말\n다이어트 양말\n코벨 다이어트"}
-                  value={draft.matchAliasesText}
-                  onChange={(event) => setDraft((current) => ({ ...current, matchAliasesText: event.target.value }))}
-                  disabled={selectedSalesUnit?.isStoreLevel}
-                />
-              </label>
-
-              {selectedSalesUnit?.isGroup && (
-                <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-                  그룹 판매단위는 주문을 직접 매핑할 수 없으며, 매출/원가는 자식 판매단위에서 집계됩니다.
-                </div>
-              )}
-
-              <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">메모</span>
-                <textarea
-                  className="input-shell min-h-28"
-                  placeholder="설명 메모"
-                  value={draft.memo}
-                  onChange={(event) => setDraft((current) => ({ ...current, memo: event.target.value }))}
-                />
-              </label>
-
-              {errorMessage ? (
-                <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                  {errorMessage}
-                </div>
-              ) : null}
-
-              {successMessage ? (
-                <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-                  {successMessage}
-                </div>
-              ) : null}
-
-              <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-                비활성화된 판매단위는 과거 FK를 유지하지만 신규 자동 매핑과 비용 설정 대상에서는 제외됩니다.
-              </div>
-
-              {selectedSalesUnit?.isGroup && (
-                <div className="space-y-4 rounded-2xl border border-purple-200 bg-purple-50 px-4 py-4">
-                  <div>
-                    <h4 className="mb-3 text-sm font-semibold text-purple-900">자식 관리</h4>
-                    <div className="space-y-2">
-                      {data.salesUnits
-                        .filter((u) => u.parentSalesUnitId === selectedSalesUnit.id)
-                        .map((child) => (
-                          <div key={child.id} className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2">
-                            <span className="text-sm text-ink">{child.displayName}</span>
-                            <button
-                              className="button-shell button-ghost text-xs"
-                              type="button"
-                              disabled={isBusy}
-                              onClick={async () => {
-                                setIsSubmitting(true);
-                                try {
-                                  const response = await fetch(
-                                    `/api/canonical-sales-units/group/${child.id}/detach-child`,
-                                    {
-                                      method: "POST",
-                                      headers: { "Content-Type": "application/json" },
-                                      body: JSON.stringify({ storeId: primaryStore.id }),
-                                    },
-                                  );
-                                  const payload = (await response.json().catch(() => null)) as { message?: string } | null;
-                                  if (!response.ok) {
-                                    throw new Error(payload?.message ?? "자식 제거에 실패했습니다.");
-                                  }
-                                  await refreshWithMessage("자식을 제거했습니다.");
-                                } catch (error) {
-                                  setErrorMessage(error instanceof Error ? error.message : "자식 제거 중 오류가 발생했습니다.");
-                                } finally {
-                                  setIsSubmitting(false);
-                                }
-                              }}
-                            >
-                              제거
-                            </button>
-                          </div>
-                        ))}
-                    </div>
-                    <button
-                      className="button-shell button-ghost mt-3 text-xs"
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => {
-                        setManageChildrenModal({
-                          isOpen: true,
-                          selectedChildIdToAdd: null,
-                          errorMessage: null,
-                          isSubmitting: false,
-                        });
-                      }}
-                    >
-                      자식 추가
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              <div className="flex flex-wrap gap-3">
-                <button className="button-shell button-primary" type="submit" disabled={isBusy || selectedSalesUnit?.isStoreLevel}>
-                  {isEditing ? "수정 저장" : "신규 저장"}
-                </button>
-                <button
-                  className="button-shell button-secondary"
-                  type="button"
-                  disabled={isBusy || !selectedSalesUnit || !selectedSalesUnit.isActive}
-                  onClick={() => handleToggle("deactivate")}
-                >
-                  비활성화
-                </button>
-                <button
-                  className="button-shell button-ghost"
-                  type="button"
-                  disabled={isBusy || !selectedSalesUnit || selectedSalesUnit.isActive}
-                  onClick={() => handleToggle("activate")}
-                >
-                  활성화
-                </button>
-                {selectedSalesUnit?.isGroup && (
-                  <button
-                    className="button-shell button-ghost text-red-600"
-                    type="button"
-                    disabled={isBusy}
-                    onClick={async () => {
-                      setIsSubmitting(true);
-                      try {
-                        const response = await fetch(
-                          `/api/canonical-sales-units/group/${selectedSalesUnit.id}/dissolve`,
-                          {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ storeId: primaryStore.id }),
-                          },
-                        );
-                        const payload = (await response.json().catch(() => null)) as { message?: string } | null;
-                        if (!response.ok) {
-                          throw new Error(payload?.message ?? "그룹 해체에 실패했습니다.");
-                        }
-                        await refreshWithMessage("그룹을 해체했습니다.");
-                      } catch (error) {
-                        setErrorMessage(error instanceof Error ? error.message : "그룹 해체 중 오류가 발생했습니다.");
-                      } finally {
-                        setIsSubmitting(false);
-                      }
-                    }}
-                  >
-                    그룹 해체
-                  </button>
-                )}
-              </div>
-            </form>
+              그룹 해체
+            </button>
           )}
-        </Panel>
-      </div>
+        </div>
+    </div>
+  );
+
+
+  return (
+    <div className="sales-units-workspace space-y-3">
+      <header className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+          <h1 className="text-2xl font-semibold tracking-tight">판매단위</h1>
+          <p className="text-sm text-ink/65">{primaryStore.name}</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Link className="button-shell button-ghost" href={mappingsHref}>주문·광고 매핑</Link>
+          <button
+            className="button-shell button-secondary"
+            type="button"
+            disabled={!canRegister || isBusy}
+            onClick={() => {
+              setCreateGroupModal({
+                isOpen: true,
+                selectedChildIds: new Set(),
+                displayName: "",
+                errorMessage: null,
+                isSubmitting: false,
+              });
+            }}
+          >
+            기존 상품 그룹 만들기
+          </button>
+        </div>
+      </header>
+
+      <SourceBanner sources={data.sources} />
+
+      {canRegister && (
+        <section className="rounded-lg border border-ink/15 bg-white/85" aria-labelledby="product-registration-title">
+          <h2 id="product-registration-title">
+            <button
+              ref={registrationToggle}
+              type="button"
+              aria-expanded={registrationOpen}
+              aria-controls="product-registration"
+              className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold hover:bg-sand/35 sm:px-4"
+              onClick={() => {
+                setRegistrationOpen(!registrationOpen);
+                if (!registrationOpen && !orderContextError) requestAnimationFrame(() => document.getElementById("new-product-name")?.focus());
+              }}
+            >
+              <Plus size={16} className="text-coral" aria-hidden="true" />
+              신상품 등록
+              <ChevronDown size={16} className={registrationOpen ? "ml-auto rotate-180" : "ml-auto"} aria-hidden="true" />
+            </button>
+          </h2>
+          <div id="product-registration" hidden={!registrationOpen}>
+            {orderContextError ? (
+              <div className="flex flex-wrap items-center gap-2 border-t border-ink/10 px-3 py-2 text-sm">
+                <p role="alert" className="text-red-700">{orderContextError}</p>
+                <Link href={mappingsHref} className="button-shell button-secondary">주문 매핑으로 돌아가기</Link>
+              </div>
+            ) : (
+              <ProductRegistrationView
+                key={activeSignatureKey + ":" + registrationVersion}
+                store={primaryStore}
+                today={today}
+                signatureIds={registrationSignatures}
+                onSaved={handleRegistered}
+              />
+            )}
+          </div>
+        </section>
+      )}
+      {savedProduct && (
+        <div role="status" className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-sm text-emerald-900">
+          <span>상품을 등록했습니다.</span>
+          <Link className="font-semibold underline underline-offset-2" href={productHref(savedProduct.id, savedProduct.date, savedProduct.recalculationPending)}>등록한 상품 상태 확인</Link>
+        </div>
+      )}
+      {successMessage && <p role="status" className="rounded-md bg-emerald-50 px-3 py-1.5 text-sm text-emerald-900">{successMessage}</p>}
+
+      <section className="rounded-lg border border-ink/15 bg-white/85" aria-labelledby="sales-unit-list-title">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 sm:px-4">
+          <div>
+            <h2 id="sales-unit-list-title" className="text-base font-semibold">등록된 판매단위</h2>
+            <p className="text-xs text-ink/65">
+              전체 {formatNumber(data.salesUnits.length)}개 · 활성 {formatNumber(activeCount)}개
+              {data.costCoverage && <> · 원가 미설정 {formatNumber(incompleteCostCount)}개</>}
+            </p>
+          </div>
+          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+            <label className="flex min-w-40 flex-1 items-center gap-1.5 sm:w-52">
+              <Search aria-hidden="true" size={16} className="shrink-0 text-ink/65" />
+              <span className="sr-only">판매단위 검색</span>
+              <input className="input-shell" type="search" placeholder="상품명 또는 연결 키워드" value={search} onChange={(event) => setSearch(event.target.value)} />
+            </label>
+            <select className="input-shell max-w-32" aria-label="상태로 판매단위 필터링" value={filter} onChange={(event) => setFilter(event.target.value)}>
+              <option value="all">전체 상태</option>
+              <option value="active">활성</option>
+              <option value="inactive">비활성</option>
+              {data.costCoverage && <option value="missing">원가 미설정</option>}
+            </select>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full table-fixed text-sm">
+            <caption className="sr-only">판매단위, 자동 연결 키워드, 상태와 적용 원가</caption>
+            <colgroup>
+              <col />
+              <col className="hidden w-[27%] lg:table-column" />
+              <col className="w-[3rem] sm:w-16" />
+              <col className="w-[5rem] sm:w-28" />
+              <col className="w-[6.25rem] sm:w-32" />
+            </colgroup>
+            <thead className="border-y border-ink/10 bg-sand/45 text-xs text-ink/70">
+              <tr>
+                <th scope="col" className="px-2.5 py-2 text-left sm:px-4">상품 · 판매 구성</th>
+                <th scope="col" className="hidden px-2 py-2 text-left lg:table-cell">자동 연결 키워드</th>
+                <th scope="col" className="py-2 text-center">상태</th>
+                <th scope="col" className="px-2 py-2 text-right">
+                  <span title={data.costCoverage ? formatDate(data.costCoverage.date) + " 기준" : "원가 조회 불가"}>적용 원가</span>
+                </th>
+                <th scope="col" className="px-2 py-2 text-right sm:pr-4">관리</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-ink/10">
+              {rows.length === 0 && (
+                <tr><td className="px-4 py-6 text-center text-sm text-ink/65" colSpan={5}>{filtering ? "검색 조건에 맞는 판매단위가 없습니다." : "등록된 판매단위가 없습니다."}</td></tr>
+              )}
+              {rows.map(({ unit, isChild, expansionKey, isExpanded, childCount }) => {
+                const isEditing = selectedSalesUnitId === unit.id && !unit.isStoreLevel;
+                const cost = costsById.get(unit.id);
+                const productId = unit.parentSalesUnitId && groupIds.has(unit.parentSalesUnitId) ? unit.parentSalesUnitId : unit.id;
+                const editorId = "edit-unit-" + unit.id;
+                return (
+                  <Fragment key={unit.id}>
+                    <tr className={isEditing ? "bg-sand/55" : isChild ? "bg-sand/20 hover:bg-sand/45" : "hover:bg-sand/30"}>
+                      <th scope="row" className="px-2.5 py-1.5 text-left font-medium sm:px-4">
+                        <div className={"flex min-w-0 items-center gap-1.5" + (isChild ? " pl-5" : "")}>
+                          {unit.isGroup && childCount > 0 && (
+                            <button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-ink/10" aria-expanded={isExpanded} aria-label={unit.displayName + " 판매 구성"} onClick={() => setExpandedGroups((current) => ({ ...current, [expansionKey]: !isExpanded }))}>
+                              {isExpanded ? <ChevronDown aria-hidden="true" size={15} /> : <ChevronRight aria-hidden="true" size={15} />}
+                            </button>
+                          )}
+                          <span className="min-w-0 break-words leading-4 sm:truncate" title={unit.displayName}>{unit.displayName}</span>
+                          {unit.isGroup && <span className="hidden shrink-0 text-xs font-normal text-ink/65 sm:inline">그룹{childCount > 0 ? " · " + childCount : ""}</span>}
+                          {unit.isStoreLevel && <span className="hidden shrink-0 text-xs font-normal text-ink/65 sm:inline">공통</span>}
+                        </div>
+                      </th>
+                      <td className="hidden truncate px-2 py-1.5 text-xs text-ink/70 lg:table-cell" title={unit.matchAliases.join(", ")}>{unit.matchAliases.join(", ") || "—"}</td>
+                      <td className="py-1.5 text-center text-xs">
+                        <span className={unit.isActive ? "font-medium text-emerald-800" : "text-ink/65"}>{unit.isActive ? "활성" : "비활성"}</span>
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-right text-xs tabular-nums sm:text-sm">
+                        {cost === null ? <span className="text-amber-800">미설정</span> : cost === undefined ? <span className="text-ink/55">—</span> : formatCurrency(cost)}
+                      </td>
+                      <td className="py-0.5 pr-2 text-right sm:pr-4">
+                        {!unit.isStoreLevel && (
+                          <div className="flex items-center justify-end gap-0.5 whitespace-nowrap text-xs">
+                            <Link prefetch={false} className="rounded px-1.5 py-1.5 text-ink/70 hover:bg-ink/10 hover:text-ink" href={productHref(productId)} aria-label={unit.displayName + " 상품 상태"}>상태</Link>
+                            <button
+                              type="button"
+                              className="rounded px-1.5 py-1.5 font-semibold hover:bg-ink/10"
+                              aria-expanded={isEditing}
+                              aria-controls={isEditing ? editorId : undefined}
+                              aria-label={unit.displayName + (isEditing ? " 편집 닫기" : " 편집")}
+                              disabled={isBusy}
+                              onClick={() => {
+                                setSelectedSalesUnitId(isEditing ? null : unit.id);
+                                setErrorMessage(null);
+                                setSuccessMessage(null);
+                              }}
+                            >{isEditing ? "닫기" : "편집"}</button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                    {isEditing && (
+                      <tr id={editorId} className="bg-sand/30">
+                        <td colSpan={5} className="px-3 py-2.5 sm:px-4">{editor}</td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       {createGroupModal.isOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">

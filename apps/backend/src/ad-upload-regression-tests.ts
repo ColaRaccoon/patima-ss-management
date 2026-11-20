@@ -219,6 +219,16 @@ export async function runAdUploadRegressionTests() {
       assert.equal(response.status, 201);
       const body = await response.json();
       assert.deepEqual(body.data.items.map((item: { storeName: string }) => item.storeName), ["인피니티스토어", "파티마스토어"]);
+      for (const storeId of ["store-0", "store-1"]) {
+        const listing = await fetch(`${base}/api/v1/ad-campaign-signatures?storeId=${storeId}&page=1&pageSize=50`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        assert.equal(listing.status, 200, "upload must remain visible through the mapping-list endpoint");
+        const listed = await listing.json();
+        assert.equal(listed.data.totalCount, 1);
+        assert.equal(listed.data.items[0].campaignId, "campaign");
+        assert.equal(listed.data.items[0].totalCost, 100);
+      }
       assert.equal((await send(uploads)).status, 400);
       assert.equal((await send([file("260230_파티마.xlsx")])).status, 400);
       const manualUpload = file("manual-report.xlsx", "manual-campaign");

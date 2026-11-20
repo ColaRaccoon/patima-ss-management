@@ -13,6 +13,9 @@ import { NaverCommerceConfigService } from "./naver-commerce-config.service";
 import { CredentialService } from "./credential.service";
 import { NaverCommerceService, ResolvedCommerceCredential } from "./naver-commerce.service";
 import { mock } from "node:test";
+import { OrderMappingService } from "./order-mapping.service";
+import { CampaignMappingService } from "./campaign-mapping.service";
+import { recalculateAdCampaignSignaturesForStore } from "./ad-mapping-engine";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 
 async function runPostgresStartupTests() {
@@ -98,6 +101,8 @@ async function runPostgresStartupTests() {
 
 export async function runStartupRegressionTests() {
   await runPostgresStartupTests();
+  await verifyStartupOrderMappingPersistence();
+  await verifyStartupCampaignMappingPersistence();
   const crypto = new CryptoService();
   const config = {
     getBootstrapStorePayload: () => ({ name: "Test", sellerAccountId: "seller", channelNo: "channel", memo: "" }),
@@ -272,4 +277,127 @@ export async function runStartupRegressionTests() {
     }
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+async function verifyStartupOrderMappingPersistence() {
+  let data = createEmptyDatabase();
+  const timestamp = "2026-11-11T00:00:00Z";
+  data.stores = [{ id: "mapped-store" }, { id: "empty-store" }] as never;
+  data.canonicalSalesUnits = ["auto", "manual"].map((id) => ({
+    id, storeId: "mapped-store", displayName: id, isActive: true,
+    matchAliases: [id], normalizedMatchAliases: [id], linkedProductIds: [],
+    linkedOptionCodes: [], linkedManageCodes: [], parentSalesUnitId: null,
+    deactivatedAt: null, isGroup: false, isStoreLevel: false,
+  })) as never;
+  data.orderSourceSignatures = ["auto", "manual"].map((id) => ({
+    id: `sig-${id}`, storeId: "mapped-store", rawProductNameSnapshot: "auto",
+    normalizedProductName: "auto", rawOptionInfoSnapshot: null, normalizedOptionInfo: "",
+    sourceSignature: "auto || ", canonicalSalesUnitId: id, mappingStatus: "MAPPED",
+    confirmedAt: id === "manual" ? timestamp : null, updatedAt: timestamp,
+  })) as never;
+  data.orderItems = ["auto", "manual"].map((id) => ({
+    id: `item-${id}`, storeId: "mapped-store", orderSourceSignatureId: `sig-${id}`,
+    canonicalSalesUnitId: id, paymentDate: "2026-11-11", updatedAt: timestamp,
+  })) as never;
+  let writes = 0;
+  let registered = 0;
+  let fail = false;
+  const database = {
+    getSnapshot: () => data,
+    writeCommitted: async (mutator: (draft: typeof data) => void, keys?: readonly string[]) => {
+      writes++;
+      assert.deepEqual(keys, ["orderSourceSignatures", "orderItems"]);
+      const draft = structuredClone(data);
+      mutator(draft);
+      if (fail) throw new Error("STARTUP_COMMIT_FAILED");
+      data = draft;
+    },
+  } as unknown as DatabaseService;
+  const service = new OrderMappingService(database, {
+    registerRetryExecutor: () => { registered++; },
+  } as never, {} as never, {} as never);
+  const initial = structuredClone(data);
+  await service.onModuleInit();
+  assert.deepEqual(data, initial, "module initialization only registers retry before database loading completes");
+  await service.onApplicationBootstrap();
+  assert.equal(writes, 0, "unchanged and empty stores must not persist startup snapshots");
+  assert.equal(registered, 1, "skipping persistence must retain retry registration");
+  assert.deepEqual(data, initial, "dry-run must not mutate live mappings or timestamps");
+
+  data.orderItems[0].canonicalSalesUnitId = null;
+  data.orderSourceSignatures[0].canonicalSalesUnitId = null;
+  data.orderSourceSignatures[0].mappingStatus = "UNMAPPED";
+  const beforeFailure = structuredClone(data);
+  fail = true;
+  await assert.rejects(service.onApplicationBootstrap(), /STARTUP_COMMIT_FAILED/);
+  assert.deepEqual(data, beforeFailure, "failed startup persistence must not publish the probe");
+  fail = false;
+  await service.onApplicationBootstrap();
+  assert.equal(writes, 2, "one failed and one successful changed-store commit only");
+  assert.equal(data.orderItems[0].canonicalSalesUnitId, "auto");
+  assert.equal(data.orderSourceSignatures[0].canonicalSalesUnitId, "auto");
+  assert.deepEqual(data.orderSourceSignatures[1], initial.orderSourceSignatures[1]);
+  assert.deepEqual(data.orderItems[1], initial.orderItems[1]);
+  await service.onApplicationBootstrap();
+  assert.equal(writes, 2, "successful repair must not cause writes on subsequent startup");
+  console.log("PASS startup order mapping skips unchanged snapshots, persists real changes only and preserves manual mappings on failure and restart");
+}
+
+async function verifyStartupCampaignMappingPersistence() {
+  let data = createEmptyDatabase();
+  data.stores = [{ id: "campaign-store" }] as never;
+  data.canonicalSalesUnits = [{ id: "target", storeId: "campaign-store", displayName: "상품",
+    isActive: true, matchAliases: ["상품"], normalizedMatchAliases: ["상품"],
+    parentSalesUnitId: null, isGroup: false, isStoreLevel: false }] as never;
+  data.adCampaignDailyCosts = [{ id: "row", storeId: "campaign-store", campaignId: "campaign",
+    campaignName: "상품 광고", normalizedCampaignName: "상품 광고", reportDate: "2026-11-11",
+    totalCost: 100, adCampaignSignatureId: null, canonicalSalesUnitId: null }] as never;
+  recalculateAdCampaignSignaturesForStore(data, "campaign-store", { applyToRows: true });
+  const initial = structuredClone(data);
+  let writes = 0;
+  let summaries = 0;
+  let fail = false;
+  const database = {
+    getSnapshot: () => data,
+    writeCommitted: async (mutator: (draft: typeof data) => void, keys?: readonly string[]) => {
+      writes++;
+      assert.deepEqual(keys, ["adCampaignSignatures", "adCampaignDailyCosts"]);
+      const draft = structuredClone(data);
+      mutator(draft);
+      if (fail) throw new Error("CAMPAIGN_STARTUP_FAILED");
+      data = draft;
+    },
+  } as unknown as DatabaseService;
+  const service = new CampaignMappingService(database, {} as never, {} as never, {} as never,
+    { ensureStoreLevelSalesUnit: async () => "store-level" } as never,
+    { refreshStoreDateListBestEffort: async () => { summaries++; } } as never);
+  await service.onApplicationBootstrap();
+  assert.equal(writes, 0);
+  assert.equal(summaries, 0);
+  assert.deepEqual(data, initial, "campaign probe must not change live mapping timestamps");
+  data.adCampaignDailyCosts[0].canonicalSalesUnitId = null;
+  const beforeFailure = structuredClone(data);
+  fail = true;
+  await assert.rejects(service.onApplicationBootstrap(), /CAMPAIGN_STARTUP_FAILED/);
+  assert.deepEqual(data, beforeFailure);
+  assert.equal(summaries, 0, "failed persistence must not refresh summaries");
+  fail = false;
+  await service.onApplicationBootstrap();
+  assert.equal(writes, 2);
+  assert.equal(summaries, 1);
+  assert.equal(data.adCampaignDailyCosts[0].canonicalSalesUnitId, "target");
+  await service.onApplicationBootstrap();
+  assert.equal(writes, 2);
+  assert.equal(summaries, 1);
+  data.adCampaignSignatures[0].confirmedAt = "2026-11-11T00:00:00Z";
+  data.adCampaignSignatures[0].canonicalSalesUnitId = null;
+  data.adCampaignSignatures[0].mappingReason = "INTENTIONALLY_UNMAPPED";
+  await service.onApplicationBootstrap();
+  assert.equal(data.adCampaignDailyCosts[0].canonicalSalesUnitId, null);
+  assert.equal(data.adCampaignSignatures[0].mappingReason, "INTENTIONALLY_UNMAPPED");
+  const afterManual = structuredClone(data);
+  await service.onApplicationBootstrap();
+  assert.equal(writes, 3);
+  assert.deepEqual(data, afterManual);
+  console.log("PASS campaign startup skips unchanged mapping writes and summaries, scopes actual repairs and preserves manual decisions");
 }

@@ -5,7 +5,18 @@ import {
   OrderSourceSignature,
   OrderItem,
 } from "@patima/shared";
-import { coalesceNonBlankText, getSignatureMappingStatus, isSalesUnitAssignable, nowIso } from "./helpers";
+import {
+  coalesceNonBlankText,
+  getSignatureMappingStatus,
+  isSalesUnitAssignable,
+  nowIso,
+} from "./helpers";
+import {
+  createOrderGroupContext,
+  matchOrderGroup,
+  matchesOrderAlias,
+  OrderGroupMatch,
+} from "./order-group-matcher";
 
 interface AutoMatchResolution {
   canonicalSalesUnitId: string | null;
@@ -15,11 +26,19 @@ interface AutoMatchResolution {
 
 interface ItemIdMappingResult {
   resolvedUnitId: string | null;
-  resolvedBy: "optionManageCode" | "optionCode" | "productId" | "fallback" | null;
+  resolvedBy:
+    | "optionManageCode"
+    | "optionCode"
+    | "productId"
+    | "fallback"
+    | null;
+  ambiguous?: boolean;
 }
 
 const dedupe = (values: Array<string | null | undefined>): string[] =>
-  Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+  Array.from(
+    new Set(values.filter((value): value is string => Boolean(value))),
+  );
 
 const matchesAlias = (lookupValues: string[], alias: string): boolean =>
   alias.length > 0 && lookupValues.some((value) => value.includes(alias));
@@ -29,7 +48,9 @@ const resolveAliasMatches = (
   lookupValues: string[],
 ): AutoMatchResolution => {
   const matched = salesUnits.filter((salesUnit) =>
-    (salesUnit.normalizedMatchAliases ?? []).some((alias) => matchesAlias(lookupValues, alias)),
+    (salesUnit.normalizedMatchAliases ?? []).some((alias) =>
+      matchesAlias(lookupValues, alias),
+    ),
   );
 
   if (matched.length === 1) {
@@ -55,50 +76,27 @@ const resolveAliasMatches = (
   };
 };
 
-const buildOrderLookupValues = (signature: OrderSourceSignature): string[] =>
-  dedupe([
-    normalizeMatchAlias(signature.normalizedProductName),
-    normalizeMatchAlias(signature.normalizedOptionInfo),
-    normalizeMatchAlias(signature.sourceSignature),
-    normalizeMatchAlias(`${signature.normalizedProductName} ${signature.normalizedOptionInfo}`),
-  ]);
-
 const buildCampaignLookupValues = (normalizedCampaignName: string): string[] =>
   dedupe([normalizeMatchAlias(normalizedCampaignName)]);
-
-function resolveByOptionManageCode(
-  salesUnits: CanonicalSalesUnit[],
-  optionManageCode: string | null | undefined,
-): string | null {
-  if (!optionManageCode) return null;
-  const matched = salesUnits.find((u) => u.linkedManageCodes?.includes(optionManageCode));
-  return matched?.id ?? null;
-}
-
-function resolveByOptionCode(
-  salesUnits: CanonicalSalesUnit[],
-  optionCode: string | null,
-): string | null {
-  if (!optionCode) return null;
-  const matched = salesUnits.find((u) => u.linkedOptionCodes?.includes(optionCode));
-  return matched?.id ?? null;
-}
-
-function resolveByProductId(
-  salesUnits: CanonicalSalesUnit[],
-  externalProductId: string | null,
-): string | null {
-  if (!externalProductId) return null;
-  const matched = salesUnits.find((u) => u.linkedProductIds?.includes(externalProductId));
-  return matched?.id ?? null;
-}
 
 export const getActiveSalesUnitsForAutoMapping = (
   database: Pick<DatabaseShape, "canonicalSalesUnits">,
   storeId: string,
 ): CanonicalSalesUnit[] =>
   database.canonicalSalesUnits.filter(
-    (item) => item.storeId === storeId && item.isActive && !item.isGroup && (item.normalizedMatchAliases ?? []).length > 0,
+    (item) =>
+      item.storeId === storeId &&
+      item.isActive &&
+      !item.isGroup &&
+      !item.isStoreLevel &&
+      (!item.parentSalesUnitId ||
+        database.canonicalSalesUnits.some(
+          (parent) =>
+            parent.id === item.parentSalesUnitId &&
+            parent.storeId === storeId &&
+            parent.isActive,
+        )) &&
+      (item.normalizedMatchAliases ?? []).length > 0,
   );
 
 // 광고는 그룹에 귀속된다. 부모와 자식의 키워드가 함께 일치해도
@@ -107,7 +105,9 @@ export const getActiveSalesUnitsForCampaignMapping = (
   database: Pick<DatabaseShape, "canonicalSalesUnits">,
   storeId: string,
 ): CanonicalSalesUnit[] => {
-  const activeUnits = database.canonicalSalesUnits.filter((unit) => unit.storeId === storeId && unit.isActive);
+  const activeUnits = database.canonicalSalesUnits.filter(
+    (unit) => unit.storeId === storeId && unit.isActive,
+  );
   const unitsById = new Map(activeUnits.map((unit) => [unit.id, unit]));
   const targets = new Map<string, CanonicalSalesUnit>();
   for (const unit of activeUnits) {
@@ -116,10 +116,12 @@ export const getActiveSalesUnitsForCampaignMapping = (
     const existing = targets.get(target.id);
     targets.set(target.id, {
       ...target,
-      normalizedMatchAliases: Array.from(new Set([
-        ...(existing?.normalizedMatchAliases ?? []),
-        ...unit.normalizedMatchAliases,
-      ])),
+      normalizedMatchAliases: Array.from(
+        new Set([
+          ...(existing?.normalizedMatchAliases ?? []),
+          ...unit.normalizedMatchAliases,
+        ]),
+      ),
     });
   }
   return Array.from(targets.values());
@@ -133,73 +135,127 @@ export const getActiveSalesUnitsForIdMapping = (
     (item) =>
       item.storeId === storeId &&
       item.isActive &&
-      ((item.linkedOptionCodes ?? []).length > 0 || (item.linkedProductIds ?? []).length > 0 || (item.linkedManageCodes ?? []).length > 0),
+      !item.isGroup &&
+      !item.isStoreLevel &&
+      (!item.parentSalesUnitId ||
+        database.canonicalSalesUnits.some(
+          (parent) =>
+            parent.id === item.parentSalesUnitId &&
+            parent.storeId === storeId &&
+            parent.isActive,
+        )) &&
+      ((item.linkedOptionCodes ?? []).length > 0 ||
+        (item.linkedProductIds ?? []).length > 0 ||
+        (item.linkedManageCodes ?? []).length > 0),
   );
 
 export const resolveOrderSignatureAutoMapping = (
   salesUnits: CanonicalSalesUnit[],
   signature: OrderSourceSignature,
-): AutoMatchResolution => resolveAliasMatches(salesUnits, buildOrderLookupValues(signature));
+): AutoMatchResolution => {
+  const option = coalesceNonBlankText(
+    signature.rawOptionInfoSnapshot,
+    signature.normalizedOptionInfo,
+  ) ?? "";
+  const product = /\[함께배송/.test(option)
+    ? ""
+    : signature.normalizedProductName;
+  const matched = salesUnits.filter((unit) =>
+    (unit.normalizedMatchAliases ?? []).some((alias) =>
+      matchesOrderAlias(unit, alias, product, option),
+    ),
+  );
+  return {
+    canonicalSalesUnitId: matched.length === 1 ? matched[0].id : null,
+    candidateCount: matched.length,
+    ambiguous: matched.length > 1,
+  };
+};
 
 export const resolveCampaignAutoMapping = (
   salesUnits: CanonicalSalesUnit[],
   normalizedCampaignName: string,
-): AutoMatchResolution => resolveAliasMatches(salesUnits, buildCampaignLookupValues(normalizedCampaignName));
+): AutoMatchResolution =>
+  resolveAliasMatches(
+    salesUnits,
+    buildCampaignLookupValues(normalizedCampaignName),
+  );
+
+type IdMappingMaps = Record<
+  "optionManageCode" | "optionCode" | "productId",
+  Map<string, Set<string>>
+>;
+
+const buildIdMappingMaps = (
+  salesUnits: CanonicalSalesUnit[],
+): IdMappingMaps => {
+  const maps: IdMappingMaps = {
+    optionManageCode: new Map(),
+    optionCode: new Map(),
+    productId: new Map(),
+  };
+  for (const unit of salesUnits) {
+    if (!unit.isActive || unit.isGroup || unit.isStoreLevel) continue;
+    for (const [kind, values] of [
+      ["optionManageCode", unit.linkedManageCodes],
+      ["optionCode", unit.linkedOptionCodes],
+      ["productId", unit.linkedProductIds],
+    ] as const) {
+      for (const value of values ?? []) {
+        const key = value.trim();
+        if (!key) continue;
+        const ids = maps[kind].get(key) ?? new Set<string>();
+        ids.add(unit.id);
+        maps[kind].set(key, ids);
+      }
+    }
+  }
+  return maps;
+};
+
+const resolveWithIdMaps = (
+  maps: IdMappingMaps,
+  item: OrderItem,
+  bundled: boolean,
+  group: OrderGroupMatch | null,
+): ItemIdMappingResult => {
+  const keys = [
+    ["optionManageCode", item.optionManageCode],
+    ["optionCode", item.optionCode],
+    ["productId", bundled ? null : item.externalProductId],
+  ] as const;
+  for (const [kind, key] of keys) {
+    const candidates = key ? maps[kind].get(key.trim()) : undefined;
+    if (!candidates?.size) continue;
+    let ids = [...candidates];
+    if (group) {
+      ids = ids.filter((id) => group.familyUnitIds.has(id));
+      // A listing ID may name the main product while the selected option names another family.
+      if (!ids.length && kind === "productId") continue;
+      if (!ids.length)
+        return { resolvedUnitId: null, resolvedBy: kind, ambiguous: true };
+      if (kind === "productId" || ids.length > 1)
+        ids = ids.filter((id) => group.candidateIds.has(id));
+    }
+    if (ids.length === 1) return { resolvedUnitId: ids[0], resolvedBy: kind };
+    return { resolvedUnitId: null, resolvedBy: kind, ambiguous: true };
+  }
+  return { resolvedUnitId: null, resolvedBy: null };
+};
 
 export const resolveOrderItemByIds = (
   salesUnits: CanonicalSalesUnit[],
   item: OrderItem,
   optionManageCode?: string,
-): ItemIdMappingResult => {
-  // 1순위: optionManageCode → linkedManageCodes (함께배송 관리코드)
-  if (optionManageCode) {
-    const resolvedByManageCode = resolveByOptionManageCode(salesUnits, optionManageCode);
-    if (resolvedByManageCode) {
-      return {
-        resolvedUnitId: resolvedByManageCode,
-        resolvedBy: "optionManageCode",
-      };
-    }
-  }
-
-  // 2순위: optionCode → linkedOptionCodes (함께배송 옵션코드 폴백)
-  const resolvedByOptionCode = resolveByOptionCode(salesUnits, item.optionCode);
-  if (resolvedByOptionCode) {
-    return {
-      resolvedUnitId: resolvedByOptionCode,
-      resolvedBy: "optionCode",
-    };
-  }
-
-  // 3순위: externalProductId → linkedProductIds (일반 상품)
-  const resolvedByProductId = resolveByProductId(salesUnits, item.externalProductId);
-  if (resolvedByProductId) {
-    return {
-      resolvedUnitId: resolvedByProductId,
-      resolvedBy: "productId",
-    };
-  }
-
-  // 4순위: fallback (텍스트 매칭은 시그니처 기반으로 진행, 여기서는 null 반환)
-  return {
-    resolvedUnitId: null,
-    resolvedBy: null,
-  };
-};
-
-const buildIdMappingMaps = (salesUnits: CanonicalSalesUnit[]) => {
-  const manageCodeMap = new Map<string, string>();
-  const optionCodeMap = new Map<string, string>();
-  const productIdMap = new Map<string, string>();
-
-  salesUnits.forEach((unit) => {
-    (unit.linkedManageCodes ?? []).forEach((code) => manageCodeMap.set(code, unit.id));
-    (unit.linkedOptionCodes ?? []).forEach((code) => optionCodeMap.set(code, unit.id));
-    (unit.linkedProductIds ?? []).forEach((id) => productIdMap.set(id, unit.id));
-  });
-
-  return { manageCodeMap, optionCodeMap, productIdMap };
-};
+): ItemIdMappingResult =>
+  resolveWithIdMaps(
+    buildIdMappingMaps(
+      salesUnits.filter((unit) => unit.storeId === item.storeId),
+    ),
+    { ...item, optionManageCode: optionManageCode ?? item.optionManageCode },
+    /\[함께배송/.test(item.rawOptionInfo ?? ""),
+    null,
+  );
 
 const recalculateOrderMappings = (
   database: DatabaseShape,
@@ -209,190 +265,254 @@ const recalculateOrderMappings = (
     orderItemIds?: Set<string> | string[] | null;
   },
 ): void => {
-  const autoMatchSalesUnits = getActiveSalesUnitsForAutoMapping(database, storeId);
-  const idMappingSalesUnits = getActiveSalesUnitsForIdMapping(database, storeId);
+  const autoMatchSalesUnits = getActiveSalesUnitsForAutoMapping(
+    database,
+    storeId,
+  );
+  const groupContext = createOrderGroupContext(database, storeId);
+  const idMaps = buildIdMappingMaps(
+    getActiveSalesUnitsForIdMapping(database, storeId),
+  );
   const targetSignatureIds = options?.signatureIds
     ? new Set(Array.from(options.signatureIds).filter(Boolean))
     : null;
   const targetOrderItemIds = options?.orderItemIds
     ? new Set(Array.from(options.orderItemIds).filter(Boolean))
     : null;
-
-  database.orderSourceSignatures
-    .filter((item) => item.storeId === storeId && (!targetSignatureIds || targetSignatureIds.has(item.id)))
-    .forEach((signature) => {
-      if (!signature.confirmedAt) {
-        const resolution = resolveOrderSignatureAutoMapping(autoMatchSalesUnits, signature);
-        const nextMappingStatus = resolution.ambiguous
-          ? "CONFLICT"
-          : resolution.canonicalSalesUnitId
-            ? "MAPPED"
-            : "UNMAPPED";
-        if (
-          signature.canonicalSalesUnitId !== resolution.canonicalSalesUnitId ||
-          signature.mappingStatus !== nextMappingStatus
-        ) {
-          signature.canonicalSalesUnitId = resolution.canonicalSalesUnitId;
-          signature.mappingStatus = nextMappingStatus;
-          signature.lastAutoMappedAt = nowIso();
-          signature.updatedAt = nowIso();
-        }
-      } else {
-        const nextMappingStatus = getSignatureMappingStatus(signature);
-        if (signature.mappingStatus !== nextMappingStatus) {
-          signature.mappingStatus = nextMappingStatus;
-          signature.updatedAt = nowIso();
-        }
-      }
-    });
-
-  const signaturesById = new Map<string, OrderSourceSignature>(
+  const signaturesById = new Map(
     database.orderSourceSignatures
-      .filter((item) => item.storeId === storeId)
+      .filter((signature) => signature.storeId === storeId)
       .map((signature) => [signature.id, signature]),
   );
-
   const salesUnitsById = new Map(
-    database.canonicalSalesUnits.filter((item) => item.storeId === storeId).map((item) => [item.id, item]),
+    database.canonicalSalesUnits
+      .filter((unit) => unit.storeId === storeId)
+      .map((unit) => [unit.id, unit]),
   );
-
-  const { manageCodeMap, optionCodeMap, productIdMap } = buildIdMappingMaps(idMappingSalesUnits);
-
-  // ──────────────────────────────────────────────
-  // Phase 2: 주문 아이템 ID 기반 매핑
-  // ──────────────────────────────────────────────
-
-  database.orderItems
-    .filter((item) => item.storeId === storeId && (!targetOrderItemIds || targetOrderItemIds.has(item.id)))
-    .forEach((item) => {
-      const signature = item.orderSourceSignatureId ? signaturesById.get(item.orderSourceSignatureId) : null;
-      const signatureHasConfirmedMapping = signature?.confirmedAt !== undefined && signature?.confirmedAt !== null;
-
-      let resolvedUnitId: string | null = null;
-      let mappingMethod: string | null = null;
-
-      // 우선순위 1: confirmedAt 있는 매핑은 항상 존중
-      if (signatureHasConfirmedMapping && signature?.canonicalSalesUnitId) {
-        resolvedUnitId = signature.canonicalSalesUnitId;
-        mappingMethod = "signature-confirmed";
-      } else {
-        const rawOptionInfo = coalesceNonBlankText(signature?.rawOptionInfoSnapshot, item.rawOptionInfo);
-        // 함께배송 아이템인지 판별 (signature snapshot 우선, legacy item fallback)
-        const isBundledItem = rawOptionInfo?.includes("[함께배송") ?? false;
-
-        // 우선순위 2: ID 매핑 시도 (optionManageCode → linkedManageCodes)
-        if (isBundledItem && item.optionManageCode) {
-          const resolvedId = manageCodeMap.get(item.optionManageCode);
-          if (resolvedId) {
-            resolvedUnitId = resolvedId;
-            mappingMethod = "optionManageCode";
-          }
-        }
-
-        // 우선순위 3: ID 매핑 시도 (optionCode → linkedOptionCodes)
-        if (!resolvedUnitId && item.optionCode) {
-          const resolvedId = optionCodeMap.get(item.optionCode);
-          if (resolvedId) {
-            resolvedUnitId = resolvedId;
-            mappingMethod = "optionCode";
-          }
-        }
-
-        // 우선순위 4: ID 매핑 시도 (externalProductId → linkedProductIds)
-        // ⚠️ 함께배송 아이템은 메인 상품과 같은 externalProductId를 공유하므로
-        //    productId fallback을 사용하면 메인 상품에 잘못 매핑됨 → 함께배송은 건너뜀
-        if (!resolvedUnitId && item.externalProductId && !isBundledItem) {
-          const resolvedId = productIdMap.get(item.externalProductId);
-          if (resolvedId) {
-            resolvedUnitId = resolvedId;
-            mappingMethod = "productId";
-          }
-        }
-
-        // 우선순위 5: 기존 시그니처 기반 텍스트 매칭 (fallback)
-        if (!resolvedUnitId && signature) {
-          const signatureStatus = getSignatureMappingStatus(signature);
-          if (signatureStatus === "MAPPED" && signature.canonicalSalesUnitId) {
-            const sigUnit = salesUnitsById.get(signature.canonicalSalesUnitId);
-            if (sigUnit?.isActive) {
-              resolvedUnitId = signature.canonicalSalesUnitId;
-              mappingMethod = "text-fallback";
-            }
-          }
-        }
-      }
-
-      // 매핑 방식 디버그 로그 (debug 레벨)
-      if (mappingMethod) {
-        console.debug(`[AutoMapper] Item ${item.externalProductOrderId}: resolved via ${mappingMethod}`);
-      }
-
-      // 비활성화 판매단위 검사 및 할당 가능 여부 확인
-      let finalUnitId: string | null = null;
-      if (resolvedUnitId) {
-        const candidate = salesUnitsById.get(resolvedUnitId);
-        if (candidate && isSalesUnitAssignable(candidate.deactivatedAt, item.paymentDate)) {
-          finalUnitId = resolvedUnitId;
-        }
-      }
-
-      // 변경사항이 있으면 업데이트
-      if (item.canonicalSalesUnitId !== finalUnitId) {
-        item.canonicalSalesUnitId = finalUnitId;
-        item.updatedAt = nowIso();
-      }
-
-    });
-
-  // ──────────────────────────────────────────────
-  // Phase 3: 시그니처 역추론 — 아이템 ID 매핑 결과로 시그니처 자동 매핑
-  //          같은 시그니처에 속한 아이템들이 모두 동일한 salesUnit이면 시그니처도 매핑
-  // ──────────────────────────────────────────────
-  const inferenceSignatureIds = targetSignatureIds ?? new Set(signaturesById.keys());
-  const signatureItemMappings = new Map<string, Set<string>>();
-  database.orderItems
-    .filter(
-      (item) =>
-        item.storeId === storeId &&
-        item.orderSourceSignatureId &&
-        inferenceSignatureIds.has(item.orderSourceSignatureId) &&
-        item.canonicalSalesUnitId,
+  const groupsBySignature = new Map<string, OrderGroupMatch | null>();
+  const ambiguousSignatures = new Set<string>();
+  const blockedItems = new Set<string>();
+  const blockedSignatures = new Set<string>();
+  const idResolvedSignatures = new Set<string>();
+  const touchedItems = database.orderItems.filter(
+    (item) =>
+      item.storeId === storeId &&
+      (!targetOrderItemIds || targetOrderItemIds.has(item.id)),
+  );
+  const timestamp = nowIso();
+  const setSignature = (
+    signature: OrderSourceSignature,
+    unitId: string | null,
+    status: "MAPPED" | "UNMAPPED" | "CONFLICT",
+  ) => {
+    if (
+      signature.canonicalSalesUnitId === unitId &&
+      signature.mappingStatus === status
     )
-    .forEach((item) => {
-      const signatureId = item.orderSourceSignatureId!;
-      const unitIds = signatureItemMappings.get(signatureId) ?? new Set<string>();
-      unitIds.add(item.canonicalSalesUnitId!);
-      signatureItemMappings.set(signatureId, unitIds);
-    });
+      return;
+    signature.canonicalSalesUnitId = unitId;
+    signature.mappingStatus = status;
+    signature.lastAutoMappedAt = timestamp;
+    signature.updatedAt = timestamp;
+  };
+  const assignable = (unitId: string, item: OrderItem): boolean => {
+    const unit = salesUnitsById.get(unitId);
+    if (
+      !unit ||
+      unit.isGroup ||
+      unit.isStoreLevel ||
+      (!unit.isActive && !unit.deactivatedAt) ||
+      !isSalesUnitAssignable(unit.deactivatedAt, item.paymentDate)
+    )
+      return false;
+    const parent = unit.parentSalesUnitId
+      ? salesUnitsById.get(unit.parentSalesUnitId)
+      : null;
+    return (
+      !unit.parentSalesUnitId ||
+      (!!parent &&
+        (parent.isActive || !!parent.deactivatedAt) &&
+        isSalesUnitAssignable(parent.deactivatedAt, item.paymentDate))
+    );
+  };
+  const setItem = (item: OrderItem, unitId: string | null) => {
+    const target = unitId && assignable(unitId, item) ? unitId : null;
+    if (item.canonicalSalesUnitId !== target) {
+      item.canonicalSalesUnitId = target;
+      item.updatedAt = timestamp;
+    }
+  };
 
-  signatureItemMappings.forEach((unitIds, signatureId) => {
-    const signature = signaturesById.get(signatureId);
-    if (!signature || signature.confirmedAt) return; // 수동 확인된 건 건드리지 않음
-
-    if (unitIds.size === 1) {
-      // 모든 아이템이 같은 salesUnit으로 매핑됨 → 시그니처도 매핑
-      const resolvedUnitId = Array.from(unitIds)[0];
-      if (signature.canonicalSalesUnitId !== resolvedUnitId || signature.mappingStatus !== "MAPPED") {
-        signature.canonicalSalesUnitId = resolvedUnitId;
-        signature.mappingStatus = "MAPPED";
-        signature.lastAutoMappedAt = nowIso();
-        signature.updatedAt = nowIso();
-        console.log(`[AutoMapper] Signature ${signatureId}: inferred from item ID mapping → ${resolvedUnitId}`);
-      }
-    } else if (unitIds.size > 1) {
-      // 아이템들이 서로 다른 salesUnit으로 매핑됨 → CONFLICT
-      if (signature.mappingStatus !== "CONFLICT") {
-        signature.canonicalSalesUnitId = null;
-        signature.mappingStatus = "CONFLICT";
-        signature.lastAutoMappedAt = nowIso();
-        signature.updatedAt = nowIso();
-        console.log(`[AutoMapper] Signature ${signatureId}: item ID mapping conflict (${unitIds.size} different units)`);
+  for (const signature of signaturesById.values()) {
+    if (targetSignatureIds && !targetSignatureIds.has(signature.id)) continue;
+    if (signature.confirmedAt && signature.canonicalSalesUnitId) continue;
+    if (signature.confirmedAt && !signature.canonicalSalesUnitId)
+      signature.confirmedAt = null;
+    let group = matchOrderGroup(groupContext, signature);
+    let resolution = resolveOrderSignatureAutoMapping(
+      autoMatchSalesUnits,
+      signature,
+    );
+    if (group) {
+      const option =
+        coalesceNonBlankText(
+          signature.rawOptionInfoSnapshot,
+          signature.normalizedOptionInfo,
+        ) ?? "";
+      const scopedDirect =
+        group.matchSource === "option" && group.optionOverridesProduct
+          ? resolveOrderSignatureAutoMapping(autoMatchSalesUnits, {
+              ...signature,
+              normalizedProductName: "",
+              normalizedOptionInfo: option,
+              sourceSignature: option,
+            })
+          : resolution;
+      // A configured leaf keyword is a direct rule. Broad family keywords must not steal it.
+      if (
+        scopedDirect.canonicalSalesUnitId &&
+        !group.familyUnitIds.has(scopedDirect.canonicalSalesUnitId)
+      ) {
+        resolution = scopedDirect;
+        group = null;
       }
     }
-  });
+    groupsBySignature.set(signature.id, group);
+    if (group) {
+      const candidate =
+        group.candidateIds.size === 1 && group.groupIds.size === 1
+          ? [...group.candidateIds][0]
+          : null;
+      const target = candidate ? salesUnitsById.get(candidate) : null;
+      resolution = {
+        canonicalSalesUnitId: target?.isActive ? target.id : null,
+        candidateCount: group.candidateIds.size,
+        ambiguous: group.groupIds.size > 1 || group.candidateIds.size > 1,
+      };
+    }
+    if (resolution.ambiguous) ambiguousSignatures.add(signature.id);
+    setSignature(
+      signature,
+      resolution.canonicalSalesUnitId,
+      resolution.ambiguous
+        ? "CONFLICT"
+        : resolution.canonicalSalesUnitId
+          ? "MAPPED"
+          : "UNMAPPED",
+    );
+  }
+
+  for (const item of touchedItems) {
+    const signature = item.orderSourceSignatureId
+      ? signaturesById.get(item.orderSourceSignatureId)
+      : undefined;
+    if (signature?.confirmedAt && signature.canonicalSalesUnitId) {
+      setItem(item, signature.canonicalSalesUnitId);
+      continue;
+    }
+    const option = coalesceNonBlankText(
+      signature?.rawOptionInfoSnapshot,
+      item.rawOptionInfo,
+    );
+    const group = signature
+      ? groupsBySignature.has(signature.id)
+        ? groupsBySignature.get(signature.id)!
+        : matchOrderGroup(groupContext, signature)
+      : null;
+    const ids = resolveWithIdMaps(
+      idMaps,
+      item,
+      /\[함께배송/.test(option ?? ""),
+      group,
+    );
+    if (ids.ambiguous) {
+      blockedItems.add(item.id);
+      if (signature) blockedSignatures.add(signature.id);
+      setItem(item, null);
+      continue;
+    }
+    if (ids.resolvedUnitId && signature) idResolvedSignatures.add(signature.id);
+    let target = ids.resolvedUnitId;
+    if (
+      !target &&
+      signature &&
+      getSignatureMappingStatus(signature) === "MAPPED"
+    ) {
+      const unit = signature.canonicalSalesUnitId
+        ? salesUnitsById.get(signature.canonicalSalesUnitId)
+        : null;
+      if (unit?.isActive) target = unit.id;
+    }
+    setItem(item, target);
+  }
+
+  // Apply a consistently inferred leaf target back to unresolved touched rows in the same commit.
+  const inferenceSignatureIds =
+    targetSignatureIds ?? new Set(signaturesById.keys());
+  const signatureItemMappings = new Map<string, Set<string>>();
+  for (const item of database.orderItems) {
+    const signatureId = item.orderSourceSignatureId;
+    if (
+      item.storeId !== storeId ||
+      !signatureId ||
+      !inferenceSignatureIds.has(signatureId) ||
+      !item.canonicalSalesUnitId ||
+      !assignable(item.canonicalSalesUnitId, item)
+    )
+      continue;
+    const ids = signatureItemMappings.get(signatureId) ?? new Set<string>();
+    ids.add(item.canonicalSalesUnitId);
+    signatureItemMappings.set(signatureId, ids);
+  }
+  for (const [signatureId, unitIds] of signatureItemMappings) {
+    const signature = signaturesById.get(signatureId);
+    if (
+      !signature ||
+      signature.confirmedAt ||
+      blockedSignatures.has(signatureId)
+    )
+      continue;
+    if (unitIds.size > 1) setSignature(signature, null, "CONFLICT");
+    else {
+      const inferredId = [...unitIds][0];
+      const group = groupsBySignature.get(signatureId);
+      const explicitId = idResolvedSignatures.has(signatureId);
+      if (
+        (!ambiguousSignatures.has(signatureId) || explicitId) &&
+        (!group || group.candidateIds.has(inferredId) || explicitId)
+      ) {
+        setSignature(signature, inferredId, "MAPPED");
+      }
+    }
+  }
+  for (const signatureId of blockedSignatures) {
+    const signature = signaturesById.get(signatureId);
+    if (signature && !signature.confirmedAt)
+      setSignature(signature, null, "CONFLICT");
+  }
+  for (const item of touchedItems) {
+    if (
+      item.canonicalSalesUnitId ||
+      blockedItems.has(item.id) ||
+      !item.orderSourceSignatureId
+    )
+      continue;
+    const signature = signaturesById.get(item.orderSourceSignatureId);
+    if (
+      !signature ||
+      signature.confirmedAt ||
+      signature.mappingStatus !== "MAPPED" ||
+      !signature.canonicalSalesUnitId
+    )
+      continue;
+    setItem(item, signature.canonicalSalesUnitId);
+  }
 };
 
-export const recalculateOrderMappingsForStore = (database: DatabaseShape, storeId: string): void => {
+export const recalculateOrderMappingsForStore = (
+  database: DatabaseShape,
+  storeId: string,
+): void => {
   recalculateOrderMappings(database, storeId);
 };
 

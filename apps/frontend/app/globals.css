@@ -147,6 +147,30 @@ textarea {
   transform: translateY(-1px);
 }
 
+:is(.sales-units-workspace, .mappings-workspace) .input-shell {
+  border-radius: 0.375rem;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+:is(.sales-units-workspace, .mappings-workspace) .button-shell {
+  gap: 0.3rem;
+  border-radius: 0.375rem;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.8125rem;
+  line-height: 1.125rem;
+}
+
+.mappings-workspace select.input-shell.w-auto {
+  width: auto;
+}
+
+.mappings-workspace details th,
+.mappings-workspace details td {
+  padding: 0.4rem 0.55rem;
+}
+
 button:disabled,
 input:disabled,
 select:disabled,

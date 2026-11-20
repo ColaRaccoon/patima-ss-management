@@ -1,6 +1,7 @@
 import { cn } from "@/lib/cn";
 
 interface PanelProps {
+  id?: string;
   title: string;
   description?: string;
   aside?: React.ReactNode;
@@ -9,6 +10,7 @@ interface PanelProps {
 }
 
 export function Panel({
+  id,
   title,
   description,
   aside,
@@ -16,7 +18,7 @@ export function Panel({
   className,
 }: PanelProps) {
   return (
-    <section className={cn("glass-panel rounded-[30px] p-5 sm:p-6", className)}>
+    <section id={id} className={cn("glass-panel rounded-[30px] p-5 sm:p-6", className)}>
       <div className="mb-5 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <h2 className="text-xl font-semibold tracking-tight text-ink">{title}</h2>

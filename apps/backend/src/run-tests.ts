@@ -1,3 +1,4 @@
+import { runCampaignMappingBatchTests } from "./campaign-mapping-batch-tests";
 import assert from "node:assert/strict";
 import { mock } from "node:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
@@ -62,10 +63,15 @@ import { OperationWorkerService } from "./operation-worker.service";
 import { ProfitService } from "./profit.service";
 import { ProfitSummaryService, PROFIT_CALCULATION_VERSION } from "./profit-summary.service";
 import { runProfitRegressionTests } from "./profit-regression-tests";
+import { runProductStatusTests } from "./product-status-tests";
 import { runStartupRegressionTests } from "./startup-regression-tests";
 import { runAdUploadPersistenceTests } from "./ad-upload-persistence-tests";
 import { runAdMappingPerformanceTests } from "./ad-mapping-performance-tests";
 import { runAdUploadRegressionTests } from "./ad-upload-regression-tests";
+import { runOrderGroupMappingTests } from "./order-group-mapping-tests";
+import { runOrderSyncNameRegressionTests } from "./order-sync-name-regression-tests";
+import { runOrderMappingIntegrationTests } from "./order-mapping-integration-tests";
+import { runProductRegistrationTests } from "./product-registration-tests";
 import {
   DEFAULT_ORDER_RAW_PAYLOAD_RETENTION_DAYS,
   getKstRetentionCutoffDate,
@@ -1794,6 +1800,8 @@ runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and r
     storeId: "store-1",
     dateFrom: "2026-04-01",
     dateTo: "2026-04-30",
+    mappingStatus: "UNRESOLVED",
+    excludeZeroCost: true,
     q: "Needle_%' OR true",
     page: 1,
     pageSize: 20,
@@ -1804,6 +1812,11 @@ runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and r
   assert.equal(result.items[0].latestRow?.sourceUploadId, "upload-1");
   assert.equal(result.items[0].totalCost, 120);
   assert.match(queries[0].text, /EXISTS \(/);
+  for (const query of queries) {
+    assert.match(query.text, /= ANY\(\$\d+::text\[\]\)/);
+    assert.match(query.text, /HAVING SUM\(COALESCE\(\(costs\.payload->>'totalCost'\)::numeric, 0\)\) <> 0/);
+    assert.ok(query.params.some((param) => JSON.stringify(param) === '["UNMAPPED","CONFLICT"]'));
+  }
   assert.match(queries[1].text, /LEFT JOIN LATERAL/);
   assert.match(queries[1].text, /WITH signature_page AS MATERIALIZED/);
   assert.ok(
@@ -1814,6 +1827,58 @@ runAsync("DatabaseService queryAdCampaignSignatures uses active upload SQL and r
   assert.equal(queries[0].params.some((param) => param === "%needle\\_\\%' or true%"), true);
   assert.equal(queries[1].params.at(-2), 20);
   assert.equal(queries[1].params.at(-1), 0);
+});
+
+runAsync("DatabaseService filters unresolved nonzero ad campaign signatures before pagination", async () => {
+  const database = createEmptyDatabase();
+  const reportDate = "2026-04-03";
+  const uploadId = "upload-active";
+  const adjustmentDate = "2026-04-04";
+  const adjustmentUploadId = "upload-adjustment";
+  database.adExcelUploads.push(createConfirmedUpload({ uploadId, reportDate }), createConfirmedUpload({
+    uploadId: adjustmentUploadId, reportDate: adjustmentDate,
+  }));
+  for (const { campaignId, target, reason, totalCost } of [
+    { campaignId: "unmapped", target: null, reason: "NO_RULE", totalCost: 100 },
+    { campaignId: "conflict", target: null, reason: "MULTIPLE_RULES", totalCost: 100 },
+    { campaignId: "mapped", target: "mapped-unit", reason: "RULE_MATCHED", totalCost: 100 },
+    { campaignId: "zero", target: null, reason: "NO_RULE", totalCost: 0 },
+    { campaignId: "offset", target: null, reason: "NO_RULE", totalCost: 100 },
+  ] as const) {
+    database.adCampaignSignatures.push(createAdCampaignSignature({
+      id: campaignId, campaignId, campaignName: campaignId, lastSeenDate: reportDate,
+      canonicalSalesUnitId: target, mappingReason: reason,
+    }));
+    database.adCampaignDailyCosts.push(Object.assign(
+      createConfirmedUploadRow({ uploadId, reportDate, campaignId, campaignName: campaignId, canonicalSalesUnitId: target, totalCost }),
+      { adCampaignSignatureId: campaignId },
+    ) as never);
+  }
+  database.adCampaignDailyCosts.push(Object.assign(
+    createConfirmedUploadRow({
+      uploadId: adjustmentUploadId, reportDate: adjustmentDate, campaignId: "offset",
+      campaignName: "offset", canonicalSalesUnitId: null, totalCost: -100,
+    }),
+    { adCampaignSignatureId: "offset" },
+  ) as never);
+  const service = Object.assign(Object.create(DatabaseService.prototype), {
+    storageMode: "file", database,
+  }) as DatabaseService;
+  const results = await Promise.all([1, 2].map((page) => service.queryAdCampaignSignatures({
+    storeId: "store-1", mappingStatus: "UNRESOLVED", excludeZeroCost: true, page, pageSize: 1,
+  })));
+  assert.deepEqual(results.map((result) => result.totalCount), [2, 2]);
+  assert.deepEqual(new Set(results.flatMap((result) => result.items.map(({ signature }) => signature.id))), new Set(["unmapped", "conflict"]));
+  const includeZero = await service.queryAdCampaignSignatures({
+    storeId: "store-1", mappingStatus: "UNRESOLVED", excludeZeroCost: false,
+  });
+  assert.equal(includeZero.totalCount, 4);
+  assert.deepEqual(includeZero.items.filter((item) => item.totalCost === 0).map((item) => item.signature.id).sort(), ["offset", "zero"]);
+  const beforeAdjustment = await service.queryAdCampaignSignatures({
+    storeId: "store-1", mappingStatus: "UNRESOLVED", excludeZeroCost: true, dateTo: reportDate,
+  });
+  assert.equal(beforeAdjustment.totalCount, 3);
+  assert.equal(beforeAdjustment.items.find((item) => item.signature.id === "offset")?.totalCost, 100);
 });
 
 runAsync("DatabaseService queryAdCampaignSignatures keeps repaired Hangul search compatible", async () => {
@@ -3807,6 +3872,7 @@ runAsync("OrderSyncService listOrderSourceSignatures searches canonical sales un
         mappingStatus: "MAPPED",
       }) as never,
       createOrderSourceSignature("sig-other", "Other Product"),
+      Object.assign(createOrderSourceSignature("sig-conflict", "Conflicting Product"), { mappingStatus: "CONFLICT" as const }),
     );
   });
 
@@ -3818,6 +3884,11 @@ runAsync("OrderSyncService listOrderSourceSignatures searches canonical sales un
   assert.equal(result.data.totalCount, 1);
   assert.equal(result.data.items[0].id, "sig-needle");
   assert.equal(result.data.items[0].canonicalDisplayName, "Needle Unit");
+  const unresolved = await Promise.all([1, 2].map((page) => orderSyncService.listOrderSourceSignatures({
+    storeId: "store-1", mappingStatus: "UNRESOLVED", page, pageSize: 1,
+  })));
+  assert.deepEqual(unresolved.map((result) => result.data.totalCount), [2, 2]);
+  assert.deepEqual(new Set(unresolved.flatMap((result) => result.data.items.map((row) => row.id))), new Set(["sig-other", "sig-conflict"]));
 });
 
 run("evaluateAdMapping falls back to alias matching without a campaign rule", () => {
@@ -4437,6 +4508,19 @@ runAsync("DatabaseService PostgreSQL saves order manual mappings with row-level 
   assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-3")?.canonicalSalesUnitId, "sales-1");
   assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-other")?.canonicalSalesUnitId, null);
   assert.equal(service.database.orderItems.find((item: OrderItem) => item.id === "item-store-2")?.canonicalSalesUnitId, null);
+
+  queries.length = 0;
+  await assert.rejects(service.saveOrderManualMappingsCommitted({
+    storeId: "store-1",
+    signatureIds: ["sig-other", "sig-1"],
+    canonicalSalesUnitId: "different-sales-unit",
+    timestamp: "2026-06-04T01:00:00.000Z",
+    requireUnmapped: true,
+  }), /다른 판매 구성에 연결/);
+  assert.ok(queries.some((query) => query.text === "ROLLBACK"));
+  assert.ok(!queries.some((query) => /^UPDATE order_(source_signatures|items)/.test(query.text.trim())));
+  assert.equal(service.database.orderSourceSignatures.find((item: OrderSourceSignature) => item.id === "sig-other")?.canonicalSalesUnitId, null);
+  assert.equal(service.lastPersistenceError, null);
 });
 
 runAsync("DatabaseService PostgreSQL saves ad campaign mappings with row-level direct updates", async () => {
@@ -4600,6 +4684,22 @@ runAsync("DatabaseService PostgreSQL saves ad campaign mappings with row-level d
       ?.canonicalSalesUnitId,
     null,
   );
+
+  queries.length = 0;
+  await assert.rejects(service.saveAdCampaignMappingsCommitted({
+    storeId: "store-1",
+    targetIds: [untouchedRow.id, rowWithoutSignature.id],
+    action: {
+      type: "MANUAL_MAPPED",
+      canonicalSalesUnitId: "different-sales-unit",
+      timestamp: "2026-06-04T01:00:00.000Z",
+      requireUnmapped: true,
+    },
+  }), /연결 상태가 바뀐 캠페인/);
+  assert.ok(queries.some((query) => query.text === "ROLLBACK"));
+  assert.ok(!queries.some((query) => /^(INSERT INTO ad_campaign_signatures|UPDATE ad_campaign_daily_costs)/.test(query.text.trim())));
+  assert.equal(service.database.adCampaignDailyCosts.find((item: AdCampaignDailyCost) => item.id === untouchedRow.id)?.canonicalSalesUnitId, null);
+  assert.equal(service.lastPersistenceError, null);
 });
 
 runAsync("DatabaseService PostgreSQL locks materialized ad signature for row-id mapping targets", async () => {
@@ -7326,10 +7426,17 @@ run("getSignatureIndex cache invalidates on database reference change", () => {
 
 runAsync("Naver API schema, pagination, timeout and retry reliability", runNaverReliabilityTests);
 runAsync("Profit calculation regressions", runProfitRegressionTests);
+runAsync("Product status and cost coverage", runProductStatusTests);
 runAsync("Application startup regressions", runStartupRegressionTests);
 run("Ad mapping batch performance regressions", runAdMappingPerformanceTests);
 runAsync("Ad upload committed persistence regressions", runAdUploadPersistenceTests);
 runAsync("Ad batch upload regressions", runAdUploadRegressionTests);
+run("Order group mapping regressions", runOrderGroupMappingTests);
+runAsync("Order sync name regressions", runOrderSyncNameRegressionTests);
+runAsync("Order mapping persistence and HTTP integration", runOrderMappingIntegrationTests);
+runAsync("Product registration atomicity and safe retries", runProductRegistrationTests);
+
+runAsync("Campaign mapping batch atomicity and scoped persistence", runCampaignMappingBatchTests);
 
 void Promise.all(pendingAsyncTests).then(() => {
   console.log("All backend checks passed.");

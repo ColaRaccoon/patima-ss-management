@@ -18,6 +18,7 @@ import {
 } from "@nestjs/common";
 import { FileInterceptor, FilesInterceptor } from "@nestjs/platform-express";
 import type { Response } from "express";
+import type { MappingStatusFilter } from "@patima/shared";
 import { AdsService } from "./ads.service";
 import { CampaignMappingService } from "./campaign-mapping.service";
 import { CostService } from "./cost.service";
@@ -326,7 +327,7 @@ export class AppController {
   async getOrderSourceSignatures(
     @Query("storeId") storeId: string,
     @Query("mappingStatus")
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
+    mappingStatus?: MappingStatusFilter,
     @Query("q") q?: string,
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
@@ -362,7 +363,7 @@ export class AppController {
   saveOrderMappings(
     @Body()
     body:
-      | { signatureIds: string[]; canonicalSalesUnitId: string }
+      | { signatureIds: string[]; canonicalSalesUnitId: string; requireUnmapped?: boolean }
       | {
           signatureIds: string[];
           displayName: string;
@@ -596,7 +597,7 @@ export class AppController {
 
   @Post("ad-campaign-costs/batch-mapping")
   saveAdCampaignMappings(
-    @Body() body: { adCostIds: string[]; canonicalSalesUnitId: string },
+    @Body() body: { adCostIds: string[]; canonicalSalesUnitId: string; requireUnmapped?: boolean },
   ) {
     return this.adsService.saveManualMappings(body.adCostIds, body);
   }
@@ -617,8 +618,9 @@ export class AppController {
     @Query("dateFrom") dateFrom?: string,
     @Query("dateTo") dateTo?: string,
     @Query("mappingStatus")
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT",
+    mappingStatus?: MappingStatusFilter,
     @Query("q") q?: string,
+    @Query("excludeZeroCost") excludeZeroCost?: string,
     @Query("page") page?: string,
     @Query("pageSize") pageSize?: string,
   ) {
@@ -628,6 +630,7 @@ export class AppController {
       dateTo,
       mappingStatus,
       q,
+      excludeZeroCost: excludeZeroCost === "true",
       page: page ? Number(page) : undefined,
       pageSize: pageSize ? Number(pageSize) : undefined,
     });
@@ -677,6 +680,16 @@ export class AppController {
     },
   ) {
     return this.campaignMappingService.create(body);
+  }
+
+  @Post("campaign-mappings/batch")
+  createCampaignMappingsBatch(
+    @Body() body: {
+      storeId: string;
+      rules: Array<{ canonicalSalesUnitId: string; campaignPattern: string }>;
+    },
+  ) {
+    return this.campaignMappingService.createBatch(body);
   }
 
   @Patch("campaign-mappings/:mappingId")
@@ -747,16 +760,30 @@ export class AppController {
     return this.costService.deactivate(costSettingId);
   }
 
+  @Post("sales-unit-cost-snapshots/preview")
+  @UseInterceptors(FileInterceptor("file"))
+  previewCostSnapshot(
+    @Body() body: { storeId: string; effectiveFrom: string },
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    return formatApiSuccess(this.costService.previewExcelSnapshot(
+      body.storeId,
+      body.effectiveFrom,
+      file,
+    ));
+  }
+
   @Post("sales-unit-cost-snapshots/import")
   @UseInterceptors(FileInterceptor("file"))
   async importCostSnapshot(
-    @Body() body: { storeId: string; effectiveFrom: string },
+    @Body() body: { storeId: string; effectiveFrom: string; previewToken?: string },
     @UploadedFile() file: Express.Multer.File,
   ) {
     const result = await this.costService.importExcelSnapshot(
       body.storeId,
       body.effectiveFrom,
       file,
+      body.previewToken,
     );
     return formatApiSuccess(result);
   }

@@ -41,15 +41,36 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
     const startedAt = Date.now();
     const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
     if (storeIds.length === 0) return;
+    const changedStoreIds: string[] = [];
     for (const storeId of storeIds) {
       // 먼저 스토어 레벨 판매단위 확인/생성 (write 외부에서 호출)
       await this.salesUnitService.ensureStoreLevelSalesUnit(storeId);
+
+      const snapshot = this.databaseService.getSnapshot();
+      const signatures = snapshot.adCampaignSignatures.filter((row) => row.storeId === storeId);
+      const rows = snapshot.adCampaignDailyCosts.filter((row) => row.storeId === storeId);
+      const probe = {
+        ...snapshot,
+        adCampaignSignatures: signatures.map((row) => ({ ...row })),
+        adCampaignDailyCosts: rows.map((row) => ({ ...row })),
+      };
+      recalculateAdCampaignSignaturesForStore(probe, storeId, { onlyUnconfirmed: true, applyToRows: true });
+      const mappingState = (value: unknown) => JSON.stringify(value, (key, item) =>
+        key === "updatedAt" || key === "lastAutoMappedAt" ? undefined : item,
+      );
+      if (
+        mappingState(signatures) === mappingState(probe.adCampaignSignatures) &&
+        mappingState(rows) === mappingState(probe.adCampaignDailyCosts)
+      ) continue;
+
+      changedStoreIds.push(storeId);
     }
-    // Restore all stores in one ad-only commit rather than resending the same
-    // history separately for every store. Profit summaries still follow commit.
-    await this.recalculateMappings(storeIds);
-    for (const storeId of storeIds) await this.recalculateProfitSummariesForAdDates(storeId);
-    console.log(`[Startup] Ad mapping and profit summaries restored for ${storeIds.length} stores (${Date.now() - startedAt} ms)`);
+    // Skip unchanged stores and restore changed stores in one ad-only commit.
+    // Profit summaries follow the successful commit.
+    if (changedStoreIds.length === 0) return;
+    await this.recalculateMappings(changedStoreIds);
+    for (const storeId of changedStoreIds) await this.recalculateProfitSummariesForAdDates(storeId);
+    console.log(`[Startup] Ad mapping and profit summaries restored for ${changedStoreIds.length} stores (${Date.now() - startedAt} ms)`);
   }
 
   list(storeId: string, page?: number, pageSize?: number) {
@@ -61,9 +82,76 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
   }
 
   async create(payload: { storeId: string; canonicalSalesUnitId: string; campaignPattern: string }) {
+    const result = await this.createBatch({ storeId: payload.storeId, rules: [payload] });
+    return formatApiSuccess({ ...result.data.mappings[0], operationId: result.data.operationId });
+  }
+
+  async createBatch(payload: {
+    storeId: string;
+    rules: Array<{ canonicalSalesUnitId: string; campaignPattern: string }>;
+  }) {
     this.storeService.ensureWritable(payload.storeId);
-    const snapshot = this.databaseService.getSnapshot();
-    let salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === payload.canonicalSalesUnitId);
+    if (!Array.isArray(payload.rules) || payload.rules.length === 0 || payload.rules.length > 100) {
+      throw new BadRequestException({
+        success: false,
+        message: "광고 규칙은 한 번에 1~100개까지 저장할 수 있습니다.",
+        errors: [{ field: "rules", reason: "INVALID_VALUE" }],
+      });
+    }
+    const validate = (snapshot: ReturnType<DatabaseService["getSnapshot"]>) => {
+      const seen = new Set<string>();
+      return payload.rules.map((rule) => this.validateNewRule(
+        snapshot, { ...rule, storeId: payload.storeId }, seen,
+      ));
+    };
+    validate(this.databaseService.getSnapshot());
+    const mappings = await this.databaseService.writeCommitted((draft) => {
+      // Recheck the queued snapshot before mutating anything: concurrent requests
+      // must not reactivate or overwrite a rule that has just become active.
+      const rules = validate(draft);
+      return rules.map((rule) => {
+        const inactive = draft.campaignMappings.find(
+          (item) => item.storeId === payload.storeId && item.normalizedCampaignPattern === rule.normalized,
+        );
+        if (inactive) {
+          inactive.isActive = true;
+          inactive.deactivatedAt = null;
+          inactive.canonicalSalesUnitId = rule.canonicalSalesUnitId;
+          inactive.campaignPattern = rule.campaignPattern;
+          inactive.updatedAt = nowIso();
+          return { ...inactive };
+        }
+        const mapping: CampaignSalesUnitMapping = {
+          id: createId(),
+          storeId: payload.storeId,
+          channel: "NAVER_DA",
+          canonicalSalesUnitId: rule.canonicalSalesUnitId,
+          campaignPattern: rule.campaignPattern,
+          normalizedCampaignPattern: rule.normalized,
+          isActive: true,
+          deactivatedAt: null,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        };
+        draft.campaignMappings.push(mapping);
+        return { ...mapping };
+      });
+    }, ["campaignMappings"]);
+    const operation = await this.operationService.enqueue(
+      payload.storeId,
+      "RECALCULATE_AD_MAPPING",
+      { storeId: payload.storeId, reason: "AD_MAPPING_CHANGED" },
+      () => this.recalculate(payload.storeId),
+    );
+    return formatApiSuccess({ mappings, operationId: operation.id });
+  }
+
+  private validateNewRule(
+    snapshot: ReturnType<DatabaseService["getSnapshot"]>,
+    payload: { storeId: string; canonicalSalesUnitId: string; campaignPattern: string },
+    seen: Set<string>,
+  ) {
+    const salesUnit = snapshot.canonicalSalesUnits.find((item) => item.id === payload.canonicalSalesUnitId);
     if (!salesUnit) {
       throw new NotFoundException({
         success: false,
@@ -73,8 +161,6 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
     }
     ensureNoCrossStoreReference(payload.storeId, salesUnit.storeId, "canonicalSalesUnitId");
 
-    // 자식 ID를 광고 매핑에 저장하려고 하면 차단 또는 자동으로 부모로 승격
-    let targetSalesUnitId = payload.canonicalSalesUnitId;
     if (salesUnit.parentSalesUnitId) {
       throw new BadRequestException({
         success: false,
@@ -82,7 +168,9 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
         errors: [{ field: "canonicalSalesUnitId", reason: "CANNOT_MAP_TO_GROUP_CHILD" }],
       });
     }
-    const normalized = normalizeCampaignPattern(payload.campaignPattern);
+    const normalized = typeof payload.campaignPattern === "string"
+      ? normalizeCampaignPattern(payload.campaignPattern)
+      : "";
     if (!normalized) {
       throw new BadRequestException({
         success: false,
@@ -101,7 +189,7 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
     const existing = snapshot.campaignMappings.find(
       (item) => item.storeId === payload.storeId && item.normalizedCampaignPattern === normalized,
     );
-    if (existing && existing.isActive) {
+    if ((existing && existing.isActive) || seen.has(normalized)) {
       throw new BadRequestException({
         success: false,
         message: "동일한 정규화 패턴이 이미 존재합니다.",
@@ -109,46 +197,8 @@ export class CampaignMappingService implements OnModuleInit, OnApplicationBootst
       });
     }
 
-    let mapping: CampaignSalesUnitMapping;
-    await this.databaseService.writeCommitted((draft) => {
-      const inactive = draft.campaignMappings.find(
-        (item) => item.storeId === payload.storeId && item.normalizedCampaignPattern === normalized,
-      );
-      if (inactive) {
-        inactive.isActive = true;
-        inactive.deactivatedAt = null;
-        inactive.canonicalSalesUnitId = targetSalesUnitId;
-        inactive.campaignPattern = payload.campaignPattern;
-        inactive.updatedAt = nowIso();
-        mapping = { ...inactive };
-      } else {
-        mapping = {
-          id: createId(),
-          storeId: payload.storeId,
-          channel: "NAVER_DA",
-          canonicalSalesUnitId: targetSalesUnitId,
-          campaignPattern: payload.campaignPattern,
-          normalizedCampaignPattern: normalized,
-          isActive: true,
-          deactivatedAt: null,
-          createdAt: nowIso(),
-          updatedAt: nowIso(),
-        };
-        draft.campaignMappings.push(mapping);
-      }
-    });
-
-    const operation = await this.operationService.enqueue(
-      payload.storeId,
-      "RECALCULATE_AD_MAPPING",
-      { storeId: payload.storeId, reason: "AD_MAPPING_CHANGED" },
-      () => this.recalculate(payload.storeId),
-    );
-
-    return formatApiSuccess({
-      ...mapping!,
-      operationId: operation.id,
-    });
+    seen.add(normalized);
+    return { ...payload, normalized };
   }
 
   async update(mappingId: string, payload: { canonicalSalesUnitId: string; campaignPattern: string }) {

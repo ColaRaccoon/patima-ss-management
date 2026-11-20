@@ -16,6 +16,7 @@ import {
 } from "./helpers";
 import { ProfitSummaryService } from "./profit-summary.service";
 import { recalculateOrderMappingsForStore } from "./sales-unit-auto-mapper";
+import { buildSalesUnitRecord, ensureUniqueSalesUnit } from "./sales-unit-record";
 import { StoreService } from "./store.service";
 
 interface SalesUnitPayload {
@@ -119,32 +120,17 @@ export class SalesUnitService {
 
   async create(payload: SalesUnitPayload, options?: SalesUnitCreateOptions) {
     this.storeService.ensureWritable(payload.storeId);
-    const displayName = payload.displayName.trim();
-    const matchAliases = sanitizeMatchAliases(payload.matchAliases ?? []);
-    ensureNormalizedLength(normalizeText(displayName), "displayName");
-    const timestamp = nowIso();
-
-    const created: CanonicalSalesUnit = {
+    const created = buildSalesUnitRecord({
       id: createId(),
       storeId: payload.storeId,
-      displayName,
-      matchAliases,
-      normalizedMatchAliases: normalizeMatchAliasList(matchAliases),
-      linkedProductIds: payload.linkedProductIds ?? [],
-      linkedOptionCodes: payload.linkedOptionCodes ?? [],
-      linkedManageCodes: [],
-      memo: payload.memo ?? null,
-      isActive: true,
-      deactivatedAt: null,
-      isStoreLevel: false,
-      parentSalesUnitId: null,
-      isGroup: false,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-
-    this.ensureUnique(created);
-    assertGroupInvariants(created);
+      displayName: payload.displayName,
+      matchAliases: payload.matchAliases,
+      linkedProductIds: payload.linkedProductIds,
+      linkedOptionCodes: payload.linkedOptionCodes,
+      memo: payload.memo,
+      timestamp: nowIso(),
+    });
+    ensureUniqueSalesUnit(this.databaseService.getSnapshot().canonicalSalesUnits, created);
 
     const shouldRecalculateOrders = !options?.skipOrderRecalculation;
     const shouldRecalculateAds = !options?.skipAdRecalculation;
@@ -170,6 +156,7 @@ export class SalesUnitService {
     } else {
       await this.databaseService.writeCommitted((draft) => {
         ensureStoreExists(draft, payload.storeId);
+        ensureUniqueSalesUnit(draft.canonicalSalesUnits, created);
         draft.canonicalSalesUnits.push(created);
         if (shouldRecalculateOrders) {
           recalculateOrderMappingsForStore(draft, payload.storeId);
@@ -222,11 +209,12 @@ export class SalesUnitService {
       memo: payload.memo ?? null,
       updatedAt: nowIso(),
     };
-    this.ensureUnique(updated, salesUnitId);
+    ensureUniqueSalesUnit(snapshot.canonicalSalesUnits, updated, salesUnitId);
     assertGroupInvariants(updated);
 
     await this.databaseService.writeCommitted((draft) => {
       const target = draft.canonicalSalesUnits.find((item) => item.id === salesUnitId)!;
+      ensureUniqueSalesUnit(draft.canonicalSalesUnits, updated, salesUnitId);
       Object.assign(target, updated);
       recalculateOrderMappingsForStore(draft, existing.storeId);
       recalculateAdMappingsForStore(draft, existing.storeId);
@@ -702,36 +690,4 @@ export class SalesUnitService {
     });
   }
 
-  private ensureUnique(target: CanonicalSalesUnit, excludeId?: string) {
-    const snapshot = this.databaseService.getSnapshot();
-    const duplicatedDisplay = snapshot.canonicalSalesUnits.some(
-      (item) =>
-        item.id !== excludeId &&
-        item.storeId === target.storeId &&
-        normalizeText(item.displayName) === normalizeText(target.displayName),
-    );
-    if (duplicatedDisplay) {
-      throw new BadRequestException({
-        success: false,
-        message: "중복된 판매단위명이 있습니다.",
-        errors: [{ field: "displayName", reason: "SALES_UNIT_DUPLICATE_DISPLAY_NAME" }],
-      });
-    }
-
-    const duplicatedAlias = target.normalizedMatchAliases.find((alias) =>
-      snapshot.canonicalSalesUnits.some(
-        (item) =>
-          item.id !== excludeId &&
-          item.storeId === target.storeId &&
-          item.normalizedMatchAliases.includes(alias),
-      ),
-    );
-    if (duplicatedAlias) {
-      throw new BadRequestException({
-        success: false,
-        message: "중복된 알리아스가 있습니다.",
-        errors: [{ field: "matchAliases", reason: "SALES_UNIT_DUPLICATE_MATCH_ALIAS" }],
-      });
-    }
-  }
 }

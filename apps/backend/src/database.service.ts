@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, NotFoundException, OnApplicationShutdown, OnModuleInit } from "@nestjs/common";
 import {
   AdCampaignDailyCost,
   AdCampaignSignature,
@@ -6,6 +6,7 @@ import {
   DatabaseShape,
   DEFAULT_DELIVERY_UNIT_COST,
   MappingStatus,
+  MappingStatusFilter,
   OperationRecord,
   OperationStatus,
   OperationType,
@@ -20,6 +21,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { Pool, PoolClient } from "pg";
+import { isDeepStrictEqual } from "node:util";
 import {
   applyAdCampaignSignatureToRows,
   ensureAdCampaignSignaturesForStore,
@@ -30,6 +32,7 @@ import {
   createEmptyDatabase,
   getActiveConfirmedUploadIds,
   getAdMappingStatus,
+  matchesMappingStatus,
   getOrderItemMappingStatus,
   getSignatureIndex,
   getSignatureMappingStatus,
@@ -99,7 +102,7 @@ export interface OrderManualMappingCommitResult {
 }
 
 export type AdCampaignMappingCommitAction =
-  | { type: "MANUAL_MAPPED"; canonicalSalesUnitId: string; timestamp: string }
+  | { type: "MANUAL_MAPPED"; canonicalSalesUnitId: string; timestamp: string; requireUnmapped?: boolean }
   | { type: "INTENTIONALLY_UNMAPPED"; reasonNote: string; timestamp: string }
   | { type: "RECALCULATE" };
 
@@ -144,7 +147,8 @@ export interface AdCampaignSignatureListQuery {
   storeId: string;
   dateFrom?: string;
   dateTo?: string;
-  mappingStatus?: ListMappingStatus;
+  mappingStatus?: MappingStatusFilter;
+  excludeZeroCost?: boolean;
   q?: string;
   page?: number;
   pageSize?: number;
@@ -1131,17 +1135,27 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         ON sales_units.id = signatures.payload->>'canonicalSalesUnitId'
     `;
     builder.addCondition("signatures.payload->>'storeId' = {param}", query.storeId);
+    const activeCostPredicate = this.buildActiveAdCostPredicate(builder, "costs", "uploads", query);
+    const costAmount = "COALESCE((costs.payload->>'totalCost')::numeric, 0)";
+    // A campaign can have both positive and negative costs. Filter by the net cost
+    // across its active reports before counting or selecting a page.
+    const nonzeroNetCost = query.excludeZeroCost
+      ? `AND ${costAmount} <> 0 HAVING SUM(${costAmount}) <> 0`
+      : "";
     builder.addCondition(
       `EXISTS (
         SELECT 1
         FROM ad_campaign_daily_costs costs
         JOIN ad_excel_uploads uploads
           ON uploads.id = costs.payload->>'sourceUploadId'
-        WHERE ${this.buildActiveAdCostPredicate(builder, "costs", "uploads", query)}
+        WHERE ${activeCostPredicate}
+        ${nonzeroNetCost}
       )`,
     );
 
-    if (query.mappingStatus && query.mappingStatus !== "ALL") {
+    if (query.mappingStatus === "UNRESOLVED") {
+      builder.addCondition(`${adCampaignMappingStatusSql("signatures")} = ANY({param}::text[])`, ["UNMAPPED", "CONFLICT"]);
+    } else if (query.mappingStatus && query.mappingStatus !== "ALL") {
       builder.addCondition(`${adCampaignMappingStatusSql("signatures")} = {param}`, query.mappingStatus);
     }
 
@@ -1284,7 +1298,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   ): PaginationResult<AdCampaignSignatureQueryItem> {
     const activeUploadIds = getActiveConfirmedUploadIds(this.database, query.storeId);
     const keyword = query.q ? normalizeText(query.q) : null;
-    const rowsBySignatureId = new Map<string, AdCampaignDailyCost[]>();
+    const rowsBySignatureId = new Map<string, { rows: AdCampaignDailyCost[]; totalCost: number }>();
     const salesUnitsById = new Map(this.database.canonicalSalesUnits.map((item) => [item.id, item]));
 
     this.database.adCampaignDailyCosts
@@ -1295,25 +1309,25 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         if (!row.adCampaignSignatureId) {
           return;
         }
-        const rows = rowsBySignatureId.get(row.adCampaignSignatureId) ?? [];
-        rows.push(row);
-        rowsBySignatureId.set(row.adCampaignSignatureId, rows);
+        const summary = rowsBySignatureId.get(row.adCampaignSignatureId) ?? { rows: [], totalCost: 0 };
+        summary.rows.push(row);
+        summary.totalCost += row.totalCost;
+        rowsBySignatureId.set(row.adCampaignSignatureId, summary);
       });
 
     const signatures = this.database.adCampaignSignatures
       .filter((signature) => signature.storeId === query.storeId)
-      .filter((signature) => rowsBySignatureId.has(signature.id))
-      .filter((signature) =>
-        query.mappingStatus && query.mappingStatus !== "ALL"
-          ? getAdMappingStatus(signature) === query.mappingStatus
-          : true,
-      )
+      .filter((signature) => {
+        const summary = rowsBySignatureId.get(signature.id);
+        return summary && (!query.excludeZeroCost || summary.totalCost !== 0);
+      })
+      .filter((signature) => matchesMappingStatus(getAdMappingStatus(signature), query.mappingStatus))
       .filter((signature) => {
         if (!keyword) {
           return true;
         }
 
-        const rows = rowsBySignatureId.get(signature.id) ?? [];
+        const { rows } = rowsBySignatureId.get(signature.id)!;
         const salesUnitDisplayName = signature.canonicalSalesUnitId
           ? salesUnitsById.get(signature.canonicalSalesUnitId)?.displayName
           : null;
@@ -1334,12 +1348,14 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         );
       })
       .sort((left, right) =>
-        (right.lastSeenDate ?? right.updatedAt).localeCompare(left.lastSeenDate ?? left.updatedAt),
+        (right.lastSeenDate || right.updatedAt).localeCompare(left.lastSeenDate || left.updatedAt) || left.id.localeCompare(right.id),
       );
 
-    return paginate(
-      signatures.map((signature) => {
-        const rows = rowsBySignatureId.get(signature.id) ?? [];
+    const page = paginate(signatures, query.page, query.pageSize);
+    return {
+      ...page,
+      items: page.items.map((signature) => {
+        const { rows, totalCost } = rowsBySignatureId.get(signature.id)!;
         const latestRow = rows
           .slice()
           .sort((left, right) =>
@@ -1349,13 +1365,11 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         return {
           signature,
           latestRow: latestRow ?? null,
-          totalCost: rows.reduce((sum, row) => sum + row.totalCost, 0),
+          totalCost,
           rowCount: rows.length,
         };
       }),
-      query.page,
-      query.pageSize,
-    );
+    };
   }
 
   private buildActiveAdCostPredicate(
@@ -1412,14 +1426,44 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     // File storage still commits the complete snapshot atomically.
     tableKeys?: ReadonlyArray<keyof DatabaseShape>,
   ): Promise<T> {
+    return this.enqueueSnapshotCommit(mutator, tableKeys);
+  }
+
+  commitProductRegistration<T>(storeId: string, mutator: (draft: DatabaseShape) => T): Promise<T> {
+    return this.enqueueSnapshotCommit(mutator, [
+      "canonicalSalesUnits",
+      "salesUnitCostSettings",
+      "orderSourceSignatures",
+      "orderItems",
+      "adCampaignSignatures",
+      "adCampaignDailyCosts",
+      "auditLogs",
+    ], storeId);
+  }
+
+  private async enqueueSnapshotCommit<T>(
+    mutator: (draft: DatabaseShape) => T,
+    tableKeys?: ReadonlyArray<keyof DatabaseShape>,
+    registrationStoreId?: string,
+  ): Promise<T> {
     this.pendingWriteCount += 1;
 
     const operation = this.persistenceQueue
       .catch(() => undefined)
       .then(async () => {
-        const draft = this.cloneSnapshot(this.database);
+        const baseline = this.database;
+        const isRegistrationDelta = this.storageMode === "postgres" && registrationStoreId !== undefined;
+        const draft = isRegistrationDelta ? { ...baseline } : this.cloneSnapshot(baseline);
+        if (isRegistrationDelta) {
+          // Registration only appends records and updates top-level mapping fields for this store.
+          // Keep other stores and nested order payloads shared with the read-only baseline.
+          for (const key of tableKeys ?? []) {
+            const records = baseline[key] as Array<{ id: string; storeId: string | null }>;
+            (draft[key] as unknown[]) = records.map((row) => row.storeId === registrationStoreId ? { ...row } : row);
+          }
+        }
         const result = mutator(draft);
-        await this.persistSnapshotWithStatus(draft, tableKeys);
+        await this.persistSnapshotWithStatus(draft, tableKeys, isRegistrationDelta ? baseline : undefined);
         this.database = draft;
         return result;
       });
@@ -1730,6 +1774,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     signatureIds: string[];
     canonicalSalesUnitId: string;
     timestamp: string;
+    requireUnmapped?: boolean;
   }): Promise<OrderManualMappingCommitResult> {
     const signatureIds = this.normalizeCommittedIdList(params.signatureIds);
     if (signatureIds.length === 0) {
@@ -2073,7 +2118,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
           this.lastPersistenceError = null;
           return result;
         } catch (error) {
-          this.recordPersistenceError(error);
+          if (!(error instanceof ConflictException)) this.recordPersistenceError(error);
           throw error;
         }
       });
@@ -2342,6 +2387,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       signatureIds: string[];
       canonicalSalesUnitId: string;
       timestamp: string;
+      requireUnmapped?: boolean;
     },
   ): OrderManualMappingCommitResult {
     const targetIdSet = new Set(params.signatureIds);
@@ -2378,8 +2424,14 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
 
   private applyOrderManualMappingToSignature(
     signature: OrderSourceSignature,
-    params: { canonicalSalesUnitId: string; timestamp: string },
+    params: { canonicalSalesUnitId: string; timestamp: string; requireUnmapped?: boolean },
   ): OrderSourceSignature {
+    if (params.requireUnmapped && signature.canonicalSalesUnitId) {
+      if (signature.canonicalSalesUnitId !== params.canonicalSalesUnitId) {
+        throw new ConflictException("다른 판매 구성에 연결된 주문 조합입니다. 상품 상태를 새로고침해 주세요.");
+      }
+      if (signature.confirmedAt) return signature;
+    }
     signature.canonicalSalesUnitId = params.canonicalSalesUnitId;
     signature.mappingStatus = "MAPPED";
     signature.confirmedAt = params.timestamp;
@@ -2443,6 +2495,19 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     const targetSignatureIdSet = new Set(signatureIds);
 
     const action = params.action;
+    if (action.type === "MANUAL_MAPPED" && action.requireUnmapped) {
+      const wasAssigned = (item: AdCampaignSignature | AdCampaignDailyCost) =>
+        item.mappingReason === "INTENTIONALLY_UNMAPPED" ||
+        Boolean(item.canonicalSalesUnitId && item.canonicalSalesUnitId !== action.canonicalSalesUnitId);
+      const assignedSignature = snapshot.adCampaignSignatures.some((signature) =>
+        signature.storeId === params.storeId && targetSignatureIdSet.has(signature.id) && wasAssigned(signature));
+      const assignedRow = snapshot.adCampaignDailyCosts.some((row) =>
+        row.storeId === params.storeId && row.adCampaignSignatureId && targetSignatureIdSet.has(row.adCampaignSignatureId) &&
+        wasAssigned(row));
+      if (assignedSignature || assignedRow) {
+        throw new ConflictException("연결 상태가 바뀐 캠페인이 있습니다. 상품 상태를 새로고침해 주세요.");
+      }
+    }
     if (action.type === "RECALCULATE") {
       recalculateAdCampaignSignaturesForStore(snapshot, params.storeId, {
         signatureIds: targetSignatureIdSet,
@@ -2455,6 +2520,8 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         }
 
         if (action.type === "MANUAL_MAPPED") {
+          if (action.requireUnmapped && signature.mappingReason === "MANUAL_MAPPED" &&
+            signature.canonicalSalesUnitId === action.canonicalSalesUnitId && signature.confirmedAt) return;
           signature.canonicalSalesUnitId = action.canonicalSalesUnitId;
           signature.mappingReason = "MANUAL_MAPPED";
           signature.reasonNote = null;
@@ -3320,10 +3387,11 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
   private async persistSnapshotWithStatus(
     snapshot: DatabaseShape,
     tableKeys?: ReadonlyArray<keyof DatabaseShape>,
+    deltaBaseline?: DatabaseShape,
   ): Promise<void> {
     try {
       if (this.storageMode === "postgres") {
-        await this.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false, tableKeys });
+        await this.persistSnapshotToPostgres(snapshot, { includeQueueOwnedTables: false, tableKeys, deltaBaseline });
       } else {
         this.persistSnapshotToFile(snapshot);
       }
@@ -3404,6 +3472,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
     options: {
       includeQueueOwnedTables?: boolean;
       tableKeys?: ReadonlyArray<keyof DatabaseShape>;
+      deltaBaseline?: DatabaseShape;
     } = {},
   ) {
     const client = await this.acquirePostgresClient();
@@ -3423,7 +3492,14 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
         if (table.queueOwned && !options.includeQueueOwnedTables) {
           continue;
         }
-        await this.persistTableRowsIncrementally(client, table, snapshot[table.key] as Array<{ id: string }>);
+        const rows = snapshot[table.key] as Array<{ id: string }>;
+        if (options.deltaBaseline) {
+          const previous = new Map((options.deltaBaseline[table.key] as Array<{ id: string }>).map((row) => [row.id, row]));
+          // Product registration never removes records. Only send appended or changed rows.
+          await this.upsertTableRows(client, table, rows.filter((row) => !isDeepStrictEqual(row, previous.get(row.id))));
+        } else {
+          await this.persistTableRowsIncrementally(client, table, rows);
+        }
       }
 
       await client.query("COMMIT");

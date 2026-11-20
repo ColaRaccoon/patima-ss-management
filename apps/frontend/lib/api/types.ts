@@ -3,6 +3,7 @@ import type {
   DailySalesUnitProfit,
   DailySalesUnitDetailRevenueBreakdown,
   DailySalesUnitDetailDeliveryContext,
+  MappingStatusFilter,
   OperationStatus,
   OperationType,
   ProfitStatus,
@@ -437,11 +438,11 @@ export interface OrdersPageData {
 export interface SalesUnitsPageData {
   primaryStore: StoreListItem | null;
   salesUnits: SalesUnitListItem[];
-  costSettings: CostSettingListItem[];
+  costCoverage: { date: string; items: Array<{ id: string; unitCost: number | null }> } | null;
   sources: SourceState[];
 }
 
-export type MappingListStatus = "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+export type MappingListStatus = MappingStatusFilter;
 
 export interface PageMeta {
   page: number;
@@ -458,6 +459,10 @@ export interface MappingListState {
   pageSize: number;
 }
 
+export interface AdMappingListState extends MappingListState {
+  excludeZeroCost: boolean;
+}
+
 export interface MappingsPageData {
   primaryStore: StoreListItem | null;
   salesUnits: SalesUnitListItem[];
@@ -466,7 +471,7 @@ export interface MappingsPageData {
   signatureQuery: MappingListState;
   adCosts: CampaignCostListItem[];
   adCostPage: PageMeta;
-  adCostQuery: MappingListState;
+  adCostQuery: AdMappingListState;
   campaignMappings: CampaignMappingRuleListItem[];
   sources: SourceState[];
 }

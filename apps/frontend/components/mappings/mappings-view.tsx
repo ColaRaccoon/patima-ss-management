@@ -4,26 +4,27 @@ import type { FormEvent, PointerEvent as ReactPointerEvent, ReactNode } from "re
 import Link from "next/link";
 import { useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { DataTable } from "@/components/shared/data-table";
 import { EmptyState } from "@/components/shared/empty-state";
-import { PageHeader } from "@/components/shared/page-header";
-import { Panel } from "@/components/shared/panel";
 import { SourceBanner } from "@/components/shared/source-banner";
 import { StatusBadge } from "@/components/shared/status-badge";
-import type { MappingListStatus, MappingsPageData } from "@/lib/api/types";
-import { buildNaverStoreProductUrl, formatCurrency, formatDate, formatNullableText, formatNumber } from "@/lib/format";
+import type { AdMappingListState, MappingListState, MappingListStatus, MappingsPageData, PageMeta } from "@/lib/api/types";
+import { buildNaverStoreProductUrl, formatCurrency, formatNumber } from "@/lib/format";
 import { buildHrefWithStore, STORE_ID_QUERY_KEY } from "@/lib/store-selection";
 
 type MappingStatus = "MAPPED" | "UNMAPPED" | "CONFLICT";
 type MappingListKind = "order" | "ad";
 
 const MAPPING_STATUS_OPTIONS: Array<{ value: MappingListStatus; label: string }> = [
+  { value: "UNRESOLVED", label: "미매핑·충돌" },
   { value: "ALL", label: "전체" },
   { value: "MAPPED", label: "매핑 완료" },
   { value: "UNMAPPED", label: "미매핑" },
   { value: "CONFLICT", label: "충돌" },
 ];
+const MAPPING_STATUS_LABELS = { MAPPED: "완료", UNMAPPED: "미매핑", CONFLICT: "충돌" };
 
 const PAGE_SIZE_OPTIONS = [50, 100, 200] as const;
 
@@ -41,14 +42,6 @@ const MAPPING_QUERY_PARAM_NAMES = {
     q: "adQ",
   },
 } as const;
-
-interface SignatureDraft {
-  displayName: string;
-  matchAliasesText: string;
-  memo: string;
-  linkedProductIdsText: string;
-  linkedOptionCodesText: string;
-}
 
 interface CampaignDraft {
   canonicalSalesUnitId: string;
@@ -72,33 +65,18 @@ interface SelectionColumn<T extends SelectableRow> {
   render: (row: T) => ReactNode;
 }
 
-function emptySignatureDraft(): SignatureDraft {
-  return { displayName: "", matchAliasesText: "", memo: "", linkedProductIdsText: "", linkedOptionCodesText: "" };
-}
-
-function aliasesToText(aliases: string[]) {
-  return aliases.join("\n");
-}
-
-function parseAliases(value: string) {
-  return Array.from(
-    new Set(
-      value
-        .split(/\r?\n|,/)
-        .map((item) => item.trim())
-        .filter(Boolean),
-    ),
-  );
-}
-
 function emptyCampaignDraft(defaultSalesUnitId = ""): CampaignDraft {
   return { canonicalSalesUnitId: defaultSalesUnitId, campaignPattern: "" };
 }
 
-function toneForMappingStatus(status: MappingStatus) {
-  if (status === "MAPPED") return "success" as const;
-  if (status === "CONFLICT") return "danger" as const;
-  return "warning" as const;
+function MappingState({ status }: { status: MappingStatus }) {
+  return (
+    <span className={cn("font-semibold", {
+      "text-emerald-800": status === "MAPPED",
+      "text-red-800": status === "CONFLICT",
+      "text-amber-900": status === "UNMAPPED",
+    })}>{MAPPING_STATUS_LABELS[status]}</span>
+  );
 }
 
 function applySelectionChange(currentIds: string[], targetIds: string[], nextChecked: boolean) {
@@ -110,12 +88,6 @@ function applySelectionChange(currentIds: string[], targetIds: string[], nextChe
   return Array.from(nextIds);
 }
 
-function getMappingTypeIndicator(signature: MappingsPageData["signatures"][number]): "ID_MAPPED" | "TEXT_MAPPED" | "UNMAPPED" {
-  if (signature.mappingStatus === "UNMAPPED") return "UNMAPPED";
-  if (signature.externalProductId || signature.optionCode) return "ID_MAPPED";
-  return "TEXT_MAPPED";
-}
-
 function isCampaignMappableSalesUnit(salesUnit: MappingsPageData["salesUnits"][number]) {
   return salesUnit.isActive && (salesUnit.isStoreLevel || salesUnit.isGroup || !salesUnit.parentSalesUnitId);
 }
@@ -124,39 +96,12 @@ function hasGroupShipping(rawOptionInfo: string | null): boolean {
   return rawOptionInfo?.includes("[함께배송") ?? false;
 }
 
-function buildSignatureDraft(signatures: MappingsPageData["signatures"]): SignatureDraft {
-  if (!signatures.length) return emptySignatureDraft();
-
-  const aliases = new Set<string>();
-  signatures.forEach((signature) => {
-    const joined = [signature.rawProductNameSnapshot, signature.rawOptionInfoSnapshot]
-      .filter(Boolean)
-      .join(" ");
-    [signature.rawProductNameSnapshot, joined, signature.sourceSignature]
-      .filter(Boolean)
-      .forEach((value) => aliases.add(value));
-  });
-
-  const first = signatures[0];
-  return {
-    displayName:
-      first.canonicalDisplayName ??
-      (signatures.length === 1
-        ? [first.rawProductNameSnapshot, first.rawOptionInfoSnapshot].filter(Boolean).join(" / ")
-        : `${first.rawProductNameSnapshot} 외 ${signatures.length - 1}건`),
-    matchAliasesText: aliasesToText(parseAliases(Array.from(aliases).join("\n"))),
-    memo: "",
-    linkedProductIdsText: "",
-    linkedOptionCodesText: "",
-  };
-}
-
 function SelectionCheckbox({ checked }: { checked: boolean }) {
   return (
     <span
       aria-hidden="true"
       className={cn(
-        "flex h-5 w-5 items-center justify-center rounded border text-xs transition",
+        "flex h-4 w-4 items-center justify-center rounded border text-xs transition peer-focus-visible:ring-2 peer-focus-visible:ring-ink",
         checked
           ? "border-sand-700 bg-sand-700 text-white"
           : "border-ink/18 bg-white/90 text-transparent",
@@ -175,16 +120,17 @@ function SelectionTable<T extends SelectableRow>(props: {
   emptyMessage: string;
   onStartDrag: (event: ReactPointerEvent<HTMLLabelElement>, id: string, selected: boolean) => void;
   onContinueDrag: (event: ReactPointerEvent<HTMLTableRowElement>, id: string) => void;
+  onToggle: (id: string, selected: boolean) => void;
+  rowLabel: (row: T) => string;
 }) {
   return (
-    <div className="table-scroll">
-      <table className="w-full border-collapse text-left">
+      <table className="w-full table-fixed border-collapse text-left">
         <caption className="sr-only">{props.caption}</caption>
-        <thead>
-          <tr className="border-b border-ink/10 text-xs uppercase tracking-[0.18em] text-ink/45">
-            <th className="px-4 py-3 font-medium">선택</th>
+        <thead className="sticky top-0 z-[1] bg-[#f7f1e6]">
+          <tr className="border-b border-ink/10 text-xs text-ink/75">
+            <th scope="col" className="w-8 px-2 py-1.5"><span className="sr-only">선택</span></th>
             {props.columns.map((column) => (
-              <th key={column.key} className="px-4 py-3 font-medium">
+              <th key={column.key} scope="col" className={cn("px-1.5 py-1.5 font-semibold", column.className)}>
                 {column.title}
               </th>
             ))}
@@ -193,7 +139,7 @@ function SelectionTable<T extends SelectableRow>(props: {
         <tbody>
           {props.rows.length === 0 ? (
             <tr>
-              <td className="px-4 py-10 text-center text-sm text-ink/60" colSpan={props.columns.length + 1}>
+              <td className="px-3 py-4 text-center text-sm text-ink/65" colSpan={props.columns.length + 1}>
                 {props.emptyMessage}
               </td>
             </tr>
@@ -204,27 +150,30 @@ function SelectionTable<T extends SelectableRow>(props: {
                 <tr
                   key={row.id}
                   className={cn(
-                    "select-none border-b border-ink/8 text-sm text-ink transition hover:bg-white/45",
-                    isSelected && "bg-white/75",
+                    "border-b border-ink/10 text-xs text-ink hover:bg-sand/35",
+                    isSelected && "bg-sand/65",
                   )}
                   onPointerEnter={(event) => props.onContinueDrag(event, row.id)}
                 >
-                  <td className="px-4 py-4 align-top">
+                  <td className="px-2 py-1 align-middle">
                     <label
-                      className="inline-flex cursor-pointer items-center gap-3"
+                      className="flex cursor-pointer items-center"
                       onClick={(event) => event.preventDefault()}
                       onPointerDown={(event) => {
                         event.preventDefault();
                         props.onStartDrag(event, row.id, isSelected);
                       }}
                     >
-                      <input checked={isSelected} className="sr-only" readOnly type="checkbox" />
+                      <input aria-label={props.rowLabel(row) + " 선택"} checked={isSelected} className="peer sr-only" readOnly type="checkbox" onKeyDown={(event) => {
+                        if (event.key !== " ") return;
+                        event.preventDefault();
+                        props.onToggle(row.id, !isSelected);
+                      }} />
                       <SelectionCheckbox checked={isSelected} />
-                      <span className="sr-only">{isSelected ? "선택됨" : "선택"}</span>
                     </label>
                   </td>
                   {props.columns.map((column) => (
-                    <td key={column.key} className={cn("px-4 py-4 align-top", column.className)}>
+                    <td key={column.key} className={cn("px-1.5 py-1 align-middle leading-[14px]", column.className)}>
                       {column.render(row)}
                     </td>
                   ))}
@@ -234,6 +183,65 @@ function SelectionTable<T extends SelectableRow>(props: {
           )}
         </tbody>
       </table>
+  );
+}
+
+function MappingListToolbar({
+  title, value, onSearchChange, onSearch, query, page, onChange,
+  busy, hiddenCount, hideEmpty, emptyLabel, onHideEmpty, rowCount, selectedCount, hiddenSelected, onSelectPage, onClearSelection,
+}: {
+  title: string;
+  value: string;
+  onSearchChange: (value: string) => void;
+  onSearch: (event: FormEvent<HTMLFormElement>) => void;
+  query: MappingListState;
+  page: PageMeta;
+  onChange: (patch: Partial<MappingListState>) => void;
+  busy: boolean;
+  hiddenCount?: number;
+  hideEmpty: boolean;
+  emptyLabel: string;
+  onHideEmpty: (hide: boolean) => void;
+  rowCount: number;
+  selectedCount: number;
+  hiddenSelected: number;
+  onSelectPage: () => void;
+  onClearSelection: () => void;
+}) {
+  return (
+    <div className="space-y-1.5 border-b border-ink/10 px-2.5 pb-1.5 pt-2">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <h2 className="text-base font-semibold">{title}</h2>
+        <span className="text-xs tabular-nums text-ink/65">{formatNumber(page.totalCount)}건</span>
+      </div>
+      <form className="flex flex-wrap items-center gap-1.5" onSubmit={onSearch}>
+        <input aria-label={title + " 검색"} className="input-shell min-w-24 flex-1" type="search" placeholder={title === "광고 비용" ? "캠페인·판매단위 검색" : "상품명·옵션 검색"} value={value} onChange={(event) => onSearchChange(event.target.value)} />
+        <button type="submit" className="button-shell button-secondary" disabled={busy}>검색</button>
+        {query.q && <button type="button" className="button-shell button-ghost" disabled={busy} onClick={() => {
+          onSearchChange("");
+          onChange({ q: "", page: 1 });
+        }}>초기화</button>}
+        <select aria-label={title + " 상태"} className="input-shell w-auto" value={query.mappingStatus} disabled={busy} onChange={(event) => onChange({ mappingStatus: event.target.value as MappingListStatus, page: 1 })}>
+          {MAPPING_STATUS_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+        <select aria-label={title + " 페이지 크기"} className="input-shell w-auto" value={query.pageSize} disabled={busy} onChange={(event) => onChange({ pageSize: Number(event.target.value), page: 1 })}>
+          {PAGE_SIZE_OPTIONS.map((size) => <option key={size} value={size}>{size}개</option>)}
+        </select>
+      </form>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-ink/70">
+        <button type="button" className="button-shell button-ghost" disabled={busy || !rowCount} onClick={onSelectPage}>페이지 선택</button>
+        {selectedCount > 0 && <button type="button" className="button-shell button-ghost" disabled={busy} onClick={onClearSelection}>선택 해제</button>}
+        <label className="inline-flex items-center gap-1.5">
+          <input type="checkbox" checked={hideEmpty} disabled={busy} onChange={(event) => onHideEmpty(event.target.checked)} />
+          {emptyLabel}{Boolean(hiddenCount) && " (" + formatNumber(hiddenCount) + ")"}
+        </label>
+        {hiddenSelected > 0 && <span className="text-amber-900">숨긴 선택 {hiddenSelected}건</span>}
+        <div className="ml-auto flex items-center gap-1">
+          <button type="button" aria-label={title + " 이전 페이지"} className="button-shell button-ghost" disabled={busy || page.page <= 1} onClick={() => onChange({ page: page.page - 1 })}><ChevronLeft size={16} aria-hidden="true" /></button>
+          <span className="whitespace-nowrap tabular-nums">{page.page} / {page.totalPages}</span>
+          <button type="button" aria-label={title + " 다음 페이지"} className="button-shell button-ghost" disabled={busy || !page.hasNext} onClick={() => onChange({ page: page.page + 1 })}><ChevronRight size={16} aria-hidden="true" /></button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -248,13 +256,11 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const [signatureSalesUnitId, setSignatureSalesUnitId] = useState(
     data.salesUnits.find((u) => u.isActive && !u.isGroup && !u.isStoreLevel)?.id ?? "",
   );
-  const [signatureDraft, setSignatureDraft] = useState(emptySignatureDraft());
   const [campaignDraft, setCampaignDraft] = useState(
     emptyCampaignDraft(data.campaignMappings[0]?.canonicalSalesUnitId ?? defaultCampaignSalesUnitId),
   );
   const [adCostSalesUnitId, setAdCostSalesUnitId] = useState(defaultCampaignSalesUnitId);
-  const [hideZeroCostAdRows, setHideZeroCostAdRows] = useState(true);
-  const [hideZeroOrderSignatures, setHideZeroOrderSignatures] = useState(true);
+  const [hideZeroOrderSignatures, setHideZeroOrderSignatures] = useState(false);
   const [intentionalReason, setIntentionalReason] = useState("");
   const [orderSearchInput, setOrderSearchInput] = useState(data.signatureQuery.q);
   const [adSearchInput, setAdSearchInput] = useState(data.adCostQuery.q);
@@ -273,22 +279,18 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
   const adDragRef = useRef<PointerSelectionState>({ active: false, nextChecked: false, pointerId: null });
   const orderScrollRef = useRef<HTMLDivElement>(null);
   const adScrollRef = useRef<HTMLDivElement>(null);
+  const rulesRef = useRef<HTMLDetailsElement>(null);
+  const ruleInputRef = useRef<HTMLInputElement>(null);
   const scrollPositions = useRef<Map<string, number>>(new Map());
 
   const selectedMapping = data.campaignMappings.find((mapping) => mapping.id === selectedMappingId) ?? null;
-  const visibleAdCostsBase = hideZeroCostAdRows ? data.adCosts.filter((item) => item.totalCost !== 0) : data.adCosts;
-  const hiddenZeroCostCount = data.adCosts.length - visibleAdCostsBase.length;
   const isBusy = isSavingOrder || isRecalculatingOrder || isSavingCampaign || isSavingAdCost || isRefreshing;
-  const conflictSignatureCount = data.signatures.filter((item) => item.mappingStatus === "CONFLICT").length;
-  const conflictAdCostCount = data.adCosts.filter((item) => item.mappingStatus === "CONFLICT").length;
   const selectedSignatureSet = new Set(selectedSignatureIds);
   const selectedAdCostSet = new Set(selectedAdCostIds);
   const filteredSignatures = data.signatures.filter((item) => !hideZeroOrderSignatures || item.usageCount !== 0);
-  const filteredAdCosts = visibleAdCostsBase;
   const selectedSignatureRows = data.signatures.filter((item) => selectedSignatureSet.has(item.id));
   const selectedAdCostRows = data.adCosts.filter((item) => selectedAdCostSet.has(item.id));
   const visibleSelectedSignatureCount = filteredSignatures.filter((item) => selectedSignatureSet.has(item.id)).length;
-  const visibleSelectedAdCostCount = filteredAdCosts.filter((item) => selectedAdCostSet.has(item.id)).length;
   const hiddenSignaturesCount = data.signatures.length - filteredSignatures.length;
 
   useEffect(() => {
@@ -328,6 +330,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     data.adCostQuery.page,
     data.adCostQuery.pageSize,
     data.adCostQuery.q,
+    data.adCostQuery.excludeZeroCost,
   ]);
 
   useEffect(() => {
@@ -345,7 +348,6 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     const rows = data.signatures.filter((item) => selectedIds.has(item.id));
     if (!rows.length) {
       setSignatureSalesUnitId(data.salesUnits[0]?.id ?? "");
-      setSignatureDraft(emptySignatureDraft());
       return;
     }
     const sharedSalesUnitId =
@@ -354,7 +356,6 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         ? rows[0].canonicalSalesUnitId
         : data.salesUnits[0]?.id ?? "";
     setSignatureSalesUnitId(sharedSalesUnitId);
-    setSignatureDraft(buildSignatureDraft(rows));
   }, [data.salesUnits, data.signatures, selectedSignatureIds]);
 
   useEffect(() => {
@@ -408,17 +409,16 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   const primaryStoreId = data.primaryStore.id;
   const salesUnitsHref = buildHrefWithStore("/sales-units", null, primaryStoreId);
+  const unmappedSelectedSignatures = selectedSignatureRows.filter((row) => row.mappingStatus !== "MAPPED");
+  const registrationQuery = new URLSearchParams(unmappedSelectedSignatures.map((row) => ["signatureId", row.id]));
+  registrationQuery.set("register", "1");
+  const registrationHref = buildHrefWithStore("/sales-units", registrationQuery, primaryStoreId);
   const orderPage = data.signaturePage;
   const adPage = data.adCostPage;
 
   const navigateMappingList = (
     kind: MappingListKind,
-    patch: Partial<{
-      mappingStatus: MappingListStatus;
-      q: string;
-      page: number;
-      pageSize: number;
-    }>,
+    patch: Partial<AdMappingListState>,
   ) => {
     const current = kind === "order" ? data.signatureQuery : data.adCostQuery;
     const next = { ...current, ...patch };
@@ -439,10 +439,14 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       setSelectedSignatureIds([]);
     } else {
       setSelectedAdCostIds([]);
+      if (patch.excludeZeroCost === false) searchParams.set("adShowZero", "1");
+      if (patch.excludeZeroCost === true) searchParams.delete("adShowZero");
     }
 
+    saveScrollPositions();
+    scrollPositions.current.set(kind, 0);
     startRefresh(() => {
-      router.replace(`/mappings?${searchParams.toString()}`);
+      router.replace(`/mappings?${searchParams.toString()}`, { scroll: false });
     });
   };
 
@@ -564,42 +568,6 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     }
   }
 
-  async function handleCreateAndMap() {
-    if (!selectedSignatureRows.length) return setOrderError("주문 항목을 하나 이상 선택해 주세요.");
-    if (!signatureDraft.displayName.trim()) return setOrderError("displayName is required.");
-    const matchAliases = parseAliases(signatureDraft.matchAliasesText);
-    if (!matchAliases.length) return setOrderError("Add at least one match alias.");
-    const linkedProductIds = signatureDraft.linkedProductIdsText.trim()
-      ? parseAliases(signatureDraft.linkedProductIdsText).filter(Boolean)
-      : null;
-    const linkedOptionCodes = signatureDraft.linkedOptionCodesText.trim()
-      ? parseAliases(signatureDraft.linkedOptionCodesText).filter(Boolean)
-      : null;
-    setOrderError(null);
-    setOrderSuccess(null);
-    setIsSavingOrder(true);
-    try {
-      await postJson(
-        "/api/order-source-signatures/batch-mapping",
-        {
-          signatureIds: selectedSignatureRows.map((item) => item.id),
-          displayName: signatureDraft.displayName.trim(),
-          matchAliases,
-          linkedProductIds,
-          linkedOptionCodes,
-          memo: signatureDraft.memo.trim() || null,
-        },
-        "Failed to create and map sales unit.",
-      );
-      setSelectedSignatureIds([]);
-      refreshWithMessage("order", `${formatNumber(selectedSignatureRows.length)}개 주문 항목에 새 판매단위를 연결했습니다.`);
-    } catch (error) {
-      setOrderError(error instanceof Error ? error.message : "Failed to create and map sales unit.");
-    } finally {
-      setIsSavingOrder(false);
-    }
-  }
-
   async function handleRecalculateOrderMappings() {
     setOrderError(null);
     setOrderSuccess(null);
@@ -608,11 +576,11 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       await postJson(
         `/api/stores/${primaryStoreId}/order-mapping/recalculate`,
         {},
-        "Failed to recalculate order mappings.",
+        "주문 자동 매핑을 다시 계산하지 못했습니다.",
       );
       refreshWithMessage("order", "주문 자동 매핑 재계산 작업을 시작했습니다.");
     } catch (error) {
-      setOrderError(error instanceof Error ? error.message : "Failed to recalculate order mappings.");
+      setOrderError(error instanceof Error ? error.message : "주문 자동 매핑을 다시 계산하지 못했습니다.");
     } finally {
       setIsRecalculatingOrder(false);
     }
@@ -620,7 +588,7 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
 
   async function handleSaveCampaign() {
     if (!campaignDraft.canonicalSalesUnitId || !campaignDraft.campaignPattern.trim()) {
-      return setCampaignError("Select a sales unit and enter a campaign pattern.");
+      return setCampaignError("판매단위와 캠페인 패턴을 입력해 주세요.");
     }
     setCampaignError(null);
     setCampaignSuccess(null);
@@ -636,11 +604,11 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
         }),
       }).then(async (response) => {
         const payload = (await response.json().catch(() => null)) as { message?: string } | null;
-        if (!response.ok) throw new Error(payload?.message ?? "Failed to save campaign mapping.");
+        if (!response.ok) throw new Error(payload?.message ?? "캠페인 규칙을 저장하지 못했습니다.");
       });
-      refreshWithMessage("campaign", selectedMapping ? "Campaign mapping updated." : "Campaign mapping created.");
+      refreshWithMessage("campaign", selectedMapping ? "캠페인 규칙을 수정했습니다." : "캠페인 규칙을 추가했습니다.");
     } catch (error) {
-      setCampaignError(error instanceof Error ? error.message : "Failed to save campaign mapping.");
+      setCampaignError(error instanceof Error ? error.message : "캠페인 규칙을 저장하지 못했습니다.");
     } finally {
       setIsSavingCampaign(false);
     }
@@ -652,17 +620,17 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
     setCampaignSuccess(null);
     setIsSavingCampaign(true);
     try {
-      await postJson(`/api/campaign-mappings/${selectedMapping.id}/${nextAction}`, undefined, "Failed to change campaign mapping state.");
-      refreshWithMessage("campaign", nextAction === "activate" ? "Campaign mapping activated." : "Campaign mapping deactivated.");
+      await postJson(`/api/campaign-mappings/${selectedMapping.id}/${nextAction}`, undefined, "캠페인 규칙 상태를 바꾸지 못했습니다.");
+      refreshWithMessage("campaign", nextAction === "activate" ? "캠페인 규칙을 활성화했습니다." : "캠페인 규칙을 비활성화했습니다.");
     } catch (error) {
-      setCampaignError(error instanceof Error ? error.message : "Failed to change campaign mapping state.");
+      setCampaignError(error instanceof Error ? error.message : "캠페인 규칙 상태를 바꾸지 못했습니다.");
     } finally {
       setIsSavingCampaign(false);
     }
   }
 
   async function handleSaveAdCostMappings() {
-    if (!selectedAdCostRows.length) return setAdCostError("광고 row를 하나 이상 선택해 주세요.");
+    if (!selectedAdCostRows.length) return setAdCostError("광고 항목을 하나 이상 선택해 주세요.");
     if (!adCostSalesUnitId) return setAdCostError("연결할 판매단위를 선택해 주세요.");
     setAdCostError(null);
     setAdCostSuccess(null);
@@ -671,19 +639,19 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       await postJson(
         "/api/ad-campaign-costs/batch-mapping",
         { adCostIds: selectedAdCostRows.map((item) => item.id), canonicalSalesUnitId: adCostSalesUnitId },
-        "Failed to save ad cost mapping.",
+        "광고 연결을 저장하지 못했습니다.",
       );
       setSelectedAdCostIds([]);
       refreshWithMessage("ad-cost", `${formatNumber(selectedAdCostRows.length)}개 광고 row를 수동 매핑했습니다.`);
     } catch (error) {
-      setAdCostError(error instanceof Error ? error.message : "Failed to save ad cost mapping.");
+      setAdCostError(error instanceof Error ? error.message : "광고 연결을 저장하지 못했습니다.");
     } finally {
       setIsSavingAdCost(false);
     }
   }
 
   async function handleIntentionalUnmapped() {
-    if (!selectedAdCostRows.length) return setAdCostError("광고 row를 하나 이상 선택해 주세요.");
+    if (!selectedAdCostRows.length) return setAdCostError("광고 항목을 하나 이상 선택해 주세요.");
     if (!intentionalReason.trim()) return setAdCostError("제외 사유를 입력해 주세요.");
     setAdCostError(null);
     setAdCostSuccess(null);
@@ -692,19 +660,19 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       await postJson(
         "/api/ad-campaign-costs/batch-intentional-unmapped",
         { adCostIds: selectedAdCostRows.map((item) => item.id), reasonNote: intentionalReason.trim() },
-        "Failed to save intentional-unmapped note.",
+        "광고 제외 사유를 저장하지 못했습니다.",
       );
       setSelectedAdCostIds([]);
       refreshWithMessage("ad-cost", `${formatNumber(selectedAdCostRows.length)}개 광고 row를 의도적 제외로 표시했습니다.`);
     } catch (error) {
-      setAdCostError(error instanceof Error ? error.message : "Failed to save intentional-unmapped note.");
+      setAdCostError(error instanceof Error ? error.message : "광고 제외 사유를 저장하지 못했습니다.");
     } finally {
       setIsSavingAdCost(false);
     }
   }
 
   async function handleRecalculateAdCostMappings() {
-    if (!selectedAdCostRows.length) return setAdCostError("광고 row를 하나 이상 선택해 주세요.");
+    if (!selectedAdCostRows.length) return setAdCostError("광고 항목을 하나 이상 선택해 주세요.");
     setAdCostError(null);
     setAdCostSuccess(null);
     setIsSavingAdCost(true);
@@ -712,842 +680,302 @@ export function MappingsView({ data }: { data: MappingsPageData }) {
       await postJson(
         "/api/ad-campaign-costs/batch-recalculate-mapping",
         { adCostIds: selectedAdCostRows.map((item) => item.id) },
-        "Failed to recalculate ad cost mapping.",
+        "광고 자동 매핑을 다시 계산하지 못했습니다.",
       );
       setSelectedAdCostIds([]);
       refreshWithMessage("ad-cost", `${formatNumber(selectedAdCostRows.length)}개 광고 row의 자동 매핑을 다시 계산했습니다.`);
     } catch (error) {
-      setAdCostError(error instanceof Error ? error.message : "Failed to recalculate ad cost mapping.");
+      setAdCostError(error instanceof Error ? error.message : "광고 자동 매핑을 다시 계산하지 못했습니다.");
     } finally {
       setIsSavingAdCost(false);
     }
   }
 
+  const rulesSelect = [...campaignMappableSalesUnits].sort((left, right) => {
+    const rank = (unit: typeof left) => unit.isStoreLevel ? 0 : unit.isGroup ? 1 : 2;
+    return rank(left) - rank(right) || left.displayName.localeCompare(right.displayName, "ko");
+  });
+  const orderSalesUnits = data.salesUnits.filter((unit) => unit.isActive && !unit.isGroup && !unit.isStoreLevel)
+    .sort((left, right) => left.displayName.localeCompare(right.displayName, "ko"));
+  const advertisingReasonLabels = {
+    NO_RULE_MATCH: "일치 규칙 없음",
+    MULTIPLE_RULE_MATCHES: "여러 규칙 일치",
+    MANUAL_MAPPED: "수동 연결",
+    INTENTIONALLY_UNMAPPED: "의도적 제외",
+  };
+
+  function openNewRule() {
+    setSelectedMappingId(null);
+    setCampaignDraft(emptyCampaignDraft(defaultCampaignSalesUnitId));
+    setCampaignError(null);
+    setCampaignSuccess(null);
+    if (rulesRef.current) rulesRef.current.open = true;
+    requestAnimationFrame(() => ruleInputRef.current?.focus());
+  }
+
   return (
-    <div className="space-y-6">
-      <PageHeader
-        eyebrow="매핑 관리"
-        title="주문 · 광고 매핑"
-        description="주문 시그니처와 광고 캠페인을 판매단위에 연결합니다. 항목을 검색하고 드래그로 다중 선택한 뒤 일괄 매핑할 수 있습니다."
-        actions={
-          <>
-            <button
-              className="button-shell button-secondary"
-              type="button"
-              disabled={isBusy}
-              onClick={() => void handleRecalculateOrderMappings()}
-            >
-              오토매핑 재계산
-            </button>
-            <Link className="button-shell button-secondary" href={salesUnitsHref}>
-              판매단위 관리
-            </Link>
-            <button
-              className="button-shell button-primary"
-              type="button"
-              disabled={isBusy}
-              onClick={() => {
-                setSelectedMappingId(null);
-                setCampaignDraft(emptyCampaignDraft(defaultCampaignSalesUnitId));
-                setCampaignError(null);
-                setCampaignSuccess(null);
-              }}
-            >
-              새 캠페인 규칙
-            </button>
-          </>
-        }
-      />
+    <div className="mappings-workspace space-y-3">
+      <header className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+          <h1 className="text-2xl font-semibold tracking-tight">주문 · 광고 매핑</h1>
+          <p className="text-sm text-ink/65">{data.primaryStore.name}</p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={() => void handleRecalculateOrderMappings()}>주문 자동 매핑 재계산</button>
+          <Link className="button-shell button-ghost" href={salesUnitsHref}>판매단위 관리</Link>
+          <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={openNewRule}>새 캠페인 규칙</button>
+        </div>
+      </header>
 
       <SourceBanner sources={data.sources} />
 
-      {conflictSignatureCount > 0 || conflictAdCostCount > 0 ? (
-        <div className="rounded-2xl border border-red-300/40 bg-red-100/70 px-4 py-4 text-sm leading-6 text-red-800">
-          <p className="font-semibold">충돌 항목이 있습니다. 수동 확인이 필요합니다.</p>
-          <p className="mt-1">
-            주문 시그니처 {formatNumber(conflictSignatureCount)}건 / 광고 {formatNumber(conflictAdCostCount)}건
-          </p>
-        </div>
-      ) : null}
+      <nav aria-label="매핑 화면 바로가기" className="flex gap-3 text-xs lg:hidden">
+        <a href="#order-mapping" className="underline underline-offset-2">주문 시그니처</a>
+        <a href="#advertising-mapping" className="underline underline-offset-2">광고 비용</a>
+      </nav>
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(360px,1fr)]">
-        <Panel
-          title="주문 시그니처"
-          description="목록을 검색하고, 체크박스를 드래그하여 여러 항목을 선택한 뒤 일괄 매핑할 수 있습니다."
-          className="flex max-h-[70vh] min-h-[34rem] flex-col"
-        >
-          <div className="flex min-h-0 flex-1 flex-col gap-4">
-            <div className="space-y-3">
-              <form className="flex flex-col gap-2 sm:flex-row" onSubmit={submitOrderSearch}>
-                <input
-                  className="input-shell min-w-0 flex-1"
-                  value={orderSearchInput}
-                  onChange={(event) => setOrderSearchInput(event.target.value)}
-                  placeholder="시그니처, 상품명, 옵션, 판매단위 검색"
-                />
-                <button className="button-shell button-secondary" type="submit" disabled={isBusy}>
-                  검색
-                </button>
-                {data.signatureQuery.q ? (
-                  <button
-                    className="button-shell button-ghost"
-                    type="button"
-                    disabled={isBusy}
-                    onClick={() => {
-                      setOrderSearchInput("");
-                      navigateMappingList("order", { q: "", page: 1 });
-                    }}
-                  >
-                    초기화
-                  </button>
-                ) : null}
-              </form>
-              <div className="grid gap-2 sm:grid-cols-2">
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-ink/60">상태</span>
-                  <select
-                    className="input-shell"
-                    value={data.signatureQuery.mappingStatus}
-                    onChange={(event) =>
-                      navigateMappingList("order", {
-                        mappingStatus: event.target.value as MappingListStatus,
-                        page: 1,
-                      })
-                    }
-                    disabled={isBusy}
-                  >
-                    {MAPPING_STATUS_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-ink/60">페이지 크기</span>
-                  <select
-                    className="input-shell"
-                    value={data.signatureQuery.pageSize}
-                    onChange={(event) =>
-                      navigateMappingList("order", {
-                        pageSize: Number(event.target.value),
-                        page: 1,
-                      })
-                    }
-                    disabled={isBusy}
-                  >
-                    {PAGE_SIZE_OPTIONS.map((pageSize) => (
-                      <option key={pageSize} value={pageSize}>
-                        {formatNumber(pageSize)}개
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  className="button-shell button-secondary"
-                  type="button"
-                  disabled={isBusy || !filteredSignatures.length}
-                  onClick={() => updateOrderSelection(filteredSignatures.map((item) => item.id), true)}
-                >
-                  전체 선택
-                </button>
-                <button
-                  className="button-shell button-ghost"
-                  type="button"
-                  disabled={isBusy || !selectedSignatureRows.length}
-                  onClick={() => setSelectedSignatureIds([])}
-                >
-                  선택 해제
-                </button>
-              </div>
-              <div className="flex flex-wrap gap-3">
-                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
-                  <input checked={hideZeroOrderSignatures} onChange={(event) => setHideZeroOrderSignatures(event.target.checked)} type="checkbox" />
-                  주문 0건 숨기기
-                </label>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-ink/50">
-              <div className="flex flex-wrap gap-x-4 gap-y-1">
-                <span>총 {formatNumber(orderPage.totalCount)}건</span>
-                <span>
-                  페이지 {formatNumber(orderPage.page)} / {formatNumber(orderPage.totalPages)}
-                </span>
-                <span>현재 표시 {formatNumber(filteredSignatures.length)}건</span>
-                <span>선택 {formatNumber(selectedSignatureRows.length)}건</span>
-                {selectedSignatureRows.length > visibleSelectedSignatureCount ? (
-                  <span>숨겨진 선택 {formatNumber(selectedSignatureRows.length - visibleSelectedSignatureCount)}건</span>
-                ) : null}
-                {hiddenSignaturesCount > 0 ? (
-                  <span>0건 숨김 {formatNumber(hiddenSignaturesCount)}건</span>
-                ) : null}
-              </div>
-              <div className="flex gap-2">
-                <button
-                  className="button-shell button-ghost"
-                  type="button"
-                  disabled={isBusy || orderPage.page <= 1}
-                  onClick={() => navigateMappingList("order", { page: Math.max(1, orderPage.page - 1) })}
-                >
-                  이전
-                </button>
-                <button
-                  className="button-shell button-ghost"
-                  type="button"
-                  disabled={isBusy || !orderPage.hasNext}
-                  onClick={() => navigateMappingList("order", { page: orderPage.page + 1 })}
-                >
-                  다음
-                </button>
-              </div>
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto pr-1" ref={orderScrollRef}>
-              <SelectionTable
-                caption="Order signatures"
-                rows={filteredSignatures}
-                selectedIds={selectedSignatureSet}
-                emptyMessage="검색 결과가 없습니다."
-                onStartDrag={startOrderDrag}
-                onContinueDrag={continueOrderDrag}
-                columns={[
-                  {
-                    key: "source",
-                    title: "출처",
-                    render: (row) => (
-                      <div>
-                        <p className="font-semibold text-ink">{row.sourceSignature}</p>
-                        <p className="mt-1 text-xs text-ink/55">
-                          {row.rawProductNameSnapshot} / {formatNullableText(row.rawOptionInfoSnapshot)}
-                        </p>
-                        {row.fallbackProductName && (
-                          <p className="mt-2 text-xs text-ink/45">
-                            ↳{" "}
-                            <span>
-                              {row.fallbackProductName}{" "}
-                              <span className="text-ink/35">
-                                (
-                                {row.fallbackProductNameSource === "orderItem"
-                                  ? "원본 주문 표기"
-                                  : row.fallbackProductNameSource === "optionInfo"
-                                  ? "옵션에서 추출"
-                                  : row.fallbackProductNameSource === "product"
-                                  ? "상품 DB 매칭"
-                                  : row.fallbackProductNameSource === "commerceApi"
-                                  ? "네이버 커머스 API"
-                                  : "상품 정보 없음"}
-                                )
-                              </span>
-                            </span>
-                          </p>
-                        )}
-                        {row.externalProductId && !row.fallbackProductName && row.fallbackProductNameSource === null && (
-                          <p className="mt-2 text-xs text-ink/45">
-                            ↳{" "}
-                            {buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ? (
-                              <a
-                                href={buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ?? ""}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-ink/50 underline hover:text-ink/70"
-                              >
-                                네이버 스토어 열기 ↗
-                              </a>
-                            ) : (
-                              <span className="text-ink/35">(상품 정보 없음)</span>
-                            )}
-                          </p>
-                        )}
-                      </div>
-                    ),
-                  },
-                  {
-                    key: "usage",
-                    title: "사용",
-                    render: (row) => formatNumber(row.usageCount),
-                  },
-                  {
-                    key: "status",
-                    title: "상태",
-                    render: (row) => (
-                      <div>
-                        <StatusBadge tone={toneForMappingStatus(row.mappingStatus)}>{row.mappingStatus}</StatusBadge>
-                        <div className="mt-2 flex flex-wrap items-center gap-2">
-                          {(getMappingTypeIndicator(row) === "ID_MAPPED") && (
-                            <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">ID매핑</span>
-                          )}
-                          {(getMappingTypeIndicator(row) === "TEXT_MAPPED") && (
-                            <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">텍스트매핑</span>
-                          )}
-                          {hasGroupShipping(row.rawOptionInfoSnapshot) && (
-                            <span className="inline-flex items-center rounded-full bg-purple-100 px-2 py-0.5 text-xs font-medium text-purple-700">함께배송</span>
-                          )}
-                        </div>
-                        <p className="mt-2 text-sm text-ink/65">{row.canonicalDisplayName ?? "미매핑"}</p>
-                      </div>
-                    ),
-                  },
-                ]}
-              />
-            </div>
-          </div>
-        </Panel>
-
-        <Panel
-          title="주문 매핑"
-          description="선택한 시그니처를 기존 판매단위에 연결하거나, 새 판매단위를 만들어 한 번에 연결합니다."
-        >
-          {selectedSignatureRows.length ? (
-            <div className="space-y-4">
-              <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-                <p className="font-semibold text-ink">
-                  {formatNumber(selectedSignatureRows.length)}개 시그니처 선택됨
-                </p>
-                <div className="mt-3 space-y-2">
-                  {selectedSignatureRows.slice(0, 3).map((row) => (
-                    <div key={row.id} className="rounded-2xl border border-ink/10 bg-white/70 px-3 py-2">
-                      <p className="font-medium text-ink">{row.sourceSignature}</p>
-                      <p className="text-xs text-ink/55">
-                        {row.rawProductNameSnapshot} / {formatNullableText(row.rawOptionInfoSnapshot)}
-                      </p>
-                      {row.fallbackProductName && (
-                        <p className="mt-1 text-xs text-ink/45">
-                          ↳ {row.fallbackProductName}{" "}
-                          <span className="text-ink/35">
-                            (
-                            {row.fallbackProductNameSource === "orderItem"
-                              ? "원본 주문 표기"
-                              : row.fallbackProductNameSource === "optionInfo"
-                              ? "옵션에서 추출"
-                              : row.fallbackProductNameSource === "product"
-                              ? "상품 DB 매칭"
-                              : row.fallbackProductNameSource === "commerceApi"
-                              ? "네이버 커머스 API"
-                              : "상품 정보 없음"}
-                            )
-                          </span>
-                        </p>
-                      )}
-                      {row.externalProductId && !row.fallbackProductName && row.fallbackProductNameSource === null && (
-                        <p className="mt-1 text-xs text-ink/45">
-                          ↳{" "}
-                          {buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ? (
-                            <a
-                              href={buildNaverStoreProductUrl(row.storeSlug, row.externalProductId) ?? ""}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-ink/50 underline hover:text-ink/70"
-                            >
-                              네이버 스토어 열기 ↗
-                            </a>
-                          ) : (
-                            <span className="text-ink/35">(상품 정보 없음)</span>
-                          )}
-                        </p>
-                      )}
-                    </div>
-                  ))}
-                  {selectedSignatureRows.length > 3 ? (
-                    <p className="text-xs text-ink/55">외 {formatNumber(selectedSignatureRows.length - 3)}개 항목</p>
-                  ) : null}
-                </div>
-              </div>
-
-              <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">기존 판매단위에 연결</span>
-                <select
-                  className="input-shell"
-                  value={signatureSalesUnitId}
-                  onChange={(event) => setSignatureSalesUnitId(event.target.value)}
-                >
-                  <option value="">판매단위 선택</option>
-                  {[...data.salesUnits]
-                    .filter((u) => !u.isGroup && !u.isStoreLevel && u.isActive)
-                    .sort((a, b) => a.displayName.localeCompare(b.displayName, "ko"))
-                    .map((salesUnit) => (
-                      <option key={salesUnit.id} value={salesUnit.id}>
-                        {salesUnit.displayName}
-                      </option>
-                    ))}
-                </select>
-              </label>
-
-              <button
-                className="button-shell button-primary w-full"
-                type="button"
-                disabled={isBusy || !selectedSignatureRows.length || !data.salesUnits.length}
-                onClick={() => void handleSaveOrderMappings()}
-              >
-                선택 항목 매핑 저장
-              </button>
-
-              <div className="rounded-2xl border border-ink/10 p-4">
-                <p className="mb-4 text-sm font-medium text-ink">새 판매단위를 만들어 연결</p>
-                <div className="space-y-3">
-                  <label className="block">
-                    <span className="mb-2 block text-sm font-medium text-ink">표시 이름</span>
-                    <input
-                      className="input-shell"
-                      value={signatureDraft.displayName}
-                      onChange={(event) => setSignatureDraft((current) => ({ ...current, displayName: event.target.value }))}
-                      placeholder="화면에 표시될 판매단위 이름"
-                    />
-                  </label>
-
-                  <label className="block">
-                    <span className="mb-2 block text-sm font-medium text-ink">매칭 별칭</span>
-                    <textarea
-                      className="input-shell min-h-32"
-                      value={signatureDraft.matchAliasesText}
-                      onChange={(event) => setSignatureDraft((current) => ({ ...current, matchAliasesText: event.target.value }))}
-                      placeholder={"줄바꿈 또는 쉼표로 구분\n예: 상품명A\n상품명B, 상품명C"}
-                    />
-                  </label>
-
-                  <p className="text-xs leading-5 text-ink/55">
-                    자동 매핑 시 별칭을 기준으로 매칭됩니다. 표시 이름은 화면 표시용입니다.
-                  </p>
-
-                  <label className="block">
-                    <span className="mb-2 block text-sm font-medium text-ink">메모</span>
-                    <textarea
-                      className="input-shell min-h-24"
-                      value={signatureDraft.memo}
-                      onChange={(event) => setSignatureDraft((current) => ({ ...current, memo: event.target.value }))}
-                      placeholder="참고사항 (선택)"
-                    />
-                  </label>
-
-                  <label className="block">
-                    <span className="mb-2 block text-sm font-medium text-ink">연동 상품 ID</span>
-                    <div className="space-y-2">
-                      <textarea
-                        className="input-shell min-h-20"
-                        value={signatureDraft.linkedProductIdsText}
-                        onChange={(event) => setSignatureDraft((current) => ({ ...current, linkedProductIdsText: event.target.value }))}
-                        placeholder="상품ID를 줄바꿈 또는 쉼표로 구분&#10;예: 12345&#10;67890, 11111"
-                      />
-                      <p className="text-xs text-ink/50">네이버 상품번호 (externalProductId) 또는 수동 입력</p>
-                    </div>
-                  </label>
-
-                  <label className="block">
-                    <span className="mb-2 block text-sm font-medium text-ink">연동 옵션 코드</span>
-                    <div className="space-y-2">
-                      <textarea
-                        className="input-shell min-h-20"
-                        value={signatureDraft.linkedOptionCodesText}
-                        onChange={(event) => setSignatureDraft((current) => ({ ...current, linkedOptionCodesText: event.target.value }))}
-                        placeholder="옵션코드를 줄바꿈 또는 쉼표로 구분&#10;예: OPT001&#10;OPT002, OPT003"
-                      />
-                      <p className="text-xs text-ink/50">네이버 옵션코드 (optionCode) 또는 수동 입력</p>
-                    </div>
-                  </label>
-
-                  <button
-                    className="button-shell button-secondary w-full"
-                    type="button"
-                    disabled={isBusy || !selectedSignatureRows.length}
-                    onClick={() => void handleCreateAndMap()}
-                  >
-                    새 판매단위 생성 및 연결
-                  </button>
-                </div>
-              </div>
-
-              {orderError ? <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{orderError}</div> : null}
-              {orderSuccess ? <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{orderSuccess}</div> : null}
-            </div>
-          ) : (
-            <div className="flex flex-col items-center justify-center py-10 text-center">
-              <p className="text-sm font-medium text-ink/50">주문 시그니처를 선택해 주세요</p>
-              <p className="mt-2 text-xs text-ink/40">왼쪽 목록에서 항목을 선택하면 여기서 매핑을 수정할 수 있습니다</p>
-            </div>
-          )}
-        </Panel>
-      </div>
-
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(360px,1fr)]">
-        <Panel
-          title="광고 비용"
-          description="캠페인별 광고 비용을 조회하고, 드래그로 선택하여 판매단위에 매핑합니다."
-          className="flex max-h-[70vh] min-h-[34rem] flex-col"
-        >
-          <div className="flex min-h-0 flex-1 flex-col gap-4">
-            <div className="space-y-3">
-              <form className="flex flex-col gap-2 sm:flex-row" onSubmit={submitAdSearch}>
-                <input
-                  className="input-shell min-w-0 flex-1"
-                  value={adSearchInput}
-                  onChange={(event) => setAdSearchInput(event.target.value)}
-                  placeholder="캠페인명, 캠페인 ID, 판매단위, 사유, 날짜 검색"
-                />
-                <button className="button-shell button-secondary" type="submit" disabled={isBusy}>
-                  검색
-                </button>
-                {data.adCostQuery.q ? (
-                  <button
-                    className="button-shell button-ghost"
-                    type="button"
-                    disabled={isBusy}
-                    onClick={() => {
-                      setAdSearchInput("");
-                      navigateMappingList("ad", { q: "", page: 1 });
-                    }}
-                  >
-                    초기화
-                  </button>
-                ) : null}
-              </form>
-              <div className="grid gap-2 sm:grid-cols-2">
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-ink/60">상태</span>
-                  <select
-                    className="input-shell"
-                    value={data.adCostQuery.mappingStatus}
-                    onChange={(event) =>
-                      navigateMappingList("ad", {
-                        mappingStatus: event.target.value as MappingListStatus,
-                        page: 1,
-                      })
-                    }
-                    disabled={isBusy}
-                  >
-                    {MAPPING_STATUS_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-ink/60">페이지 크기</span>
-                  <select
-                    className="input-shell"
-                    value={data.adCostQuery.pageSize}
-                    onChange={(event) =>
-                      navigateMappingList("ad", {
-                        pageSize: Number(event.target.value),
-                        page: 1,
-                      })
-                    }
-                    disabled={isBusy}
-                  >
-                    {PAGE_SIZE_OPTIONS.map((pageSize) => (
-                      <option key={pageSize} value={pageSize}>
-                        {formatNumber(pageSize)}개
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  className="button-shell button-secondary"
-                  type="button"
-                  disabled={isBusy || !filteredAdCosts.length}
-                  onClick={() => updateAdSelection(filteredAdCosts.map((item) => item.id), true)}
-                >
-                  전체 선택
-                </button>
-                <button
-                  className="button-shell button-ghost"
-                  type="button"
-                  disabled={isBusy || !selectedAdCostRows.length}
-                  onClick={() => setSelectedAdCostIds([])}
-                >
-                  선택 해제
-                </button>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink/50">
-                <span>총 {formatNumber(adPage.totalCount)}건</span>
-                <span>
-                  페이지 {formatNumber(adPage.page)} / {formatNumber(adPage.totalPages)}
-                </span>
-                <span>현재 표시 {formatNumber(filteredAdCosts.length)}건</span>
-                <span>선택 {formatNumber(selectedAdCostRows.length)}건</span>
-                {selectedAdCostRows.length > visibleSelectedAdCostCount ? (
-                  <span>숨겨진 선택 {formatNumber(selectedAdCostRows.length - visibleSelectedAdCostCount)}건</span>
-                ) : null}
-                {hiddenZeroCostCount > 0 ? <span>0원 숨김 {formatNumber(hiddenZeroCostCount)}건</span> : null}
-              </div>
-              <div className="flex flex-wrap items-center gap-3">
-                <label className="inline-flex items-center gap-2 text-xs text-ink/60">
-                  <input checked={hideZeroCostAdRows} onChange={(event) => setHideZeroCostAdRows(event.target.checked)} type="checkbox" />
-                  0원 항목 숨기기
-                </label>
-                <div className="flex gap-2">
-                  <button
-                    className="button-shell button-ghost"
-                    type="button"
-                    disabled={isBusy || adPage.page <= 1}
-                    onClick={() => navigateMappingList("ad", { page: Math.max(1, adPage.page - 1) })}
-                  >
-                    이전
-                  </button>
-                  <button
-                    className="button-shell button-ghost"
-                    type="button"
-                    disabled={isBusy || !adPage.hasNext}
-                    onClick={() => navigateMappingList("ad", { page: adPage.page + 1 })}
-                  >
-                    다음
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto pr-1" ref={adScrollRef}>
-              <SelectionTable
-                caption="Ad cost rows"
-                rows={filteredAdCosts}
-                selectedIds={selectedAdCostSet}
-                emptyMessage={
-                  hideZeroCostAdRows && hiddenZeroCostCount > 0
-                    ? `검색 결과가 없습니다. (0원 row ${formatNumber(hiddenZeroCostCount)}개 숨김)`
-                    : "검색 결과가 없습니다."
-                }
-                onStartDrag={startAdDrag}
-                onContinueDrag={continueAdDrag}
-                columns={[
-                  {
-                    key: "campaign",
-                    title: "캠페인",
-                    render: (row) => (
-                      <div>
-                        <p className="font-semibold text-ink">{row.campaignName}</p>
-                        <p className="mt-1 text-xs text-ink/55">{formatDate(row.reportDate)}</p>
-                      </div>
-                    ),
-                  },
-                  {
-                    key: "cost",
-                    title: "비용",
-                    render: (row) => formatCurrency(row.totalCost),
-                  },
-                  {
-                    key: "status",
-                    title: "상태",
-                    render: (row) => (
-                      <div>
-                        <StatusBadge tone={toneForMappingStatus(row.mappingStatus)}>{row.mappingStatus}</StatusBadge>
-                        <p className="mt-2 text-xs text-ink/55">
-                          {row.mappingReason ?? "규칙 매칭"} / {row.matchedRuleCount}개 규칙
-                        </p>
-                      </div>
-                    ),
-                  },
-                  {
-                    key: "salesUnit",
-                    title: "판매단위",
-                    render: (row) => row.canonicalDisplayName ?? "미매핑",
-                  },
-                ]}
-              />
-            </div>
-          </div>
-        </Panel>
-
-        <Panel
-          title="광고 매핑"
-          description="선택한 항목을 판매단위에 수동 매핑하거나, 자동 매핑을 재계산하거나, 의도적 제외로 표시합니다."
-        >
-          {selectedAdCostRows.length ? (
-            <div className="space-y-4">
-              <div className="rounded-2xl bg-white/70 px-4 py-4 text-sm leading-6 text-ink/65">
-                <p className="font-semibold text-ink">{formatNumber(selectedAdCostRows.length)}개 광고 항목 선택됨</p>
-                <div className="mt-3 space-y-2">
-                  {selectedAdCostRows.slice(0, 3).map((row) => (
-                    <div key={row.id} className="rounded-2xl border border-ink/10 bg-white/70 px-3 py-2">
-                      <p className="font-medium text-ink">{row.campaignName}</p>
-                      <p className="text-xs text-ink/55">
-                        {formatDate(row.reportDate)} / {formatCurrency(row.totalCost)}
-                      </p>
-                    </div>
-                  ))}
-                  {selectedAdCostRows.length > 3 ? (
-                    <p className="text-xs text-ink/55">외 {formatNumber(selectedAdCostRows.length - 3)}개 항목</p>
-                  ) : null}
-                </div>
-              </div>
-
-              <label className="block">
-                <span className="mb-2 block text-sm font-medium text-ink">판매단위</span>
-                <select
-                  className="input-shell"
-                  value={adCostSalesUnitId}
-                  onChange={(event) => setAdCostSalesUnitId(event.target.value)}
-                >
-                  <option value="">판매단위 선택</option>
-                  {[...data.salesUnits]
-                    .filter((u) => u.isActive && (u.isStoreLevel || u.isGroup || !u.parentSalesUnitId))
-                    .sort((a, b) => {
-                      if (a.isStoreLevel !== b.isStoreLevel) return a.isStoreLevel ? -1 : 1;
-                      return a.displayName.localeCompare(b.displayName, "ko");
-                    })
-                    .map((salesUnit) => (
-                      <option key={salesUnit.id} value={salesUnit.id}>
-                        {salesUnit.isStoreLevel
-                          ? `[스토어 전체] ${salesUnit.displayName}`
-                          : salesUnit.isGroup
-                            ? `[그룹] ${salesUnit.displayName}`
-                            : salesUnit.displayName}
-                      </option>
-                    ))}
-                </select>
-              </label>
-
-              <div className="flex flex-wrap gap-3">
-                <button className="button-shell button-primary flex-1" type="button" disabled={isBusy || !selectedAdCostRows.length || !data.salesUnits.length} onClick={() => void handleSaveAdCostMappings()}>
-                  수동 매핑 저장
-                </button>
-                <button className="button-shell button-ghost" type="button" disabled={isBusy || !selectedAdCostRows.length} onClick={() => void handleRecalculateAdCostMappings()}>
-                  자동 재계산
-                </button>
-              </div>
-
-              <div className="rounded-2xl border border-ink/10 p-4">
-                <p className="mb-3 text-sm font-medium text-ink">의도적 제외 처리</p>
-                <textarea className="input-shell min-h-20" value={intentionalReason} onChange={(event) => setIntentionalReason(event.target.value)} placeholder="제외 사유를 입력해 주세요" />
-                <button className="button-shell button-ghost mt-3 w-full" type="button" disabled={isBusy || !selectedAdCostRows.length} onClick={() => void handleIntentionalUnmapped()}>
-                  의도적 제외로 표시
-                </button>
-              </div>
-
-              {adCostError ? <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{adCostError}</div> : null}
-              {adCostSuccess ? <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{adCostSuccess}</div> : null}
-            </div>
-          ) : (
-            <div className="flex flex-col items-center justify-center py-10 text-center">
-              <p className="text-sm font-medium text-ink/50">광고 항목을 선택해 주세요</p>
-              <p className="mt-2 text-xs text-ink/40">왼쪽 목록에서 항목을 선택하면 여기서 매핑을 수정할 수 있습니다</p>
-            </div>
-          )}
-        </Panel>
-      </div>
-
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(360px,1fr)]">
-        <Panel title="캠페인 규칙" description="활성 규칙은 별칭 기반 매칭보다 우선 적용됩니다.">
-          <DataTable
-            caption="캠페인 규칙"
-            columns={[
-              {
-                key: "select",
-                title: "선택",
-                render: (row) => (
-                  <button
-                    className="button-shell button-ghost"
-                    type="button"
-                    disabled={isBusy}
-                    onClick={() => {
-                      setSelectedMappingId(row.id);
-                      setCampaignError(null);
-                      setCampaignSuccess(null);
-                    }}
-                  >
-                    {selectedMappingId === row.id ? "선택됨" : "열기"}
-                  </button>
-                ),
-              },
-              {
-                key: "pattern",
-                title: "패턴",
-                render: (row) => (
-                  <div>
-                    <p className="font-semibold text-ink">{row.campaignPattern}</p>
-                    <p className="mt-1 text-xs text-ink/55">{row.normalizedCampaignPattern}</p>
-                  </div>
-                ),
-              },
-              { key: "salesUnit", title: "판매단위", render: (row) => row.canonicalDisplayName },
-              {
-                key: "enabled",
-                title: "상태",
-                render: (row) => <StatusBadge tone={row.isEnabled ? "success" : "muted"}>{row.isEnabled ? "활성" : "비활성"}</StatusBadge>,
-              },
-            ]}
-            rows={data.campaignMappings}
-            getRowKey={(row) => row.id}
+      <div className="grid items-start gap-3 lg:grid-cols-2">
+        <section id="order-mapping" className="min-w-0 scroll-mt-2 rounded-lg border border-ink/15 bg-white/85" aria-label="주문 시그니처">
+          <MappingListToolbar
+            title="주문 시그니처"
+            value={orderSearchInput}
+            onSearchChange={setOrderSearchInput}
+            onSearch={submitOrderSearch}
+            query={data.signatureQuery}
+            page={orderPage}
+            onChange={(patch) => navigateMappingList("order", patch)}
+            busy={isBusy}
+            hideEmpty={hideZeroOrderSignatures}
+            onHideEmpty={setHideZeroOrderSignatures}
+            emptyLabel="주문 0건 숨기기"
+            hiddenCount={hiddenSignaturesCount}
+            rowCount={filteredSignatures.length}
+            selectedCount={selectedSignatureRows.length}
+            hiddenSelected={selectedSignatureRows.length - visibleSelectedSignatureCount}
+            onSelectPage={() => updateOrderSelection(filteredSignatures.map((item) => item.id), true)}
+            onClearSelection={() => setSelectedSignatureIds([])}
           />
-        </Panel>
+          {selectedSignatureRows.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5 border-b border-ink/10 bg-sand/45 px-2.5 py-1.5 text-xs">
+              <strong className="shrink-0">{formatNumber(selectedSignatureRows.length)}건 선택</strong>
+              <label className="min-w-32 flex-1">
+                <span className="sr-only">주문 연결 판매단위</span>
+                <select className="input-shell" value={signatureSalesUnitId} disabled={isBusy} onChange={(event) => setSignatureSalesUnitId(event.target.value)}>
+                  <option value="">판매단위 선택</option>
+                  {orderSalesUnits.map((unit) => <option key={unit.id} value={unit.id}>{unit.displayName}</option>)}
+                </select>
+              </label>
+              <button className="button-shell button-primary" type="button" disabled={isBusy || !signatureSalesUnitId} onClick={() => void handleSaveOrderMappings()}>연결 저장</button>
+              {unmappedSelectedSignatures.length === selectedSignatureRows.length && selectedSignatureRows.length <= 100 && data.primaryStore.isActive && (
+                <Link className="button-shell button-secondary" href={registrationHref}>신상품 등록</Link>
+              )}
+            </div>
+          )}
+          {orderError && <p role="alert" className="bg-red-50 px-2.5 py-1.5 text-xs text-red-800">{orderError}</p>}
+          {orderSuccess && <p role="status" className="bg-emerald-50 px-2.5 py-1.5 text-xs text-emerald-900">{orderSuccess}</p>}
+          <div className="max-h-[min(65vh,43rem)] overflow-auto rounded-b-lg" ref={orderScrollRef}>
+            <SelectionTable
+              caption="주문 시그니처 목록"
+              rows={filteredSignatures}
+              selectedIds={selectedSignatureSet}
+              rowLabel={(row) => row.sourceSignature}
+              emptyMessage="조건에 맞는 주문 시그니처가 없습니다."
+              onStartDrag={startOrderDrag}
+              onContinueDrag={continueOrderDrag}
+              onToggle={(id, selected) => { if (!isBusy) updateOrderSelection([id], selected); }}
+              columns={[
+                {
+                  key: "source",
+                  title: "상품명 · 옵션",
+                  render: (row) => {
+                    const productName = row.fallbackProductName || row.rawProductNameSnapshot || row.sourceSignature;
+                    const url = !row.fallbackProductName && row.fallbackProductNameSource === null
+                      ? buildNaverStoreProductUrl(row.storeSlug, row.externalProductId)
+                      : null;
+                    return (
+                      <>
+                        <p title={row.sourceSignature} className="truncate font-semibold">{productName}</p>
+                        {(row.rawOptionInfoSnapshot || url) && (
+                          <div className="flex items-baseline gap-1 text-ink/70">
+                            {row.rawOptionInfoSnapshot && <span title={row.rawOptionInfoSnapshot} className="min-w-0 truncate">{row.rawOptionInfoSnapshot}</span>}
+                            {url && <a href={url} target="_blank" rel="noopener noreferrer" className="shrink-0 underline">상품 링크</a>}
+                          </div>
+                        )}
+                      </>
+                    );
+                  },
+                },
+                {
+                  key: "usage",
+                  title: "주문",
+                  className: "w-12 text-right tabular-nums",
+                  render: (row) => formatNumber(row.usageCount),
+                },
+                {
+                  key: "status",
+                  title: "상태 · 판매단위",
+                  className: "w-[6.25rem] sm:w-28",
+                  render: (row) => (
+                    <>
+                      <MappingState status={row.mappingStatus} />
+                      {row.mappingStatus === "MAPPED" && <span className="ml-1 text-[10px] text-ink/65">{row.externalProductId || row.optionCode ? "ID" : "텍스트"}</span>}
+                      {hasGroupShipping(row.rawOptionInfoSnapshot) && <span className="ml-1 text-[10px] text-ink/65">함께배송</span>}
+                      {row.canonicalDisplayName && <p title={row.canonicalDisplayName} className="truncate text-ink/65">{row.canonicalDisplayName}</p>}
+                    </>
+                  ),
+                },
+              ]}
+            />
+          </div>
+        </section>
 
-        <Panel title={selectedMapping ? "캠페인 규칙 편집" : "새 캠페인 규칙"} description="캠페인명에 포함된 키워드로 매칭하는 규칙을 만들거나 수정합니다.">
-          <div className="space-y-4">
-            <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">판매단위</span>
+        <section id="advertising-mapping" className="min-w-0 scroll-mt-2 rounded-lg border border-ink/15 bg-white/85" aria-label="광고 비용">
+          <MappingListToolbar
+            title="광고 비용"
+            value={adSearchInput}
+            onSearchChange={setAdSearchInput}
+            onSearch={submitAdSearch}
+            query={data.adCostQuery}
+            page={adPage}
+            onChange={(patch) => navigateMappingList("ad", patch)}
+            busy={isBusy}
+            hideEmpty={data.adCostQuery.excludeZeroCost}
+            onHideEmpty={(excludeZeroCost) => navigateMappingList("ad", { excludeZeroCost, page: 1 })}
+            emptyLabel="광고비 0원 숨기기"
+            rowCount={data.adCosts.length}
+            selectedCount={selectedAdCostRows.length}
+            hiddenSelected={0}
+            onSelectPage={() => updateAdSelection(data.adCosts.map((item) => item.id), true)}
+            onClearSelection={() => setSelectedAdCostIds([])}
+          />
+          {selectedAdCostRows.length > 0 && (
+            <div className="space-y-1.5 border-b border-ink/10 bg-sand/45 px-2.5 py-1.5 text-xs">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <strong className="shrink-0">{formatNumber(selectedAdCostRows.length)}건 선택</strong>
+                <label className="min-w-28 flex-1">
+                  <span className="sr-only">광고 연결 판매단위</span>
+                  <select className="input-shell" value={adCostSalesUnitId} disabled={isBusy} onChange={(event) => setAdCostSalesUnitId(event.target.value)}>
+                    <option value="">판매단위 선택</option>
+                    {rulesSelect.map((unit) => <option key={unit.id} value={unit.id}>{unit.displayName}</option>)}
+                  </select>
+                </label>
+                <button className="button-shell button-primary" type="button" disabled={isBusy || !adCostSalesUnitId} onClick={() => void handleSaveAdCostMappings()}>연결 저장</button>
+                <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={() => void handleRecalculateAdCostMappings()}>자동 재계산</button>
+                <details className="w-full">
+                  <summary className="w-fit cursor-pointer rounded py-1 font-medium">의도적 제외</summary>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <input className="input-shell min-w-28 flex-1" aria-label="제외 사유" value={intentionalReason} onChange={(event) => setIntentionalReason(event.target.value)} placeholder="제외 사유" />
+                    <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={() => void handleIntentionalUnmapped()}>선택 항목 제외</button>
+                  </div>
+                </details>
+              </div>
+            </div>
+          )}
+          {adCostError && <p role="alert" className="bg-red-50 px-2.5 py-1.5 text-xs text-red-800">{adCostError}</p>}
+          {adCostSuccess && <p role="status" className="bg-emerald-50 px-2.5 py-1.5 text-xs text-emerald-900">{adCostSuccess}</p>}
+          <div className="max-h-[min(65vh,43rem)] overflow-auto rounded-b-lg" ref={adScrollRef}>
+            <SelectionTable
+              caption="광고 비용 목록"
+              rows={data.adCosts}
+              selectedIds={selectedAdCostSet}
+              rowLabel={(row) => row.campaignName}
+              emptyMessage="조건에 맞는 광고 캠페인이 없습니다."
+              onStartDrag={startAdDrag}
+              onContinueDrag={continueAdDrag}
+              onToggle={(id, selected) => { if (!isBusy) updateAdSelection([id], selected); }}
+              columns={[
+                {
+                  key: "campaign",
+                  title: "캠페인 · 최근일",
+                  render: (row) => (
+                    <>
+                      <p title={row.campaignName} className="truncate font-semibold">{row.campaignName}</p>
+                      {row.reportDate && <p className="tabular-nums text-ink/65">{row.reportDate}</p>}
+                    </>
+                  ),
+                },
+                {
+                  key: "cost",
+                  title: "비용",
+                  className: "w-[4.75rem] whitespace-nowrap text-right tabular-nums sm:w-20",
+                  render: (row) => formatCurrency(row.totalCost),
+                },
+                {
+                  key: "status",
+                  title: "상태 · 판매단위",
+                  className: "w-[6.25rem] sm:w-28",
+                  render: (row) => (
+                    <>
+                      <MappingState status={row.mappingStatus} />
+                      {row.canonicalDisplayName
+                        ? <p title={row.canonicalDisplayName} className="truncate text-ink/65">{row.canonicalDisplayName}</p>
+                        : row.mappingReason && <p title={row.reasonNote || undefined} className="truncate text-ink/65">{advertisingReasonLabels[row.mappingReason]}{row.matchedRuleCount > 1 && " " + row.matchedRuleCount + "개"}</p>}
+                    </>
+                  ),
+                },
+              ]}
+            />
+          </div>
+        </section>
+      </div>
+
+      <details ref={rulesRef} className="rounded-lg border border-ink/15 bg-white/85">
+        <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
+          캠페인 규칙 <span className="ml-1 text-xs font-normal text-ink/65">{formatNumber(data.campaignMappings.length)}개</span>
+        </summary>
+        <div className="grid gap-3 border-t border-ink/10 p-3 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
+          <div className="max-h-72 min-w-0 overflow-auto rounded-md border border-ink/10">
+            <DataTable
+              caption="캠페인 규칙"
+              emptyTitle="등록된 캠페인 규칙이 없습니다."
+              emptyDescription=""
+              rows={data.campaignMappings}
+              getRowKey={(row) => row.id}
+              selectedRowKey={selectedMappingId}
+              onRowClick={(row) => {
+                if (isBusy) return;
+                setSelectedMappingId(row.id);
+                setCampaignError(null);
+                setCampaignSuccess(null);
+              }}
+              columns={[
+                { key: "pattern", title: "캠페인 패턴", render: (row) => row.campaignPattern },
+                { key: "salesUnit", title: "판매단위", render: (row) => row.canonicalDisplayName },
+                { key: "enabled", title: "상태", render: (row) => <StatusBadge tone={row.isEnabled ? "success" : "muted"}>{row.isEnabled ? "활성" : "비활성"}</StatusBadge> },
+              ]}
+            />
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-sm font-semibold">{selectedMapping ? "캠페인 규칙 편집" : "새 캠페인 규칙"}</h2>
+            <label className="block text-xs font-medium">
+              <span className="mb-1 block">판매단위</span>
               <select className="input-shell" value={campaignDraft.canonicalSalesUnitId} onChange={(event) => setCampaignDraft((current) => ({ ...current, canonicalSalesUnitId: event.target.value }))}>
                 <option value="">판매단위 선택</option>
-                {[...campaignMappableSalesUnits]
-                  .sort((a, b) => {
-                    const rank = (unit: typeof a) => (unit.isStoreLevel ? 0 : unit.isGroup ? 1 : 2);
-                    const rankDiff = rank(a) - rank(b);
-                    return rankDiff || a.displayName.localeCompare(b.displayName, "ko");
-                  })
-                  .map((salesUnit) => (
-                    <option key={salesUnit.id} value={salesUnit.id}>
-                      {salesUnit.isStoreLevel
-                        ? `[스토어 전체] ${salesUnit.displayName}`
-                        : salesUnit.isGroup
-                          ? `[그룹] ${salesUnit.displayName}`
-                          : salesUnit.displayName}
-                    </option>
-                  ))}
+                {rulesSelect.map((unit) => <option key={unit.id} value={unit.id}>{unit.displayName}</option>)}
               </select>
-              {data.salesUnits.some((u) => u.parentSalesUnitId) && (
-                <p className="mt-1 text-xs text-ink/55">
-                  그룹 자식 판매단위는 광고 매핑 대상이 아닙니다. 자식이 속한 그룹을 선택해주세요.
-                </p>
-              )}
             </label>
-
-            <label className="block">
-              <span className="mb-2 block text-sm font-medium text-ink">캠페인 패턴</span>
-              <input className="input-shell" value={campaignDraft.campaignPattern} onChange={(event) => setCampaignDraft((current) => ({ ...current, campaignPattern: event.target.value }))} placeholder="캠페인명에 포함된 키워드" />
+            <label className="block text-xs font-medium">
+              <span className="mb-1 block">캠페인 패턴</span>
+              <input ref={ruleInputRef} className="input-shell" value={campaignDraft.campaignPattern} onChange={(event) => setCampaignDraft((current) => ({ ...current, campaignPattern: event.target.value }))} placeholder="캠페인명에 포함된 키워드" />
             </label>
-
-            {campaignError ? <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{campaignError}</div> : null}
-            {campaignSuccess ? <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{campaignSuccess}</div> : null}
-
-            <div className="flex flex-wrap gap-3">
-              <button className="button-shell button-primary flex-1" type="button" disabled={isBusy || !campaignMappableSalesUnits.length} onClick={() => void handleSaveCampaign()}>
+            {campaignError && <p role="alert" className="text-xs text-red-800">{campaignError}</p>}
+            {campaignSuccess && <p role="status" className="text-xs text-emerald-900">{campaignSuccess}</p>}
+            <div className="flex flex-wrap gap-1.5">
+              <button className="button-shell button-primary" type="button" disabled={isBusy || !campaignDraft.canonicalSalesUnitId || !campaignDraft.campaignPattern.trim()} onClick={() => void handleSaveCampaign()}>
                 {selectedMapping ? "변경사항 저장" : "규칙 생성"}
               </button>
-              {selectedMapping ? (
+              {selectedMapping && (
                 <>
-                  <button
-                    className="button-shell button-secondary"
-                    type="button"
-                    disabled={isBusy}
-                    onClick={() => {
-                      setSelectedMappingId(null);
-                      setCampaignDraft(emptyCampaignDraft(defaultCampaignSalesUnitId));
-                      setCampaignError(null);
-                      setCampaignSuccess(null);
-                    }}
-                  >
-                    새 규칙
+                  <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={openNewRule}>새 규칙</button>
+                  <button className="button-shell button-ghost" type="button" disabled={isBusy} onClick={() => void handleToggleCampaign(selectedMapping.isEnabled ? "deactivate" : "activate")}>
+                    {selectedMapping.isEnabled ? "비활성화" : "활성화"}
                   </button>
-                  {selectedMapping.isEnabled ? (
-                    <button className="button-shell button-ghost" type="button" disabled={isBusy} onClick={() => void handleToggleCampaign("deactivate")}>
-                      비활성화
-                    </button>
-                  ) : (
-                    <button className="button-shell button-secondary" type="button" disabled={isBusy} onClick={() => void handleToggleCampaign("activate")}>
-                      활성화
-                    </button>
-                  )}
                 </>
-              ) : null}
+              )}
             </div>
           </div>
-        </Panel>
-      </div>
+        </div>
+      </details>
     </div>
   );
 }

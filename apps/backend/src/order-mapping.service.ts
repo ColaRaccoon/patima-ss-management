@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException, OnModuleInit } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException, OnApplicationBootstrap, OnModuleInit } from "@nestjs/common";
 import { DatabaseService } from "./database.service";
 import {
   ensureNoCrossStoreReference,
@@ -13,7 +13,7 @@ import { SalesUnitService } from "./sales-unit.service";
 import { StoreService } from "./store.service";
 
 @Injectable()
-export class OrderMappingService implements OnModuleInit {
+export class OrderMappingService implements OnModuleInit, OnApplicationBootstrap {
   constructor(
     private readonly databaseService: DatabaseService,
     private readonly operationService: OperationService,
@@ -26,9 +26,30 @@ export class OrderMappingService implements OnModuleInit {
     this.operationService.registerRetryExecutor("RECALCULATE_ORDER_MAPPING", async (operation) => {
       return this.recalculate(operation.storeId);
     });
+  }
 
+  async onApplicationBootstrap(): Promise<void> {
     const storeIds = Array.from(new Set(this.databaseService.getSnapshot().stores.map((store) => store.id)));
     for (const storeId of storeIds) {
+      const snapshot = this.databaseService.getSnapshot();
+      // The mapper only mutates signature/item mapping fields. Probe detached rows,
+      // without cloning raw API payloads or persisting the entire startup snapshot.
+      const signatures = snapshot.orderSourceSignatures.filter((row) => row.storeId === storeId);
+      const items = snapshot.orderItems.filter((row) => row.storeId === storeId);
+      const probe = {
+        ...snapshot,
+        orderSourceSignatures: signatures.map((row) => ({ ...row })),
+        orderItems: items.map((row) => ({ ...row })),
+      };
+      recalculateOrderMappingsForStore(probe, storeId);
+      const changed = probe.orderSourceSignatures.some((row, index) =>
+        row.canonicalSalesUnitId !== signatures[index].canonicalSalesUnitId ||
+        row.mappingStatus !== signatures[index].mappingStatus ||
+        row.confirmedAt !== signatures[index].confirmedAt,
+      ) || probe.orderItems.some((row, index) =>
+        row.canonicalSalesUnitId !== items[index].canonicalSalesUnitId,
+      );
+      if (!changed) continue;
       await this.databaseService.writeCommitted((draft) => {
         recalculateOrderMappingsForStore(draft, storeId);
       }, ["orderSourceSignatures", "orderItems"]);
@@ -61,7 +82,7 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  async saveMappings(signatureIds: string[], payload: { canonicalSalesUnitId: string }) {
+  async saveMappings(signatureIds: string[], payload: { canonicalSalesUnitId: string; requireUnmapped?: boolean }) {
     const result = await this.saveMappingsInternal(signatureIds, payload);
     return formatApiSuccess({
       signatureIds: result.signatureIds,
@@ -101,7 +122,7 @@ export class OrderMappingService implements OnModuleInit {
     });
   }
 
-  private async saveMappingsInternal(signatureIds: string[], payload: { canonicalSalesUnitId: string }) {
+  private async saveMappingsInternal(signatureIds: string[], payload: { canonicalSalesUnitId: string; requireUnmapped?: boolean }) {
     const { snapshot, storeId, dedupedIds } = this.resolveSignatureBatch(signatureIds);
     this.storeService.ensureWritable(storeId);
 
@@ -136,6 +157,7 @@ export class OrderMappingService implements OnModuleInit {
       signatureIds: dedupedIds,
       canonicalSalesUnitId: payload.canonicalSalesUnitId,
       timestamp,
+      requireUnmapped: payload.requireUnmapped === true,
     });
     await this.refreshProfitSummariesForDates(storeId, commitResult.affectedDates);
 

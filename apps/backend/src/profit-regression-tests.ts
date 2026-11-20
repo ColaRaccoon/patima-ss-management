@@ -443,6 +443,68 @@ export async function runProfitRegressionTests() {
   );
 
   await check(
+    "cost preview reports changes and validates the file and store state at commit",
+    async () => {
+      const db = memory(fixture());
+      db.data.salesUnitCostSnapshots[0].effectiveFrom = date;
+      db.data.canonicalSalesUnits.push({
+        ...db.data.canonicalSalesUnits[0],
+        id: "missing",
+        displayName: "Omitted unit",
+      });
+      db.data.salesUnitCostSnapshotEntries.push({
+        ...db.data.salesUnitCostSnapshotEntries[0],
+        id: "missing-cost",
+        canonicalSalesUnitId: "missing",
+      });
+      const service = costs(db);
+      const input = excel([
+        ["u", "Renamed unit", 3500, 0.02, 100],
+        ["", "New unit", 0, null, 0],
+      ]);
+      const beforePreview = db.getSnapshot();
+      const preview = service.previewExcelSnapshot("s", date, input);
+      assert.deepEqual(db.getSnapshot(), beforePreview);
+      assert.equal(preview.replaces?.id, "snapshot");
+      assert.deepEqual(preview.created, [
+        { row: 3, displayName: "New unit", cost: { unitCost: 0, feeRate: null, otherCost: 0 } },
+      ]);
+      assert.deepEqual(preview.changed, [
+        {
+          id: "u",
+          previousName: "Unit",
+          displayName: "Renamed unit",
+          metadataChanged: true,
+          previousCost: { unitCost: 2000, feeRate: 0.03, otherCost: 0 },
+          nextCost: { unitCost: 3500, feeRate: 0.02, otherCost: 100 },
+        },
+      ]);
+      assert.deepEqual(preview.missing, [
+        { id: "missing", displayName: "Omitted unit", reason: "OMITTED", losesCurrentCost: true },
+      ]);
+      await assert.rejects(
+        () => service.importExcelSnapshot("s", date, excel([["u", "Changed file", 100, 0, 0]]), preview.token),
+        { status: 409 },
+      );
+      db.data.canonicalSalesUnits[1].displayName = "Changed since preview";
+      await assert.rejects(
+        () => service.importExcelSnapshot("s", date, input, preview.token),
+        { status: 409 },
+      );
+      assert.equal(db.data.salesUnitCostSnapshots[0].id, "snapshot");
+      const fresh = service.previewExcelSnapshot("s", date, input);
+      const result = await service.importExcelSnapshot("s", date, input, fresh.token);
+      assert.deepEqual(result.mismatch, { salesUnitCount: 3, entryCount: 2, missingSalesUnitIds: ["missing"] });
+      assert.equal(result.replacedSnapshot?.snapshotId, "snapshot");
+      await assert.rejects(
+        () => service.importExcelSnapshot("s", date, input, fresh.token),
+        { status: 409 },
+      );
+      assert.equal(db.data.canonicalSalesUnits.filter((unit) => unit.displayName === "New unit").length, 1);
+    },
+  );
+
+  await check(
     "blank unit cost is incomplete while an explicit zero is valid",
     async () => {
       const db = memory(fixture());

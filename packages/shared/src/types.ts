@@ -16,6 +16,7 @@ export type SaleStatus =
   | "EXCHANGED"
   | "UNKNOWN";
 export type MappingStatus = "MAPPED" | "UNMAPPED" | "CONFLICT";
+export type MappingStatusFilter = "ALL" | "UNRESOLVED" | MappingStatus;
 export type ProfitStatus = "COMPLETE" | "INCOMPLETE_COST";
 export type WeekdayValidationStatus =
   | "PENDING"
@@ -96,6 +97,13 @@ export interface CanonicalSalesUnit {
   isStoreLevel: boolean;
   parentSalesUnitId: string | null;
   isGroup: boolean;
+  advertisingNotPlanned?: boolean;
+  productForm?: {
+    productName: string;
+    configurationName: string;
+    commonAliases: string[];
+    effectiveFrom: string;
+  };
   createdAt: string;
   updatedAt: string;
 }
@@ -447,6 +455,34 @@ export interface SalesUnitCostSnapshotEntry {
   otherCost: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CostSnapshotPreview {
+  token: string;
+  storeId: string;
+  effectiveFrom: string;
+  fileName: string;
+  replaces: Pick<SalesUnitCostSnapshot, "id" | "sourceFileName" | "createdAt"> | null;
+  nextSnapshotDate: string | null;
+  created: Array<{
+    row: number;
+    displayName: string;
+    cost: Pick<SalesUnitCostSnapshotEntry, "unitCost" | "feeRate" | "otherCost"> | null;
+  }>;
+  changed: Array<{
+    id: string;
+    previousName: string;
+    displayName: string;
+    metadataChanged: boolean;
+    previousCost: Pick<SalesUnitCostSnapshotEntry, "unitCost" | "feeRate" | "otherCost"> | null;
+    nextCost: Pick<SalesUnitCostSnapshotEntry, "unitCost" | "feeRate" | "otherCost"> | null;
+  }>;
+  missing: Array<{
+    id: string;
+    displayName: string;
+    reason: "OMITTED" | "BLANK_COST";
+    losesCurrentCost: boolean;
+  }>;
 }
 
 export interface DailyFakePurchase {

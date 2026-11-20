@@ -13,6 +13,7 @@ import {
   parseAdUploadFileName,
 } from "@patima/shared";
 import * as XLSX from "xlsx";
+import type { MappingStatusFilter } from "@patima/shared";
 import { AuditLogService } from "./audit-log.service";
 import {
   createAdCampaignSignatureIndex,
@@ -879,7 +880,8 @@ export class AdsService implements OnModuleInit {
     storeId: string;
     dateFrom?: string;
     dateTo?: string;
-    mappingStatus?: "ALL" | "MAPPED" | "UNMAPPED" | "CONFLICT";
+    mappingStatus?: MappingStatusFilter;
+    excludeZeroCost?: boolean;
     q?: string;
     page?: number;
     pageSize?: number;
@@ -957,7 +959,7 @@ export class AdsService implements OnModuleInit {
 
   async saveManualMappings(
     adCostIds: string[],
-    payload: { canonicalSalesUnitId: string },
+    payload: { canonicalSalesUnitId: string; requireUnmapped?: boolean },
   ) {
     const result = await this.saveManualMappingsInternal(adCostIds, payload);
     return formatApiSuccess({
@@ -1014,7 +1016,7 @@ export class AdsService implements OnModuleInit {
 
   private async saveManualMappingsInternal(
     adCostIds: string[],
-    payload: { canonicalSalesUnitId: string },
+    payload: { canonicalSalesUnitId: string; requireUnmapped?: boolean },
   ) {
     const snapshot = this.databaseService.getSnapshot();
     const { dedupedIds, storeId } = this.resolveAdSignatureBatch(
@@ -1065,6 +1067,7 @@ export class AdsService implements OnModuleInit {
           type: "MANUAL_MAPPED",
           canonicalSalesUnitId: payload.canonicalSalesUnitId,
           timestamp,
+          requireUnmapped: payload.requireUnmapped === true,
         },
       });
     await this.recalculateProfitSummariesForAdDates(

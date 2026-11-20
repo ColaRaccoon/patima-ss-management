@@ -170,6 +170,19 @@ node scripts/prune-operations.mjs --days 90 --prune-failed --yes
 - `FAILED`는 기본 보존하며, `--prune-failed`가 있을 때만 archive/delete 후보가 됩니다.
 - retry chain에 최근/진행 중 row가 연결되어 있으면 오래된 원본도 보존합니다.
 
+## 주문 자동 매핑 읽기 전용 검증
+
+```powershell
+npm run build --workspace @patima/backend
+node scripts/diagnostics/verify-order-mappings.mjs
+```
+
+`.env`의 DB에서 매핑에 필요한 필드만 읽고 연결을 종료한 뒤 메모리에서 재계산합니다. 읽기 전용 트랜잭션을 사용하며 주문 원본·고객 정보·접속 정보는 출력하거나 파일로 저장하지 않습니다.
+
+- 수동 확정과 기존 주문 매핑 보존, 재계산 반복 및 입력 순서 변경 시 결과 일치를 검사합니다. 불일치하면 종료 코드 1을 반환합니다.
+- 수동 확정·과거 매핑을 메모리에서 제거한 별도 표본으로 그룹 자동 판별을 검증합니다. 기존 수동 판단과 다른 결과 및 판별 불가 건수도 표시합니다. 이 표본 결과는 운영 DB에 반영하지 않습니다.
+- `npm test`에는 합성 주문을 이용한 구성·성별·식별자 충돌, 상품명 복구, 반복 동기화 회귀 테스트가 포함됩니다.
+
 ## 환경변수
 
 ```env
